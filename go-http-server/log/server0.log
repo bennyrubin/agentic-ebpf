@@ -1,0 +1,5 @@
+2025/10/02 18:31:05 Loading eBPF policy: pickfirst
+2025/10/02 18:31:05 eBPF program attached to the SO_REUSEPORT socket group!
+2025/10/02 18:31:05 Started listening in 127.0.0.1:8080 successfully! (serverNum = 0, policy = pickfirst)
+2025/10/02 18:31:05 Updating with (key = 0 , value = 4)
+2025/10/02 18:31:05 Map update succeeded

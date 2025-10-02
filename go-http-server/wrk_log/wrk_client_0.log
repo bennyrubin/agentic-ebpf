@@ -1,0 +1,9 @@
+Running 20s test @ http://localhost:8080/hello
+  1 threads and 1 connections
+  Thread calibration: mean lat.: 1.194ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     1.17ms  479.00us   3.98ms   72.49%
+    Req/Sec     1.06k    86.69     1.33k    82.73%
+  19999 requests in 20.00s, 2.71MB read
+Requests/sec:   1000.00
+Transfer/sec:    138.67KB
