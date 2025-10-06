@@ -2,6 +2,7 @@ package main
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go reuseportlb eBPF/reuseportlb.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go pickfirst eBPF/pickfirst.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go roundrobin eBPF/roundrobin.c
 
 import (
 	"context"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/prometheus/procfs"
 	"golang.org/x/sys/unix"
 )
 
@@ -26,6 +26,7 @@ func handleHello(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCpu(w http.ResponseWriter, r *http.Request) {
+
 	// Simulate CPU intensive work
 	const n = 50000
 	result := 0
@@ -38,18 +39,26 @@ func handleCpu(w http.ResponseWriter, r *http.Request) {
 }
 
 // Inspired by src/net/dial.go
-func getListenConfig(prog *ebpf.Program, serverNum int, installProgram bool) net.ListenConfig {
+func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 	lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
 		var opErr error
 		// If Control is not nil, it is called after creating the network
 		// connection but before binding it to the operating system.
 		err := c.Control(func(fd uintptr) {
+
+			// Set SO_REUSEADDR on the socket to allow reuse of local addresses.
+			// if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			// 	opErr = fmt.Errorf("setsockopt(SO_REUSEADDR) failed: %w", err)
+			// 	return
+			// }
+
 			// Set SO_REUSEPORT on the socket for both instances (because eBPF program works on socket with SO_REUSEPORT configured)
-			// This sets the SO_REUSEPORT option on the socket, which allows multiple sockets to bind to the same port.
-			// In "function" words, for fd on the SOL_SOCKET level, set the SO_REUSEPORT option to 1 (a.k.a. true/on).
-			opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+				opErr = fmt.Errorf("setsockopt(SO_REUSEPORT) failed: %w", err)
+				return
+			}
 			// Set eBPF program to be invoked for socket selection
-			if prog != nil && serverNum == 0 && installProgram {
+			if prog != nil && installProgram {
 				// SO_ATTACH_REUSEPORT_EBPF program defines how packets are assigned to the sockets in the reuseport group
 				// That is, all sockets which have SO_REUSEPORT set and are using the same local address to receive packets.
 				// In "function" words, for fd on the SOL_SOCKET lever, set the unix.SO_ATTACH_REUSEPORT_EBPF option to eBPF program file descriptor.
@@ -76,6 +85,23 @@ func GetFdFromListener(l net.Listener) int {
 	pfd := netFD.FieldByName("pfd")
 	fd := int(pfd.FieldByName("Sysfd").Int())
 	return fd
+}
+
+func ListenerFD(l net.Listener) (int, error) {
+	rc, ok := l.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return -1, fmt.Errorf("no SyscallConn")
+	}
+	var fd int
+	var opErr error
+	if raw, err := rc.SyscallConn(); err == nil {
+		raw.Control(func(p uintptr) { fd = int(p) })
+	} else {
+		opErr = err
+	}
+	return fd, opErr
 }
 
 // ensureBpffsMounted mounts bpffs at the given path if it's not already mounted.
@@ -111,7 +137,27 @@ func loadPolicy(policy string) (LoadedObjects, error) {
 	switch policy {
 
 	case "round-robin":
-		return LoadedObjects{}, fmt.Errorf("agent policy is not implemented")
+		log.Println("Reached round-robin policy case in loadPolicy")
+		var objs roundrobinObjects
+		if err := loadRoundrobinObjects(&objs, &mapOptions); err != nil {
+			return LoadedObjects{}, err
+		}
+
+		type rrState struct {
+			Counter       uint32
+			ActiveSockets uint32
+		}
+		k := uint32(0)
+		s := rrState{Counter: 0, ActiveSockets: 4}
+		objs.roundrobinMaps.Rr.Update(&k, &s, ebpf.UpdateAny)
+
+		log.Printf("Added round robin state: key=%d, value={Counter: %d, ActiveSockets: %d} (only works with 4 servers)", k, s.Counter, s.ActiveSockets)
+
+		return LoadedObjects{
+			Program: objs.roundrobinPrograms.RrSelector,
+			Map:     objs.roundrobinMaps.TcpBalancingTargets, // sockarray to be filled per-instance
+			Close:   objs.Close,
+		}, nil
 
 	case "pickfirst":
 		var objs pickfirstObjects
@@ -172,25 +218,14 @@ func main() {
 
 	defer objs.Close() // This only unloads the eBPF program (if it is not attached to kernel) and map, but doesn't remove the pin
 
-	// Check if other instances are already running on the same port - because we are testing SO_REUSEPORT
-	fs, _ := procfs.NewDefaultFS()
-	netTCP, _ := fs.NetTCP()
-	otherInstancesRunning := false
-	for _, i := range netTCP {
-		if i.LocalPort == 8080 {
-			otherInstancesRunning = true
-			break
-		}
-	}
-
 	// Setup HTTP Server instance
 	// We can't directly use http.ListenAndServe because it hides the socket implementation (which is what we are interested in with SetsockoptInt)
 	http.HandleFunc("/hello", handleHello)
 	http.HandleFunc("/cpu", handleCpu)
 	server := http.Server{Addr: "127.0.0.1:8080", Handler: nil}
 
-	installProgram := !otherInstancesRunning && policy != "default"
-	lc := getListenConfig(objs.Program, serverNum, installProgram)
+	installProgram := serverNum == 0 && policy != "default"
+	lc := getListenConfig(objs.Program, installProgram)
 	ln, err := lc.Listen(context.Background(), "tcp", server.Addr)
 	if err != nil {
 		log.Fatalf("Unable to listen of specified addr: %v", err)
@@ -200,7 +235,12 @@ func main() {
 
 	if policy != "default" {
 		// NOTE: Each process has its own file descriptor table, so don't get confused if the FDs are the same for both processes
-		v := uint64(GetFdFromListener(ln))
+		//v := uint64(GetFdFromListener(ln))
+		fd, err := ListenerFD(ln)
+		if err != nil {
+			log.Fatalf("get listener fd: %v", err)
+		}
+		v := uint64(fd)
 		var k uint32 = uint32(serverNum)
 
 		log.Printf("Updating with (key = %d , value = %d)", k, v)
