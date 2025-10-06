@@ -47,14 +47,14 @@ func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 		err := c.Control(func(fd uintptr) {
 
 			// Set SO_REUSEADDR on the socket to allow reuse of local addresses.
-			// if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-			// 	opErr = fmt.Errorf("setsockopt(SO_REUSEADDR) failed: %w", err)
-			// 	return
-			// }
+			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+				log.Println("setsockopt(SO_REUSEADDR) failed: %v", err)
+				return
+			}
 
 			// Set SO_REUSEPORT on the socket for both instances (because eBPF program works on socket with SO_REUSEPORT configured)
 			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-				opErr = fmt.Errorf("setsockopt(SO_REUSEPORT) failed: %w", err)
+				log.Println("setsockopt(SO_REUSEPORT) failed: %v", err)
 				return
 			}
 			// Set eBPF program to be invoked for socket selection
@@ -64,7 +64,7 @@ func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 				// In "function" words, for fd on the SOL_SOCKET lever, set the unix.SO_ATTACH_REUSEPORT_EBPF option to eBPF program file descriptor.
 				err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_ATTACH_REUSEPORT_EBPF, prog.FD())
 				if err != nil {
-					opErr = fmt.Errorf("setsockopt(SO_ATTACH_REUSEPORT_EBPF) failed: %w", err)
+					log.Println("setsockopt(SO_ATTACH_REUSEPORT_EBPF) failed: %v", err)
 				} else {
 					log.Println("eBPF program attached to the SO_REUSEPORT socket group!")
 				}

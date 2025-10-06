@@ -18,7 +18,7 @@ struct {
 SEC("sk_reuseport/selector")
 enum sk_action pickfirst(struct sk_reuseport_md *reuse)
 {
-    __u32 key0 = 0;
+    __u32 key0 = 2;
 
     if (bpf_sk_select_reuseport(reuse, &tcp_balancing_targets, &key0, 0) == 0) {
         // Successfully selected socket at index 0

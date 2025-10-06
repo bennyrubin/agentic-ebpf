@@ -96,6 +96,8 @@ for cpu in $CPUS_NODE0; do
 
     renice -20 -p "$pid" >/dev/null || true
 
+    sleep .3
+
     ((i++))
 done
 
