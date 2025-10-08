@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,10 +19,9 @@ import (
 // Configuration
 // -------------------------------
 var (
-	cpuCores       = []int{0, 1, 2, 3}               // which cores to monitor
-	updateInterval = 2 * time.Second                 // how often to update utilization
+	updateInterval = 5 * time.Millisecond                 // how often to update utilization
 	alpha          = 0.25                            // smoothing factor for running average (0–1)
-	mapPath        = "/sys/fs/bpf/tc/globals/cpu_util_map"      // pinned BPF map path
+	mapPath        = "/sys/fs/bpf/cpu_util_map"      // pinned BPF map path
 	maxCores       = 64                              // max entries in the map
 )
 
@@ -97,7 +98,7 @@ func loadOrCreateMap(path string) (*ebpf.Map, error) {
 	spec := &ebpf.MapSpec{
 		Type:       ebpf.Array,
 		KeySize:    4,
-		ValueSize:  4, // float32
+		ValueSize:  4, // uint32 (percentage * 100)
 		MaxEntries: uint32(maxCores),
 		Name:       "cpu_util_map",
 	}
@@ -120,6 +121,24 @@ func loadOrCreateMap(path string) (*ebpf.Map, error) {
 // -------------------------------
 
 func main() {
+	// Parse command line flags
+	cpuCoresStr := flag.String("cpus", "0 1 2 3", "space-separated list of CPU cores to monitor (e.g., \"0 1 2 3\")")
+	flag.Parse()
+
+	// Parse CPU cores from the string
+	cpuCores := []int{}
+	for _, s := range strings.Fields(*cpuCoresStr) {
+		core, err := strconv.Atoi(s)
+		if err != nil {
+			log.Fatalf("invalid CPU core number: %s", s)
+		}
+		cpuCores = append(cpuCores, core)
+	}
+
+	if len(cpuCores) == 0 {
+		log.Fatalf("no CPU cores specified")
+	}
+
 	m, err := loadOrCreateMap(mapPath)
 	if err != nil {
 		log.Fatalf("Error setting up map: %v", err)
@@ -157,7 +176,8 @@ func main() {
 			runningAvg[core] = newAvg
 
 			var key uint32 = uint32(core)
-			value := float32(newAvg)
+			// Store as percentage * 100 (e.g., 75.5% -> 7550)
+			value := uint32(newAvg * 100)
 
 			buf := new(bytes.Buffer)
 			if err := binary.Write(buf, binary.LittleEndian, value); err != nil {
@@ -168,7 +188,7 @@ func main() {
 			if err := m.Update(&key, buf.Bytes(), ebpf.UpdateAny); err != nil {
 				log.Printf("failed to update BPF map for CPU %d: %v", core, err)
 			} else {
-				log.Printf("CPU %d: inst=%.1f%% avg=%.1f%%", core, instUtil, newAvg)
+				log.Printf("CPU %d: inst=%.1f%% avg=%.1f%% (map=%d)", core, instUtil, newAvg, value)
 			}
 		}
 
