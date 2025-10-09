@@ -3,6 +3,8 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go reuseportlb eBPF/reuseportlb.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go pickfirst eBPF/pickfirst.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go roundrobin eBPF/roundrobin.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpuutil eBPF/cpuutil.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go acceptqueue eBPF/acceptqueue.c
 
 import (
 	"context"
@@ -15,6 +17,7 @@ import (
 	"reflect"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -78,6 +81,20 @@ func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 	return lc
 }
 
+type slowListener struct {
+	net.Listener
+	delay time.Duration
+}
+
+func (sl *slowListener) Accept() (net.Conn, error) {
+	conn, err := sl.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	time.Sleep(sl.delay)
+	return conn, nil
+}
+
 // GetFdFromListener get net.Listener's file descriptor.
 func GetFdFromListener(l net.Listener) int {
 	v := reflect.Indirect(reflect.ValueOf(l))
@@ -136,8 +153,29 @@ func loadPolicy(policy string) (LoadedObjects, error) {
 
 	switch policy {
 
+	case "cpuutil":
+		var objs cpuutilObjects
+		if err := loadCpuutilObjects(&objs, &mapOptions); err != nil {
+			return LoadedObjects{}, err
+		}
+		return LoadedObjects{
+			Program: objs.cpuutilPrograms.CpuutilSelector,
+			Map:     objs.cpuutilMaps.TcpBalancingTargets,
+			Close:   objs.Close,
+		}, nil
+
+	case "acceptqueue":
+		var objs acceptqueueObjects
+		if err := loadAcceptqueueObjects(&objs, &mapOptions); err != nil {
+			return LoadedObjects{}, err
+		}
+		return LoadedObjects{
+			Program: objs.acceptqueuePrograms.AcceptqSelector,
+			Map:     objs.acceptqueueMaps.TcpBalancingTargets,
+			Close:   objs.Close,
+		}, nil
+
 	case "round-robin":
-		log.Println("Reached round-robin policy case in loadPolicy")
 		var objs roundrobinObjects
 		if err := loadRoundrobinObjects(&objs, &mapOptions); err != nil {
 			return LoadedObjects{}, err
@@ -175,7 +213,7 @@ func loadPolicy(policy string) (LoadedObjects, error) {
 		return LoadedObjects{}, fmt.Errorf("agent policy is not implemented")
 
 	default:
-		validPolicies := []string{"default", "random", "round-robin", "agent"}
+		validPolicies := []string{"default", "pickfirst", "round-robin", "cpuutil", "acceptqueue", "agent"}
 		log.Fatalf("Invalid policy: %q. Valid policies are: %v", policy, validPolicies)
 	}
 	return LoadedObjects{}, nil
@@ -233,13 +271,20 @@ func main() {
 		log.Printf("Started listening in 127.0.0.1:8080 successfully! (serverNum = %d, policy = %s)", serverNum, policy)
 	}
 
+	fd, err := ListenerFD(ln)
+	if err != nil {
+		log.Fatalf("get listener fd: %v", err)
+	}
+	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+	if err != nil {
+		log.Printf("getsockopt(SO_COOKIE) failed: %v", err)
+	} else {
+		log.Printf("Listener socket cookie: %d (0x%x)", cookie, cookie)
+	}
+
 	if policy != "default" {
 		// NOTE: Each process has its own file descriptor table, so don't get confused if the FDs are the same for both processes
 		//v := uint64(GetFdFromListener(ln))
-		fd, err := ListenerFD(ln)
-		if err != nil {
-			log.Fatalf("get listener fd: %v", err)
-		}
 		v := uint64(fd)
 		var k uint32 = uint32(serverNum)
 
@@ -257,7 +302,7 @@ func main() {
 		}
 	}
 
-	err = server.Serve(ln)
+	err = server.Serve(&slowListener{Listener: ln, delay: 50 * time.Millisecond})
 	if err != nil {
 		log.Fatalf("Unable to start HTTP server: %v", err)
 	}

@@ -1,0 +1,10 @@
+Running 20s test @ http://localhost:8080/cpu
+  1 threads and 1 connections
+  Thread calibration: mean lat.: 0.986ms, rate sampling interval: 10ms
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     0.98ms  320.29us   1.92ms   61.90%
+    Req/Sec   805.17    449.07     1.22k    76.89%
+  17660 requests in 20.01s, 2.88MB read
+  Socket errors: connect 0, read 1, write 20835, timeout 0
+Requests/sec:    882.72
+Transfer/sec:    147.41KB

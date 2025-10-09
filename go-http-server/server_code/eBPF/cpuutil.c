@@ -9,6 +9,7 @@ struct {
     __uint(max_entries, 64);
     __type(key, __u32);
     __type(value, __u32); // CPU utilization * 100
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
 } cpu_util_map SEC(".maps");
 
 struct {

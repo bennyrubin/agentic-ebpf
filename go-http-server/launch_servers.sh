@@ -12,7 +12,10 @@ fi
 NUM_SERVERS=$1
 POLICY=$2
 
+# Recreate the log directory every run
+rm -rf log
 mkdir -p log
+mkdir -p .gocache
 
 # Get list of CPUs on NUMA node 0
 CPUS_NODE0=$(lscpu -p=CPU,NODE | grep -v '^#' | awk -F, '$2==0 {print $1}')
@@ -35,6 +38,9 @@ cleanup() {
     done
     if [[ -n "${MONITOR_PID:-}" ]] && kill -0 "$MONITOR_PID" 2>/dev/null; then
         kill "$MONITOR_PID"
+    fi
+    if [[ -n "${COLLECT_STATS_PID:-}" ]] && kill -0 "$COLLECT_STATS_PID" 2>/dev/null; then
+        kill "$COLLECT_STATS_PID"
     fi
 }
 trap cleanup SIGINT SIGTERM EXIT
@@ -86,9 +92,7 @@ for cpu in $CPUS_NODE0; do
     echo "Starting server $i on CPU $cpu with policy '$POLICY' (logging to $logfile)"
     
     # Redirect stdout/stderr to log file
-    (
-        exec stdbuf -oL -eL taskset -c "$cpu" ./go-http-server "$i" "$POLICY"
-    ) >"$logfile" 2>&1 &
+    taskset -c "$cpu" go run ./server_code/ "$i" "$POLICY" >"$logfile" 2>&1 &
 
     pid=$!
     PIDS+=("$pid")
@@ -100,6 +104,18 @@ for cpu in $CPUS_NODE0; do
 
     ((i++))
 done
+
+# Launch collect_stats to populate BPF maps
+if (( ${#USED_CPUS[@]} > 0 )); then
+    cpu_arg=$(IFS=' '; echo "${USED_CPUS[*]}")
+    collect_log="log/collect_stats.log"
+    echo "Starting collect_stats for CPUs: ${cpu_arg} (logging to $collect_log)"
+    (
+        export GOCACHE="$(pwd)/.gocache"
+        exec stdbuf -oL -eL go run ./collect_stats.go -cpus "${cpu_arg}" -logdir log -period "${REPORT_INTERVAL}s"
+    ) >>"$collect_log" 2>&1 &
+    COLLECT_STATS_PID=$!
+fi
 
 # Start CPU monitor in background
 monitor_cpu "${USED_CPUS[@]}" &

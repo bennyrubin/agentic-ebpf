@@ -1,0 +1,9 @@
+./doc.go
+./fd.go
+./fd_trace.go
+./mapflags_string.go
+./ptr.go
+./ptr_64.go
+./signals.go
+./syscall.go
+./types.go

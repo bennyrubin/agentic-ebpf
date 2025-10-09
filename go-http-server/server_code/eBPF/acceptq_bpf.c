@@ -78,8 +78,8 @@ int BPF_KPROBE(on_syn_recv, struct sock *sk)
     // However, the trace pipe is more flexible than older bpf_printk versions,
     // and modern kernels often support more arguments.
     // For clarity, we'll use a single bpf_printk call.
-    bpf_printk("PID: %d, Backlog: %d/%d, CPU: %d, Pointer: 0x%llx",
-                pid, sk_ack_backlog, sk_max_ack_backlog, cpu, sk_ptr);
+    bpf_printk("PID: %d, Backlog: %d/%d, CPU: %d, Pointer: 0x%llx, Cookie: 0x%llx",
+                pid, sk_ack_backlog, sk_max_ack_backlog, cpu, sk_ptr, sk_cookie);
 
     return 0;
 }

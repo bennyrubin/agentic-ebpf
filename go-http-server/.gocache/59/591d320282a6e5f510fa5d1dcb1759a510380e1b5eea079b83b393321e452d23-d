@@ -1,0 +1,14 @@
+./attachtype_string.go
+./collection.go
+./cpu.go
+./doc.go
+./elf_reader.go
+./elf_sections.go
+./info.go
+./linker.go
+./map.go
+./marshalers.go
+./prog.go
+./syscalls.go
+./types.go
+./types_string.go

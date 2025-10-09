@@ -1,0 +1,16 @@
+./auxv.go
+./buffer.go
+./deque.go
+./elf.go
+./endian_le.go
+./errors.go
+./feature.go
+./io.go
+./math.go
+./output.go
+./pinning.go
+./platform.go
+./prog.go
+./statfs.go
+./vdso.go
+./version.go
