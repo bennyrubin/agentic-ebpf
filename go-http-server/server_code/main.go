@@ -277,10 +277,9 @@ func main() {
 	}
 	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
 	if err != nil {
-		log.Printf("getsockopt(SO_COOKIE) failed: %v", err)
-	} else {
-		log.Printf("Listener socket cookie: %d (0x%x)", cookie, cookie)
+		log.Fatalf("getsockopt(SO_COOKIE) failed: %v", err)
 	}
+	log.Printf("Listener socket cookie: %d (0x%x)", cookie, cookie)
 
 	if policy != "default" {
 		// NOTE: Each process has its own file descriptor table, so don't get confused if the FDs are the same for both processes
@@ -294,12 +293,23 @@ func main() {
 			log.Fatalf("Unable to load map: %v", err)
 		}
 
-		err = m.Update(&k, &v, ebpf.UpdateAny)
-		if err != nil {
+		if err := m.Update(&k, &v, ebpf.UpdateAny); err != nil {
+			m.Close()
 			log.Fatalf("Unable to update the map: %v", err)
-		} else {
-			log.Printf("Map update succeeded")
 		}
+		m.Close()
+		log.Printf("Map update succeeded")
+
+		slotMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/acceptq_slot_cookies", nil)
+		if err != nil {
+			log.Fatalf("Unable to load acceptq slot map: %v", err)
+		}
+		if err := slotMap.Update(&k, &cookie, ebpf.UpdateAny); err != nil {
+			slotMap.Close()
+			log.Fatalf("Unable to update acceptq slot map: %v", err)
+		}
+		slotMap.Close()
+		log.Printf("Updated slot %d with cookie 0x%x", k, cookie)
 	}
 
 	err = server.Serve(&slowListener{Listener: ln, delay: 50 * time.Millisecond})

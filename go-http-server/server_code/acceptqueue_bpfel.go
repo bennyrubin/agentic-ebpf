@@ -66,7 +66,8 @@ type acceptqueueProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type acceptqueueMapSpecs struct {
-	AcceptqPerCpuMap    *ebpf.MapSpec `ebpf:"acceptq_per_cpu_map"`
+	AcceptqMap          *ebpf.MapSpec `ebpf:"acceptq_map"`
+	AcceptqSlotCookies  *ebpf.MapSpec `ebpf:"acceptq_slot_cookies"`
 	TcpBalancingTargets *ebpf.MapSpec `ebpf:"tcp_balancing_targets"`
 }
 
@@ -89,13 +90,15 @@ func (o *acceptqueueObjects) Close() error {
 //
 // It can be passed to loadAcceptqueueObjects or ebpf.CollectionSpec.LoadAndAssign.
 type acceptqueueMaps struct {
-	AcceptqPerCpuMap    *ebpf.Map `ebpf:"acceptq_per_cpu_map"`
+	AcceptqMap          *ebpf.Map `ebpf:"acceptq_map"`
+	AcceptqSlotCookies  *ebpf.Map `ebpf:"acceptq_slot_cookies"`
 	TcpBalancingTargets *ebpf.Map `ebpf:"tcp_balancing_targets"`
 }
 
 func (m *acceptqueueMaps) Close() error {
 	return _AcceptqueueClose(
-		m.AcceptqPerCpuMap,
+		m.AcceptqMap,
+		m.AcceptqSlotCookies,
 		m.TcpBalancingTargets,
 	)
 }

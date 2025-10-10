@@ -19,13 +19,14 @@ import (
 )
 
 var (
-	updateInterval = 50 * time.Millisecond
-	alpha          = 0.25
-	mapPath        = "/sys/fs/bpf/cpu_util_map"
-	acceptqMapPath = "/sys/fs/bpf/acceptq_per_cpu_map"
-	acceptqProgObj = "server_code/eBPF/acceptq_bpf.o"
-	acceptqProgPin = "/sys/fs/bpf/acceptq_bpf"
-	maxCores       = 64
+	updateInterval      = 50 * time.Millisecond
+	alpha               = 0.25
+	mapPath             = "/sys/fs/bpf/cpu_util_map"
+	acceptqStatsMapPath = "/sys/fs/bpf/acceptq_map"
+	acceptqSlotMapPath  = "/sys/fs/bpf/acceptq_slot_cookies"
+	acceptqProgObj      = "server_code/eBPF/acceptq_bpf.o"
+	acceptqProgPin      = "/sys/fs/bpf/acceptq_bpf"
+	maxCores            = 64
 )
 
 type CPUStat struct {
@@ -208,10 +209,14 @@ func main() {
 		defer acceptqCleanup()
 	}
 
-	var acceptqMap *ebpf.Map
+	var acceptqStatsMap *ebpf.Map
+	var acceptqSlotMap *ebpf.Map
 	defer func() {
-		if acceptqMap != nil {
-			acceptqMap.Close()
+		if acceptqStatsMap != nil {
+			acceptqStatsMap.Close()
+		}
+		if acceptqSlotMap != nil {
+			acceptqSlotMap.Close()
 		}
 	}()
 
@@ -228,6 +233,8 @@ func main() {
 	runningAvg := make(map[int]float64)
 	instUtilByCore := make(map[int]float64)
 	mapValueByCore := make(map[int]uint32)
+	acceptqEntryBySlot := make(map[uint32]acceptqEntry)
+	slotCookieBySlot := make(map[uint32]uint64)
 
 	updateTicker := time.NewTicker(updateInterval)
 	defer updateTicker.Stop()
@@ -286,29 +293,52 @@ func main() {
 				cpuLogger.Printf("ts=%s cpu=%d inst=%.2f avg=%.2f map=%d", ts, coreID, instUtilByCore[coreID], runningAvg[coreID], mapValueByCore[coreID])
 			}
 
-			if acceptqMap == nil {
-				if m, err := ebpf.LoadPinnedMap(acceptqMapPath, nil); err == nil {
-					acceptqMap = m
-					log.Printf("Connected to accept queue map at %s", acceptqMapPath)
+			if acceptqSlotMap == nil {
+				if m, err := ebpf.LoadPinnedMap(acceptqSlotMapPath, nil); err == nil {
+					acceptqSlotMap = m
+					log.Printf("Connected to accept queue slot map at %s", acceptqSlotMapPath)
 				} else {
-					acceptqLogger.Printf("ts=%s map_unavailable err=%v", ts, err)
+					acceptqLogger.Printf("ts=%s slot_map_unavailable err=%v", ts, err)
 					continue
 				}
 			}
 
-			for _, coreID := range cpuCores {
-				var key uint32 = uint32(coreID)
-				var entry acceptqEntry
-				if err := acceptqMap.Lookup(&key, &entry); err != nil {
-					acceptqLogger.Printf("ts=%s cpu=%d lookup_err=%v", ts, coreID, err)
+			if acceptqStatsMap == nil {
+				if m, err := ebpf.LoadPinnedMap(acceptqStatsMapPath, nil); err == nil {
+					acceptqStatsMap = m
+					log.Printf("Connected to accept queue stats map at %s", acceptqStatsMapPath)
+				} else {
+					acceptqLogger.Printf("ts=%s stats_map_unavailable err=%v", ts, err)
 					continue
 				}
+			}
+
+			for slot := range cpuCores {
+				var slotKey uint32 = uint32(slot)
+				var cookie uint64
+				if err := acceptqSlotMap.Lookup(&slotKey, &cookie); err != nil || cookie == 0 {
+					if err != nil {
+						acceptqLogger.Printf("ts=%s slot=%d cookie_lookup_err=%v", ts, slotKey, err)
+					} else {
+						acceptqLogger.Printf("ts=%s slot=%d cookie=0", ts, slotKey)
+					}
+					continue
+				}
+				slotCookieBySlot[slotKey] = cookie
+
+				var entry acceptqEntry
+				if err := acceptqStatsMap.Lookup(&cookie, &entry); err != nil {
+					acceptqLogger.Printf("ts=%s slot=%d cookie=0x%x stats_lookup_err=%v", ts, slotKey, cookie, err)
+					continue
+				}
+				acceptqEntryBySlot[slotKey] = entry
 
 				util := 0.0
 				if entry.Max > 0 {
 					util = float64(entry.Curr) / float64(entry.Max) * 100
 				}
-				acceptqLogger.Printf("ts=%s cpu=%d curr=%d max=%d util=%.2f", ts, coreID, entry.Curr, entry.Max, util)
+				acceptqLogger.Printf("ts=%s slot=%d cookie=0x%x curr=%d max=%d cpu=%d util=%.2f",
+					ts, slotKey, cookie, entry.Curr, entry.Max, entry.Cpu, util)
 			}
 		default:
 		}

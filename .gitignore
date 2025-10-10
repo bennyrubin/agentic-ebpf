@@ -3,3 +3,7 @@ vendor
 *.o
 */wrk_log/
 */log/
+.gocache
+.gocache/
+.gocache-user
+.gocache-user/
