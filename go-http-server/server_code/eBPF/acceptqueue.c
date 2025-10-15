@@ -50,24 +50,17 @@ enum sk_action acceptq_selector(struct sk_reuseport_md *reuse)
 
 		struct acceptq *aq = bpf_map_lookup_elem(&acceptq_map, cookie);
 
-		__u32 util = 0;
 		if (!aq) {
-			struct acceptq init = {
-				.curr = 0,
-				.max = 1,
-				.cpu = 0,
-			};
-			bpf_map_update_elem(&acceptq_map, cookie, &init, BPF_ANY);
-			util = 0;
-			bpf_printk("slot=%u cookie=0x%llx initialized", i, *cookie);
-		} else {
-			if (aq->max == 0)
-				aq->max = 1;
-			// Calculate utilization as percentage: (curr / max) * 100
-			util = aq->curr;
-			bpf_printk("slot=%u cookie=0x%llx curr=%u max=%u util=%u",
-				   i, *cookie, aq->curr, aq->max, util);
+			bpf_printk("slot=%u cookie=0x%llx missing acceptq entry", i, *cookie);
+			continue;
 		}
+
+		if (aq->max == 0)
+			aq->max = 1;
+		// Calculate utilization as percentage: (curr / max) * 100
+		__u32 util = aq->curr;
+		bpf_printk("slot=%u cookie=0x%llx curr=%u max=%u util=%u",
+			   i, *cookie, aq->curr, aq->max, util);
 
 		if (util < lowest_util) {
 			lowest_util = util;

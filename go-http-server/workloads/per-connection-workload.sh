@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# per-connection-workload.sh launches a fixed total number of HTTP requests across
+# multiple parallel workers. Each worker runs sequential curl requests, pulling
+# paths from the configured mix, until the global TOTAL_REQUESTS budget is exhausted.
+# --parallel controls how many workers run concurrently (i.e. number of independent
+# request loops), while the positional TOTAL_REQUESTS argument specifies the aggregate
+# number of requests that will be evenly split across those workers.
+
 set -euo pipefail
 
 usage() {
@@ -54,6 +61,10 @@ msleep() {
     else
         sleep "$seconds"
     fi
+}
+
+now_ns() {
+    date +%s%N
 }
 
 declare -a PATHS=()
@@ -256,6 +267,8 @@ if [[ -n "$REUSE_PORT" ]]; then
     curl_base+=(--local-port "${REUSE_PORT}-${REUSE_PORT}")
 fi
 
+RUN_START_NS=$(now_ns)
+
 run_worker() {
     local worker_id="$1"
     local request_count="$2"
@@ -269,8 +282,14 @@ run_worker() {
     local success=0
     local failure=0
     local -a index_counts=()
+    local total_latency_ns=0
+    local latency_count=0
+    local max_latency_ns=0
+    local min_latency_ns=""
+    local worker_start_ns worker_end_ns
 
     printf "Worker %s starting (%s requests)\n" "$worker_id" "$request_count" >> "$worker_log"
+    worker_start_ns=$(now_ns)
 
     for ((i = 1; i <= request_count; i++)); do
         local idx
@@ -278,11 +297,24 @@ run_worker() {
         local path="${PATHS[idx]}"
         local url="${BASE_URL}${path}"
 
+        local req_start_ns req_end_ns latency_ns
+        req_start_ns=$(now_ns)
         if "${curl_base[@]}" "$url" >>"$worker_log" 2>&1; then
             success=$((success + 1))
         else
             failure=$((failure + 1))
             printf "Request %d to %s failed (worker %s)\n" "$i" "$url" "$worker_id" >>"$worker_log"
+        fi
+        req_end_ns=$(now_ns)
+
+        latency_ns=$((req_end_ns - req_start_ns))
+        total_latency_ns=$((total_latency_ns + latency_ns))
+        latency_count=$((latency_count + 1))
+        if [[ -z "$min_latency_ns" ]] || (( latency_ns < min_latency_ns )); then
+            min_latency_ns=$latency_ns
+        fi
+        if (( latency_ns > max_latency_ns )); then
+            max_latency_ns=$latency_ns
         fi
 
         index_counts[$idx]=$(( ${index_counts[$idx]:-0} + 1 ))
@@ -291,10 +323,19 @@ run_worker() {
             msleep "$SLEEP_MS"
         fi
     done
+    worker_end_ns=$(now_ns)
+    local worker_duration_ns=$((worker_end_ns - worker_start_ns))
 
     {
         printf "success=%d\n" "$success"
         printf "failure=%d\n" "$failure"
+        printf "latency_sum_ns=%d\n" "$total_latency_ns"
+        printf "latency_count=%d\n" "$latency_count"
+        printf "latency_min_ns=%d\n" "${min_latency_ns:-0}"
+        printf "latency_max_ns=%d\n" "$max_latency_ns"
+        printf "start_ns=%s\n" "$worker_start_ns"
+        printf "end_ns=%s\n" "$worker_end_ns"
+        printf "duration_ns=%d\n" "$worker_duration_ns"
         for idx in "${!PATHS[@]}"; do
             printf "path_%d_count=%d\n" "$idx" "${index_counts[$idx]:-0}"
         done
@@ -329,10 +370,18 @@ for pid in "${pids[@]}"; do
     fi
 done
 set -e
+RUN_END_NS=$(now_ns)
 
 total_success=0
 total_failure=0
 declare -a total_index_counts=()
+total_latency_sum_ns=0
+total_latency_count=0
+overall_latency_min_ns=""
+overall_latency_max_ns=0
+earliest_start_ns=""
+latest_end_ns=""
+total_duration_ns=0
 
 for summary in "$LOG_DIR"/worker_*.summary; do
     [[ -f "$summary" ]] || continue
@@ -344,6 +393,35 @@ for summary in "$LOG_DIR"/worker_*.summary; do
                 ;;
             failure)
                 total_failure=$((total_failure + value))
+                ;;
+            latency_sum_ns)
+                total_latency_sum_ns=$((total_latency_sum_ns + value))
+                ;;
+            latency_count)
+                total_latency_count=$((total_latency_count + value))
+                ;;
+            latency_min_ns)
+                if [[ -z "$overall_latency_min_ns" ]] || (( value < overall_latency_min_ns )); then
+                    overall_latency_min_ns=$value
+                fi
+                ;;
+            latency_max_ns)
+                if (( value > overall_latency_max_ns )); then
+                    overall_latency_max_ns=$value
+                fi
+                ;;
+            start_ns)
+                if [[ -z "$earliest_start_ns" ]] || (( value < earliest_start_ns )); then
+                    earliest_start_ns=$value
+                fi
+                ;;
+            end_ns)
+                if [[ -z "$latest_end_ns" ]] || (( value > latest_end_ns )); then
+                    latest_end_ns=$value
+                fi
+                ;;
+            duration_ns)
+                total_duration_ns=$((total_duration_ns + value))
                 ;;
             path_*_count)
                 idx="${key#path_}"
@@ -358,6 +436,42 @@ printf "\nRun complete.\n"
 printf "  Successful requests : %d\n" "$total_success"
 printf "  Failed requests     : %d\n" "$total_failure"
 printf "  Total observed      : %d\n" $((total_success + total_failure))
+
+if [[ -n "$earliest_start_ns" && -n "$latest_end_ns" ]]; then
+    run_duration_ns=$((latest_end_ns - earliest_start_ns))
+else
+    run_duration_ns=$((RUN_END_NS - RUN_START_NS))
+fi
+if (( run_duration_ns < 0 )); then
+    run_duration_ns=0
+fi
+
+run_duration_sec=$(awk -v ns="$run_duration_ns" 'BEGIN{printf "%.3f", ns/1e9}')
+total_attempts=$((total_success + total_failure))
+if (( run_duration_ns > 0 )); then
+    aggregate_success_rate=$(awk -v success="$total_success" -v ns="$run_duration_ns" 'BEGIN{if (ns > 0) printf "%.2f", success/(ns/1e9); else printf "n/a"}')
+    aggregate_request_rate=$(awk -v count="$total_attempts" -v ns="$run_duration_ns" 'BEGIN{if (ns > 0) printf "%.2f", count/(ns/1e9); else printf "n/a"}')
+else
+    aggregate_success_rate="n/a"
+    aggregate_request_rate="n/a"
+fi
+
+if (( total_latency_count > 0 )); then
+    average_latency_ms=$(awk -v sum="$total_latency_sum_ns" -v count="$total_latency_count" 'BEGIN{printf "%.3f", (sum/count)/1e6}')
+    min_latency_ms=$(awk -v ns="${overall_latency_min_ns:-0}" 'BEGIN{printf "%.3f", ns/1e6}')
+    max_latency_ms=$(awk -v ns="$overall_latency_max_ns" 'BEGIN{printf "%.3f", ns/1e6}')
+else
+    average_latency_ms="n/a"
+    min_latency_ms="n/a"
+    max_latency_ms="n/a"
+fi
+
+printf "  Run duration       : %s s\n" "$run_duration_sec"
+printf "  Aggregate throughput (success) : %s req/s\n" "$aggregate_success_rate"
+printf "  Aggregate request rate (all)   : %s req/s\n" "$aggregate_request_rate"
+printf "  Average latency    : %s ms (per request)\n" "$average_latency_ms"
+printf "  Min latency        : %s ms\n" "$min_latency_ms"
+printf "  Max latency        : %s ms\n" "$max_latency_ms"
 
 printf "  Observed mix        : "
 for idx in "${!PATHS[@]}"; do

@@ -51,13 +51,13 @@ func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 
 			// Set SO_REUSEADDR on the socket to allow reuse of local addresses.
 			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
-				log.Println("setsockopt(SO_REUSEADDR) failed: %v", err)
+				log.Printf("setsockopt(SO_REUSEADDR) failed: %v\n", err)
 				return
 			}
 
 			// Set SO_REUSEPORT on the socket for both instances (because eBPF program works on socket with SO_REUSEPORT configured)
 			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
-				log.Println("setsockopt(SO_REUSEPORT) failed: %v", err)
+				log.Printf("setsockopt(SO_REUSEPORT) failed: %v\n", err)
 				return
 			}
 			// Set eBPF program to be invoked for socket selection
@@ -67,7 +67,7 @@ func getListenConfig(prog *ebpf.Program, installProgram bool) net.ListenConfig {
 				// In "function" words, for fd on the SOL_SOCKET lever, set the unix.SO_ATTACH_REUSEPORT_EBPF option to eBPF program file descriptor.
 				err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_ATTACH_REUSEPORT_EBPF, prog.FD())
 				if err != nil {
-					log.Println("setsockopt(SO_ATTACH_REUSEPORT_EBPF) failed: %v", err)
+					fmt.Printf("setsockopt(SO_ATTACH_REUSEPORT_EBPF) failed: %v\n", err)
 				} else {
 					log.Println("eBPF program attached to the SO_REUSEPORT socket group!")
 				}
@@ -310,6 +310,22 @@ func main() {
 		}
 		slotMap.Close()
 		log.Printf("Updated slot %d with cookie 0x%x", k, cookie)
+
+		acceptqMap, err := ebpf.LoadPinnedMap("/sys/fs/bpf/acceptq_map", nil)
+		if err != nil {
+			log.Fatalf("Unable to load acceptq map: %v", err)
+		}
+		initialAcceptq := acceptqueueAcceptq{
+			Curr: 0,
+			Max:  1,
+			Cpu:  0,
+		}
+		if err := acceptqMap.Update(&cookie, &initialAcceptq, ebpf.UpdateAny); err != nil {
+			acceptqMap.Close()
+			log.Fatalf("Unable to initialize acceptq map for cookie: %v", err)
+		}
+		acceptqMap.Close()
+		log.Printf("Initialized accept queue entry for cookie 0x%x", cookie)
 	}
 
 	err = server.Serve(&slowListener{Listener: ln, delay: 50 * time.Millisecond})
