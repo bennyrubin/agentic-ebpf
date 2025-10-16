@@ -252,17 +252,13 @@ else
     printf "  Sleep          : disabled\n"
 fi
 
-LOG_ROOT="wrk_log"
-mkdir -p "$LOG_ROOT"
-
-LOG_DIR=$(mktemp -d "$LOG_ROOT/per_connection.XXXXXX")
-if [[ -z "$LOG_DIR" || ! -d "$LOG_DIR" ]]; then
-    error "failed to create log directory under $LOG_ROOT"
-fi
+LOG_DIR=${LOG_DIR:-per_connection_wrk_log}
+rm -rf "$LOG_DIR"
+mkdir -p "$LOG_DIR"
 
 printf "Logs will be stored in %s\n" "$LOG_DIR"
 
-curl_base=(curl --http1.1 --no-keepalive --fail -sS -o /dev/null --connect-timeout 2 --max-time 5)
+curl_base=(curl --http1.1 --no-keepalive --fail -sS -o /dev/null --connect-timeout 2 --max-time 5 --ipv4)
 if [[ -n "$REUSE_PORT" ]]; then
     curl_base+=(--local-port "${REUSE_PORT}-${REUSE_PORT}")
 fi
@@ -501,4 +497,37 @@ printf "Detailed logs per worker are available in %s\n" "$LOG_DIR"
 
 if (( worker_failures )); then
     printf "Warning: one or more workers exited with a non-zero status. Check worker logs for details.\n" >&2
+fi
+
+AGGREGATED_LOG="${LOG_DIR}/per-connection-workload.log"
+> "$AGGREGATED_LOG"
+have_worker_logs=0
+for worker_log in "$LOG_DIR"/worker_*.log; do
+    [[ -f "$worker_log" ]] || continue
+    have_worker_logs=1
+    worker_name=$(basename "$worker_log")
+    {
+        printf '===== %s START =====\n' "$worker_name"
+        cat "$worker_log"
+        printf '===== %s END =====\n\n' "$worker_name"
+    } >>"$AGGREGATED_LOG"
+    rm -f "$worker_log"
+done
+if (( have_worker_logs )); then
+    printf "Combined worker logs written to %s\n" "$AGGREGATED_LOG"
+else
+    rm -f "$AGGREGATED_LOG"
+fi
+
+if command -v python3 >/dev/null 2>&1; then
+    SUMMARY_OUTPUT="${LOG_DIR}/per-connection-workload-summary.csv"
+    METRICS_OUTPUT="${LOG_DIR}/per-connection-workload-metrics.csv"
+    echo "Generating summary CSV at $SUMMARY_OUTPUT"
+    python3 "$(dirname "$0")/per-connection-workload-summary.py" \
+        --logs-dir "$LOG_DIR" \
+        --output "$SUMMARY_OUTPUT" \
+        --metrics-output "$METRICS_OUTPUT"
+    echo "Run metrics CSV available at $METRICS_OUTPUT"
+else
+    echo "python3 not found in PATH; skipping summary generation" >&2
 fi
