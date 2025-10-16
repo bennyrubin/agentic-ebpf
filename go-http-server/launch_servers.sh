@@ -17,6 +17,14 @@ rm -rf log
 mkdir -p log
 mkdir -p .gocache
 
+# Ensure accept queue BPF program is loaded
+if sudo bpftool prog show pinned /sys/fs/bpf/acceptq_prog >/dev/null 2>&1; then
+    echo "Found existing pinned acceptq BPF program at /sys/fs/bpf/acceptq_prog"
+else
+    echo "Loading acceptq BPF program"
+    sudo bpftool prog load server_code/eBPF/acceptq.bpf.o /sys/fs/bpf/acceptq_prog
+fi
+
 # Get list of CPUs on NUMA node 0
 CPUS_NODE0=$(lscpu -p=CPU,NODE | grep -v '^#' | awk -F, '$2==0 {print $1}')
 NUM_CPUS_NODE0=$(echo "$CPUS_NODE0" | wc -l)
