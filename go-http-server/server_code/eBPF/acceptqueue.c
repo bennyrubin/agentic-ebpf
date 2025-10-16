@@ -57,7 +57,6 @@ enum sk_action acceptq_selector(struct sk_reuseport_md *reuse)
 
 		if (aq->max == 0)
 			aq->max = 1;
-		// Calculate utilization as percentage: (curr / max) * 100
 		__u32 util = aq->curr;
 		bpf_printk("slot=%u cookie=0x%llx curr=%u max=%u util=%u",
 			   i, *cookie, aq->curr, aq->max, util);

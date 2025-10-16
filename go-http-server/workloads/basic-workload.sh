@@ -60,26 +60,6 @@ done
 wait
 echo "All clients finished."
 
-AGGREGATED_LOG="${LOG_DIR}/basic-workload.log"
-> "$AGGREGATED_LOG"
-have_worker_logs=0
-for worker_log in "$LOG_DIR"/wrk_client_*.log; do
-    [[ -f "$worker_log" ]] || continue
-    have_worker_logs=1
-    worker_name=$(basename "$worker_log")
-    {
-        printf '===== %s START =====\n' "$worker_name"
-        cat "$worker_log"
-        printf '===== %s END =====\n\n' "$worker_name"
-    } >>"$AGGREGATED_LOG"
-    rm -f "$worker_log"
-done
-if (( have_worker_logs )); then
-    echo "Combined worker logs written to $AGGREGATED_LOG"
-else
-    rm -f "$AGGREGATED_LOG"
-fi
-
 if command -v python3 >/dev/null 2>&1; then
     SUMMARY_OUTPUT="${LOG_DIR}/basic-workload-summary.csv"
     METRICS_OUTPUT="${LOG_DIR}/basic-workload-summary-metrics.csv"

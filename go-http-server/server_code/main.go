@@ -5,6 +5,7 @@ package main
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go roundrobin eBPF/roundrobin.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go cpuutil eBPF/cpuutil.c
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go acceptqueue eBPF/acceptqueue.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go agent eBPF/agent.c
 
 import (
 	"context"
@@ -209,8 +210,15 @@ func loadPolicy(policy string) (LoadedObjects, error) {
 		}, nil
 
 	case "agent":
-		// Placeholder for agent policy, implement as needed
-		return LoadedObjects{}, fmt.Errorf("agent policy is not implemented")
+		var objs agentObjects
+		if err := loadAgentObjects(&objs, &mapOptions); err != nil {
+			return LoadedObjects{}, err
+		}
+		return LoadedObjects{
+			Program: objs.agentPrograms.AgentSelector,
+			Map:     objs.agentMaps.TcpBalancingTargets,
+			Close:   objs.Close,
+		}, nil
 
 	default:
 		validPolicies := []string{"default", "pickfirst", "round-robin", "cpuutil", "acceptqueue", "agent"}

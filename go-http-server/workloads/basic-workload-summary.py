@@ -99,6 +99,9 @@ def parse_latency(token: str) -> float:
 
 
 def parse_throughput(token: str) -> float:
+    token = token.strip()
+    if token.lower() in {"nan", "-nan", "+nan"}:
+        return 0.0
     match = re.fullmatch(r"([0-9]*\.?[0-9]+)([kmg]?)", token.lower())
     if not match:
         raise ValueError(f"Unrecognized throughput value: {token!r}")

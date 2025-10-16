@@ -12,6 +12,20 @@ fi
 NUM_SERVERS=$1
 POLICY=$2
 
+# Clean up any previous server processes
+pkill -f "go run ./server_code/" >/dev/null 2>&1 || true
+
+# Ensure port 8080 is free before starting
+fuser -k 8080/tcp >/dev/null 2>&1 || true
+
+# Terminate other launch_servers.sh instances (exclude current script)
+current_pid=$$
+pgrep -f "[l]aunch_servers.sh" | while read -r pid; do
+    if [[ "$pid" != "$current_pid" ]]; then
+        kill "$pid" >/dev/null 2>&1 || true
+    fi
+done
+
 # Recreate the log directory every run
 rm -rf log
 mkdir -p log
@@ -108,7 +122,7 @@ for cpu in $CPUS_NODE0; do
 
     renice -20 -p "$pid" >/dev/null || true
 
-    sleep .8 
+    sleep .8
     ((i++))
 done
 

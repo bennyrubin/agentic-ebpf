@@ -3,6 +3,9 @@ vendor
 *.o
 */wrk_log/
 */log/
+**/wrk_log/
+**/*log/
+**/__pycache__
 .gocache
 .gocache/
 .gocache-user
