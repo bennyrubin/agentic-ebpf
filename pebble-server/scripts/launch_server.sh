@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+BIN_DIR="$ROOT/bin"
+mkdir -p "$BIN_DIR"
+
+THREADS=4
+POLICY="default"
+DB_PATH="$ROOT/pebble.data"
+LISTEN="127.0.0.1:9000"
+LOG_DIR="$ROOT/logs/server"
+RESULTS_DIR="$ROOT/results"
+
+usage() {
+  cat <<USAGE
+Usage: $0 [options]
+  -t <threads>   number of worker sockets (default: $THREADS)
+  -p <policy>    load-balancing policy: default|round_robin|agent
+  -d <db-path>   Pebble directory (default: $DB_PATH)
+  -l <address>   UDP listen address (default: $LISTEN)
+  -o <log-dir>   directory for server logs (default: $LOG_DIR)
+  -r <results>   directory to store experiment metadata (default: $RESULTS_DIR)
+USAGE
+}
+
+while getopts ":t:p:d:l:o:r:" opt; do
+  case "$opt" in
+    t) THREADS="$OPTARG" ;;
+    p) POLICY="$OPTARG" ;;
+    d) DB_PATH="$OPTARG" ;;
+    l) LISTEN="$OPTARG" ;;
+    o) LOG_DIR="$OPTARG" ;;
+    r) RESULTS_DIR="$OPTARG" ;;
+    :) echo "Option -$OPTARG requires an argument." >&2; exit 1 ;;
+    \?) usage; exit 1 ;;
+  esac
+done
+
+mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$ROOT/run"
+
+SERVER_BIN="$BIN_DIR/pebble_server"
+
+export GOCACHE="$ROOT/.gocache"
+go build -o "$SERVER_BIN" ./cmd/pebble_server
+
+if [[ -f "$ROOT/run/server.pid" ]]; then
+  if kill -0 "$(cat "$ROOT/run/server.pid")" >/dev/null 2>&1; then
+    echo "Existing server detected; terminating"
+    kill "$(cat "$ROOT/run/server.pid")" || true
+    sleep 1
+  fi
+fi
+
+"$SERVER_BIN" \
+  -db "$DB_PATH" \
+  -listen "$LISTEN" \
+  -workers "$THREADS" \
+  -policy "$POLICY" \
+  -log-dir "$LOG_DIR" \
+  -results-dir "$RESULTS_DIR" &
+
+PID=$!
+echo $PID > "$ROOT/run/server.pid"
+
+echo "Server started (pid=$PID, policy=$POLICY, workers=$THREADS)"

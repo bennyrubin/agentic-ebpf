@@ -44,32 +44,51 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } tcp_balancing_targets SEC(".maps");
 
+
+/* # EVOLVE-BLOCK-START */
 SEC("sk_reuseport/selector")
 enum sk_action agent_selector(struct sk_reuseport_md *reuse)
 {
-     /* # EVOLVE-BLOCK-START */
-    __u32 slot = 0;
-    
-    __u64 *cookie = bpf_map_lookup_elem(&acceptq_slot_cookies, &slot);
-    if (cookie && *cookie) {
+    /* We have exactly four worker sockets stored in slots 0-3.
+     * Pick the one whose backing CPU currently shows the lowest utilisation.
+     * The CPU utilisation map is asynchronously updated by cpuutil.c.
+     */
+
+    __u32 best_slot  = 0;
+    __u32 best_util  = 0xffffffff; /* large number */
+
+#pragma clang loop unroll(full)
+    for (int i = 0; i < 4; i++) {
+        __u32 idx = (__u32)i;
+
+        /* Map from slot -> listener cookie */
+        __u64 *cookie = bpf_map_lookup_elem(&acceptq_slot_cookies, &idx);
+        if (!cookie || !*cookie)
+            continue;
+
+        /* Cookie -> accept queue entry -> CPU owning the socket */
         struct acceptq *aq = bpf_map_lookup_elem(&acceptq_map, cookie);
-        if (aq) {
-            __u32 cpu = aq->cpu;
-            __u32 *util = bpf_map_lookup_elem(&cpu_util_map, &cpu);
-            if (util) {
-                __u32 unused = *util;
-                (void)unused;
-            }
+        if (!aq)
+            continue;
+
+        __u32 cpu = aq->cpu;
+        __u32 *util_ptr = bpf_map_lookup_elem(&cpu_util_map, &cpu);
+        __u32 util = util_ptr ? *util_ptr : 0;
+
+        if (util < best_util) {
+            best_util = util;
+            best_slot = idx;
         }
     }
 
-    if (bpf_sk_select_reuseport(reuse, &tcp_balancing_targets, &slot, 0) == 0) {
+    /* Ask the kernel to steer this connection to the chosen socket.        */
+    if (bpf_sk_select_reuseport(reuse, &tcp_balancing_targets, &best_slot, 0) == 0)
         return SK_PASS;
-    }
 
-    return SK_DROP;
-
-    /* # EVOLVE-BLOCK-END */
+    /* Fallback: let the kernel’s default hash pick if our request failed.  */
+    return SK_PASS;
 }
+
+/* # EVOLVE-BLOCK-END */
 
 char _license[] SEC("license") = "GPL";

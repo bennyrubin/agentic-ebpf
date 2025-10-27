@@ -1,0 +1,14 @@
+{
+  "threads": "2",
+  "policy": "round_robin",
+  "db_path": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/pebble.data",
+  "keys": "10000",
+  "value_bytes": "256",
+  "duration_sec": "5",
+  "rate_rps": "200",
+  "get_fraction": ".95",
+  "scan_limit": "500",
+  "key_prefix": "key",
+  "key_space": "100000",
+  "listen": "127.0.0.1:9000"
+}

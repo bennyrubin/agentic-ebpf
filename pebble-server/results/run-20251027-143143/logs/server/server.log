@@ -1,0 +1,21 @@
+2025/10/27 14:31:44.892821 server starting addr=127.0.0.1:9000 workers=2 policy=default
+2025/10/27 14:31:47.213386 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:47.215501 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:47.314675 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:47.744553 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:48.583336 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:48.824631 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:48.844361 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:48.899517 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:49.055039 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:49.104272 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:49.482933 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:50.003517 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:50.079832 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:50.117966 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:50.268461 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:50.339114 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:51.109506 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:51.387477 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:51.538805 worker=0 write error: write udp 127.0.0.1:9000->127.0.0.1:58700: sendto: message too long
+2025/10/27 14:31:56.049321 server stopped

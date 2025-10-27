@@ -39,6 +39,7 @@ METRICS_DEFAULTS: Dict[str, float] = {
     "average_tput": 0.0,
     "average_latency": 0.0,
     "total_score": 0.0,
+    "combined_score": 0.0,
     "run_successful": 0.0,
     "compile_successful": 0.0,
 }
@@ -76,6 +77,7 @@ def _start_servers() -> Tuple[Optional[subprocess.Popen], list[str], threading.T
     """Launch the servers with sudo and return process handle plus captured output."""
     output_buffer: list[str] = []
     try:
+        print("DEBUG START SERVERS")
         proc = subprocess.Popen(
             SERVER_LAUNCH_CMD,
             cwd=ROOT_DIR,
@@ -158,6 +160,7 @@ def _scan_server_logs_for_errors() -> Dict[str, str]:
 def _run_workload() -> Tuple[bool, subprocess.CompletedProcess[str]]:
     """Execute the basic workload script."""
     try:
+        print("DEBUG RUN WORKLOAD")
         completed = subprocess.run(
             ("sudo", "-n", *WORKLOAD_CMD),
             cwd=WORKLOADS_DIR,
@@ -173,8 +176,11 @@ def _run_workload() -> Tuple[bool, subprocess.CompletedProcess[str]]:
         try:
             # Purposefully wait a second before cleanup to allow subprocesses to shut down gracefully
             time.sleep(1)
+            print("[DEBUG] _run_workload: running cleanup pkill commands")
             subprocess.run(["sudo", "-n", "pkill", "-f", "launch_servers"], cwd=WORKLOADS_DIR, check=False)
-            subprocess.run(["sudo", "-n", "pkill", "-f", "server_code"], cwd=WORKLOADS_DIR, check=False)
+            print("DEBUG KILL 2")
+            # subprocess.run(["sudo", "-n", "pkill", "-f", "[g]o run ./server_code/"], check=False)
+            # subprocess.run(["sudo", "-n", "pkill", "-f", "/tmp/go-build.*exe/server_code"], check=False)
         except Exception:
             pass  # Ignore errors in cleanup
 
@@ -266,6 +272,7 @@ def evaluate(program_path: str) -> EvaluationResult:
             artifacts["launch_failure"] = "Detected 'error' keyword in server logs."
             return EvaluationResult(metrics=metrics, artifacts=artifacts)
 
+        time.sleep(6)
         workload_ok, workload_result = _run_workload()
         artifacts["workload_stdout"] = workload_result.stdout
         artifacts["workload_stderr"] = workload_result.stderr
@@ -291,6 +298,7 @@ def evaluate(program_path: str) -> EvaluationResult:
                 "average_tput": avg_tput,
                 "average_latency": avg_latency,
                 "total_score": total_score,
+                "combined_score": total_score,
                 "run_successful": 1.0,
             }
         )

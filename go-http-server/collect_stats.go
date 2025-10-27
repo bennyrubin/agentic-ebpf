@@ -24,7 +24,7 @@ var (
 	mapPath             = "/sys/fs/bpf/cpu_util_map"
 	acceptqStatsMapPath = "/sys/fs/bpf/acceptq_map"
 	acceptqSlotMapPath  = "/sys/fs/bpf/acceptq_slot_cookies"
-	acceptqProgObj      = "server_code/eBPF/acceptq_bpf.o"
+	acceptqProgObj      = "server_code/eBPF/acceptq.bpf.o"
 	acceptqProgPin      = "/sys/fs/bpf/acceptq_bpf"
 	maxCores            = 64
 )

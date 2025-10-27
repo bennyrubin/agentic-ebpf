@@ -6,7 +6,9 @@ vendor
 **/wrk_log/
 **/*log/
 **/__pycache__
-.gocache
-.gocache/
-.gocache-user
-.gocache-user/
+**/gocache**
+**/gocache*/**
+**/*gocache**
+**/*gocache*/**
+**/pebble.data**
+pebble-server/results/** 

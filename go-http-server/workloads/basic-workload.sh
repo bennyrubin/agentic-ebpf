@@ -53,6 +53,7 @@ for cpu in $CPUS_NODE0; do
     echo "Client $i pinned to CPU $cpu hitting $URL"
     LOG_PATH="$LOG_DIR/wrk_client_${i}.log"
     taskset -c "$cpu" wrk2 -t1 -c1 -d20s -R 1000 "$URL" > "$LOG_PATH" 2>&1 &
+    sleep 0.1
 
     ((i++))
 done

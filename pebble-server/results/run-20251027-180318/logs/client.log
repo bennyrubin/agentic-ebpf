@@ -1,0 +1,2 @@
+[client] 2025/10/27 18:03:22.228838 starting workload server=127.0.0.1:9000 duration=5s rate=5000.00 get_frac=0.95
+[client] 2025/10/27 18:03:29.230697 sent=7933 recv=7933
