@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -13,7 +14,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,9 +21,47 @@ import (
 	"golang.org/x/time/rate"
 )
 
-type requestRecord struct {
-	sent    time.Time
-	reqType string
+const (
+	idTimeHexLen = 16
+	idSeqHexLen  = 8
+	idTotalLen   = idTimeHexLen + idSeqHexLen + 1
+
+	reqTypeGet  = byte('G')
+	reqTypeScan = byte('S')
+)
+
+var hexDigits = [...]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'}
+
+type latencyRecord struct {
+	latency float64
+	isGet   bool
+}
+
+type latencyAggregator struct {
+	overall []float64
+	get     []float64
+	scan    []float64
+}
+
+func newLatencyAggregator() *latencyAggregator {
+	return &latencyAggregator{
+		overall: make([]float64, 0, 2048),
+		get:     make([]float64, 0, 1024),
+		scan:    make([]float64, 0, 1024),
+	}
+}
+
+func (a *latencyAggregator) record(rec latencyRecord) {
+	a.overall = append(a.overall, rec.latency)
+	if rec.isGet {
+		a.get = append(a.get, rec.latency)
+	} else {
+		a.scan = append(a.scan, rec.latency)
+	}
+}
+
+func (a *latencyAggregator) totalRecv() int {
+	return len(a.overall)
 }
 
 func main() {
@@ -80,143 +118,246 @@ func main() {
 
 	rand.Seed(time.Now().UnixNano())
 
-	var (
-		mu          sync.Mutex
-		outstanding = make(map[string]requestRecord)
-		latencies   []float64
-		latByType   = map[string][]float64{
-			"GET":  {},
-			"SCAN": {},
-		}
-		sentCount  int
-		recvCount  int
-		sentByType = map[string]int{
-			"GET":  0,
-			"SCAN": 0,
-		}
-		recvByType = map[string]int{
-			"GET":  0,
-			"SCAN": 0,
-		}
-	)
-
 	limiter := rate.NewLimiter(rate.Limit(*targetRate), workers)
 	ctx, cancel := context.WithTimeout(context.Background(), *duration)
 	defer cancel()
 
-	var sendWG sync.WaitGroup
+	var (
+		sendWG    sync.WaitGroup
+		recvWG    sync.WaitGroup
+		aggWG     sync.WaitGroup
+		monitorWG sync.WaitGroup
+	)
+
+	latencyCh := make(chan latencyRecord, 8192)
+	aggregator := newLatencyAggregator()
+
+	var (
+		sentTotal int64
+		sentGet   int64
+		sentScan  int64
+		recvTotal int64
+	)
+
+	aggWG.Add(1)
+	go func() {
+		defer aggWG.Done()
+		for rec := range latencyCh {
+			aggregator.record(rec)
+			atomic.AddInt64(&recvTotal, 1)
+		}
+	}()
+
+	monitorDone := make(chan struct{})
+	monitorWG.Add(1)
+	go func() {
+		defer monitorWG.Done()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				sent := atomic.LoadInt64(&sentTotal)
+				recv := atomic.LoadInt64(&recvTotal)
+				outstanding := sent - recv
+				if outstanding > 0 {
+					logger.Printf("outstanding=%d sent=%d recv=%d", outstanding, sent, recv)
+				}
+			case <-monitorDone:
+				return
+			}
+		}
+	}()
+
+	quit := make(chan struct{})
+
 	var seq uint64
 	for i := 0; i < workers; i++ {
-		sendWG.Add(1)
+		conn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			logger.Fatalf("dial udp worker=%d: %v", i, err)
+		}
+		defer conn.Close()
+
 		seed := time.Now().UnixNano() + int64(i)
 		rng := rand.New(rand.NewSource(seed))
-		go func(rng *rand.Rand) {
+
+		workerID := i
+
+		sendWG.Add(1)
+		go func(workerID int, conn *net.UDPConn, rng *rand.Rand) {
 			defer sendWG.Done()
 			buf := make([]byte, 0, 256)
 			for {
 				if err := limiter.Wait(ctx); err != nil {
 					return
 				}
-				id := int(atomic.AddUint64(&seq, 1) - 1)
+				currSeq := atomic.AddUint64(&seq, 1) - 1
+				isGet := true
 				reqType := "GET"
 				if rng.Float64() > *getFrac {
 					reqType = "SCAN"
+					isGet = false
 				}
-				reqID := makeReqID(id)
+				sendTime := time.Now()
+				reqID := makeReqID(sendTime.UnixNano(), currSeq, isGet)
 				payload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, *scanLimit)
-				now := time.Now()
-				mu.Lock()
-				outstanding[reqID] = requestRecord{sent: now, reqType: reqType}
-				sentCount++
-				sentByType[reqType]++
-				mu.Unlock()
 				if _, err := conn.Write(payload); err != nil {
-					logger.Printf("write error: %v", err)
-					mu.Lock()
-					delete(outstanding, reqID)
-					mu.Unlock()
+					logger.Printf("write error (worker=%d): %v", workerID, err)
+					buf = payload[:0]
+					continue
+				}
+				atomic.AddInt64(&sentTotal, 1)
+				if isGet {
+					atomic.AddInt64(&sentGet, 1)
+				} else {
+					atomic.AddInt64(&sentScan, 1)
 				}
 				buf = payload[:0]
 			}
-		}(rng)
-	}
+		}(workerID, conn, rng)
 
-	quit := make(chan struct{})
-	go func() {
-		buf := make([]byte, 64*1024)
-		for {
-			if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
-					return
-				}
-				logger.Printf("set read deadline: %v", err)
-			}
-			n, err := conn.Read(buf)
-			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					select {
-					case <-quit:
+		recvWG.Add(1)
+		go func(workerID int, conn *net.UDPConn) {
+			defer recvWG.Done()
+			buf := make([]byte, 64*1024)
+			for {
+				if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
 						return
-					default:
-						continue
 					}
+					logger.Printf("set read deadline (worker=%d): %v", workerID, err)
 				}
-				if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+				n, err := conn.Read(buf)
+				if err != nil {
+					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						select {
+						case <-quit:
+							return
+						default:
+							continue
+						}
+					}
+					if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
+						return
+					}
+					logger.Printf("read error (worker=%d): %v", workerID, err)
+					continue
+				}
+
+				fields := bytes.Fields(buf[:n])
+				if len(fields) < 2 {
+					continue
+				}
+				sendNano, isGet, ok := parseReqID(fields[1])
+				if !ok {
+					continue
+				}
+				latencyMs := float64(time.Now().UnixNano()-sendNano) / 1e6
+				select {
+				case latencyCh <- latencyRecord{latency: latencyMs, isGet: isGet}:
+				case <-quit:
 					return
 				}
-				logger.Printf("read error: %v", err)
-				continue
 			}
-			resp := string(buf[:n])
-			fields := strings.Fields(resp)
-			if len(fields) < 1 {
-				continue
-			}
-			reqID := ""
-			if len(fields) > 1 {
-				reqID = fields[1]
-			}
-			mu.Lock()
-			rec, ok := outstanding[reqID]
-			if ok {
-				lat := time.Since(rec.sent).Seconds() * 1000
-				latencies = append(latencies, lat)
-				latByType[rec.reqType] = append(latByType[rec.reqType], lat)
-				delete(outstanding, reqID)
-				recvCount++
-				recvByType[rec.reqType]++
-			}
-			mu.Unlock()
-		}
-	}()
+		}(workerID, conn)
+	}
 
 	sendWG.Wait()
 
 	time.Sleep(2 * time.Second)
 	close(quit)
+	recvWG.Wait()
 
-	mu.Lock()
-	for _, rec := range outstanding {
-		logger.Printf("request %s outstanding for %s", rec.reqType, time.Since(rec.sent))
+	close(latencyCh)
+	aggWG.Wait()
+
+	close(monitorDone)
+	monitorWG.Wait()
+
+	totalSent := atomic.LoadInt64(&sentTotal)
+	totalRecv := aggregator.totalRecv()
+	totalGet := int(atomic.LoadInt64(&sentGet))
+	totalScan := int(atomic.LoadInt64(&sentScan))
+
+	if totalSent > 0 && totalRecv < int(totalSent) {
+		logger.Printf("warning: %d responses missing (sent=%d recv=%d)", int(totalSent)-totalRecv, totalSent, totalRecv)
 	}
-	mu.Unlock()
 
-	logger.Printf("sent=%d recv=%d", sentCount, recvCount)
+	logger.Printf("sent=%d recv=%d", totalSent, totalRecv)
 
-	if len(latencies) == 0 {
+	if totalRecv == 0 {
 		fmt.Println("No responses received; unable to compute latency stats")
 		return
 	}
 
-	sort.Float64s(latencies)
-	throughput := float64(recvCount) / duration.Seconds()
+	durationSeconds := duration.Seconds()
+	if durationSeconds <= 0 {
+		durationSeconds = 1
+	}
+	throughput := float64(totalRecv) / durationSeconds
 
-	fmt.Printf("Total sent: %d (GET=%d SCAN=%d)\n", sentCount, sentByType["GET"], sentByType["SCAN"])
-	fmt.Printf("Total received: %d (GET=%d SCAN=%d)\n", recvCount, recvByType["GET"], recvByType["SCAN"])
+	fmt.Printf("Total sent: %d (GET=%d SCAN=%d)\n", totalSent, totalGet, totalScan)
+	fmt.Printf("Total received: %d (GET=%d SCAN=%d)\n", totalRecv, len(aggregator.get), len(aggregator.scan))
 	fmt.Printf("Throughput: %.2f req/s\n", throughput)
-	reportLatencyStats("Overall", latencies)
-	reportLatencyStats("GET", latByType["GET"])
-	reportLatencyStats("SCAN", latByType["SCAN"])
+	reportLatencyStats("Overall", aggregator.overall)
+	reportLatencyStats("GET", aggregator.get)
+	reportLatencyStats("SCAN", aggregator.scan)
+}
+
+func makeReqID(sendNano int64, seq uint64, isGet bool) string {
+	var buf [idTotalLen]byte
+	writeHex(buf[:idTimeHexLen], uint64(sendNano))
+	writeHex(buf[idTimeHexLen:idTimeHexLen+idSeqHexLen], seq)
+	if isGet {
+		buf[idTotalLen-1] = reqTypeGet
+	} else {
+		buf[idTotalLen-1] = reqTypeScan
+	}
+	return string(buf[:])
+}
+
+func parseReqID(id []byte) (int64, bool, bool) {
+	if len(id) < idTotalLen {
+		return 0, false, false
+	}
+	sendNano, ok := parseHex(id[:idTimeHexLen])
+	if !ok {
+		return 0, false, false
+	}
+	typeByte := id[len(id)-1]
+	switch typeByte {
+	case reqTypeGet:
+		return int64(sendNano), true, true
+	case reqTypeScan:
+		return int64(sendNano), false, true
+	default:
+		return 0, false, false
+	}
+}
+
+func writeHex(dst []byte, value uint64) {
+	for i := len(dst) - 1; i >= 0; i-- {
+		dst[i] = hexDigits[value&0xF]
+		value >>= 4
+	}
+}
+
+func parseHex(src []byte) (uint64, bool) {
+	var v uint64
+	for _, b := range src {
+		switch {
+		case '0' <= b && b <= '9':
+			v = (v << 4) | uint64(b-'0')
+		case 'a' <= b && b <= 'f':
+			v = (v << 4) | uint64(b-'a'+10)
+		case 'A' <= b && b <= 'F':
+			v = (v << 4) | uint64(b-'A'+10)
+		default:
+			return 0, false
+		}
+	}
+	return v, true
 }
 
 func buildPayload(rng *rand.Rand, buf []byte, reqType, reqID, prefix string, keySpace, scanLimit int) []byte {
@@ -246,10 +387,6 @@ func appendKey(buf []byte, prefix string, keyIdx int) []byte {
 		return buf
 	}
 	return strconv.AppendInt(buf, int64(keyIdx), 10)
-}
-
-func makeReqID(seq int) string {
-	return "req-" + strconv.FormatInt(int64(seq), 10)
 }
 
 func percentile(data []float64, p float64) float64 {

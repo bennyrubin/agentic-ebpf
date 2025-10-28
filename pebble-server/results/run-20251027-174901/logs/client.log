@@ -1,6 +1,0 @@
-[client] 2025/10/27 17:49:04.931003 starting workload server=127.0.0.1:9000 duration=5s rate=10000.00 get_frac=0.95
-[client] 2025/10/27 17:49:11.932426 request GET outstanding for 6.639869915s
-[client] 2025/10/27 17:49:11.932619 request GET outstanding for 5.471438597s
-[client] 2025/10/27 17:49:11.932633 request GET outstanding for 4.34046395s
-[client] 2025/10/27 17:49:11.932643 request GET outstanding for 2.224182837s
-[client] 2025/10/27 17:49:11.932652 sent=18067 recv=18063

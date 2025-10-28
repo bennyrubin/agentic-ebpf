@@ -150,7 +150,7 @@ for idx in "${!ITERATION_LOGS[@]}"; do
 done
 
 echo "== Aggregating workload metrics =="
-LOG_DIR_PATH="$LOG_DIR" python3 - <<'PY'
+LOG_DIR_PATH="$LOG_DIR" RUN_DIR_PATH="$RUN_DIR" python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -214,7 +214,7 @@ for key in numeric_keys:
     summary[key] = {"average": avg, "stddev": stddev}
 
 output = {"iterations": iterations, "summary": summary}
-results_dir = pathlib.Path(r'"$RUN_DIR"')
+results_dir = pathlib.Path(os.environ["RUN_DIR_PATH"])
 (results_dir / "workload_summary.json").write_text(json.dumps(output, indent=2))
 PY
 
