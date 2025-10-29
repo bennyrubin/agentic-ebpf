@@ -1,0 +1,97 @@
+Attempt 1
+- Idea: Baseline measurement using original agent.c which always selects slot 0.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251028-155820
+- Metrics: throughput_avg=13093.95 req/s, overall_p99_avg=11819.75 ms
+- Reasoning: With all traffic pinned to worker 0, backlog builds up leading to huge tail latency and poor throughput; establishes baseline for comparison. Full program snapshot: codex.programs (Attempt 1).
+
+Attempt 2
+- Idea: Hash-based distribution across active workers, using new agent_state map to learn worker count; added hash mixing and multi-slot fallback search.
+- Compile/Load Attempts: 1 (clang warned about loop unroll but program loaded successfully)
+- Results dir: results/run-20251028-160209
+- Metrics: throughput_avg=44955.53 req/s, overall_p99_avg=555.59 ms
+- Reasoning: Spreading flows via reuse->hash eliminates the single-thread bottleneck and massively increases throughput. We still observed a long-tail spike in iteration 3 (~1.6s) suggesting occasional queue buildup, so further refinement is needed (e.g., distinguishing heavy SCAN traffic). Full program snapshot: codex.programs (Attempt 2).
+
+Attempt 3
+- Idea: Introduced time-jittered hashing and SCAN-aware salt so heavy SCAN bursts can't pin to a single worker; also varied step sizes to walk the worker ring evenly.
+- Compile/Load Attempts: 2 (initial clang failure missing stdbool.h, second build passed with loop-unroll warning)
+- Results dir: results/run-20251028-160532
+- Metrics: throughput_avg=44909.07 req/s, overall_p99_avg=1.58 ms
+- Reasoning: Adding temporal jitter and SCAN diversification smoothed per-worker load, eliminating the long-tail spike while maintaining top throughput. Latencies are now sub-2ms at p99 for both GET and SCAN across all iterations. Full program snapshot: codex.programs (Attempt 3).
+
+Attempt 4
+- Idea: Layered a recency-aware map that tracks the last assignment timestamp per worker, preferring the idle worker with the largest gap before falling back to hashed order; still keeps SCAN salt and time jitter so classes stay separated.
+- Compile/Load Attempts: 1 (loop-unroll warnings only)
+- Results dir: results/run-20251029-121037
+- Metrics: throughput_avg=44943.31 req/s, overall_p99_avg=1.40 ms
+- Reasoning: Recency tracking further evens out burst allocation and removes residual jitter from Attempt 3; all iterations now show tightly clustered sub-1.5 ms p99 while sustaining peak throughput. Full program snapshot: codex.programs (Attempt 4).
+
+Attempt 5
+- Idea: Replace raw recency map with per-worker slot stats that track both last assignment and last SCAN time; SCAN requests impose a short cooldown so heavy scans spread across workers while GETs still prefer the stalest slot.
+- Compile/Load Attempts: 1 (loop-unroll warnings only)
+- Results dir: results/run-20251029-121258
+- Metrics: throughput_avg=44918.02 req/s, overall_p99_avg=1.37 ms
+- Reasoning: The scan cooldown trims another ~2% off the p99 tail while keeping throughput flat; SCAN latency spread improved (p90 ≈1.21 ms, p99 ≈1.68 ms). Full program snapshot: codex.programs (Attempt 5).
+
+Attempt 6
+- Idea: Added a virtual queue length model per worker; assignments decay over time, GET/SCAN add different weights, and SCANs within 2 ms tack on a small penalty so we pick the least-loaded socket first and break ties by recency.
+- Compile/Load Attempts: 1 (loop-unroll warnings only)
+- Results dir: results/run-20251029-121716
+- Metrics: throughput_avg=44918.40 req/s, overall_p99_avg=1.36 ms
+- Reasoning: Load-aware selection smooths GET/SCAN competition, shaving another ~1% off the overall p99 (GET p99 ≈1.30 ms) without hurting throughput. Full program snapshot: codex.programs (Attempt 6).
+
+Attempt 7
+- Idea: Introduced lightweight key-aware bias so GETs lean toward a preferred worker while still using the virtual load model; hoped to improve cache warmth without sacrificing balance.
+- Compile/Load Attempts: 4 (initial program too large; trimmed probe count and payload parsing to satisfy verifier)
+- Results dir: results/run-20251029-122601
+- Metrics: throughput_avg=44931.22 req/s, overall_p99_avg=2.57 ms
+- Reasoning: Hashing off key prefixes pushed GETs toward a narrow worker set, blowing up tails despite load feedback; abandoning this direction. Full program snapshot: codex.programs (Attempt 7).
+
+Attempt 8
+- Idea: Added a CPU-affinity fast path—if the current core’s slot looks lightly loaded, send the request there before running the full load-based search.
+- Compile/Load Attempts: 2 (first version hit the verifier’s instruction cap; trimmed to a single fast-path probe)
+- Results dir: results/run-20251029-123227
+- Metrics: throughput_avg=44925.64 req/s, overall_p99_avg=1.42 ms
+- Reasoning: CPU bias reduced the best-case gap pick, but the extra divergence hurt p99 slightly (~+0.06 ms) without improving throughput. Idea discarded. Full program snapshot: codex.programs (Attempt 8).
+
+Attempt 9
+- Idea: Bucket SCANs by parsing the limit from the UDP payload; heavy scans (limit ≥80) are steered to a dedicated worker subset while lighter GET/SCAN traffic hashes across the rest.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-123833
+- Metrics: throughput_avg=44927.33 req/s, overall_p99_avg=1.51 ms, get_p99≈1.03 ms, scan_p99≈4.14 ms
+- Reasoning: GET tails improved thanks to isolating heavy scans, but concentrating heavy scans onto a small subset inflated SCAN p99 and overall p99 versus Attempt 6; need to fan them out more. Full program snapshot: codex.programs (Attempt 9).
+
+Attempt 10
+- Idea: Kept the payload-based heavy-scan detection but fanned heavy scans across ~1/3 of the workers (max 3) so they stop piling onto a single socket.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-124031
+- Metrics: throughput_avg=44949.31 req/s, overall_p99_avg=1.33 ms, get_p99≈1.18 ms, scan_p99≈2.00 ms
+- Reasoning: Spreading heavy scans wider kept GET tails low while reining in the SCAN p99 blowup; still slightly behind Attempt 6 overall, so consider dynamic thresholds or separating ultra-heavy scans further. Full program snapshot: codex.programs (Attempt 10).
+
+Attempt 11
+- Idea: Let heavy scans use up to half the worker pool (max 4 slots), leaving the rest to GETs to reduce contention.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-124220
+- Metrics: throughput_avg=44945.53 req/s, overall_p99_avg=2.07 ms
+- Reasoning: Allowing heavy scans to spill across half the sockets drove GET tails up and overall p99 regressed; better to keep heavy traffic constrained. Full program snapshot: codex.programs (Attempt 11).
+
+Attempt 12
+- Idea: Keep heavy scans on all sockets but bias them by adding an offset + limit-derived mix to the hash so GETs and heavy scans favour different regions of the ring.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-124412
+- Metrics: throughput_avg=44922.71 req/s, overall_p99_avg=1.61 ms
+- Reasoning: Offset-only hashing still let heavy scans interfere with GETs, inflating p99; the simple ring shift wasn’t enough. Full program snapshot: codex.programs (Attempt 12).
+
+Attempt 13
+- Idea: Hash payload keys for GET/SCAN so flows from the same client spread across workers; heavy scans still go to a dedicated subset keyed by the start key.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-124654
+- Metrics: throughput_avg=44951.09 req/s, overall_p99_avg=2.59 ms
+- Reasoning: Key-aware hashing introduced big swings in SCAN tails; collisions on the heavy subset still hurt. Need a different pivot. Full program snapshot: codex.programs (Attempt 13).
+
+Attempt 14
+- Idea: Restore the heavy-scan subset but distribute heavy scans by hashing the SCAN start key, so clients hitting different key ranges split across the heavy sockets.
+- Compile/Load Attempts: 1 (success)
+- Results dir: results/run-20251029-124914
+- Metrics: throughput_avg=44932.29 req/s, overall_p99_avg=1.32 ms, get_p99≈1.19 ms, scan_p99≈2.06 ms
+- Reasoning: Key-aware sharding of heavy scans removed the single-worker hotspot from Attempt 9 and nearly matches the best (Attempt 6) while keeping GET tails low. Could tune the heavy threshold further, but this is our strongest payload-informed policy so far. Full program snapshot: codex.programs (Attempt 14).

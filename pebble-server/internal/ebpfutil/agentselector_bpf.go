@@ -11,6 +11,11 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type AgentSelectorAgentState struct {
+	Active uint32
+	Pad    uint32
+}
+
 // LoadAgentSelector returns the embedded CollectionSpec for AgentSelector.
 func LoadAgentSelector() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_AgentSelectorBytes)
@@ -59,6 +64,7 @@ type AgentSelectorProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type AgentSelectorMapSpecs struct {
+	PebbleAgentState *ebpf.MapSpec `ebpf:"pebble_agent_state"`
 	PebbleUdpTargets *ebpf.MapSpec `ebpf:"pebble_udp_targets"`
 }
 
@@ -81,11 +87,13 @@ func (o *AgentSelectorObjects) Close() error {
 //
 // It can be passed to LoadAgentSelectorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type AgentSelectorMaps struct {
+	PebbleAgentState *ebpf.Map `ebpf:"pebble_agent_state"`
 	PebbleUdpTargets *ebpf.Map `ebpf:"pebble_udp_targets"`
 }
 
 func (m *AgentSelectorMaps) Close() error {
 	return _AgentSelectorClose(
+		m.PebbleAgentState,
 		m.PebbleUdpTargets,
 	)
 }

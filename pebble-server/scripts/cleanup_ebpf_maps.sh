@@ -7,6 +7,8 @@ MAPS=(
   "/sys/fs/bpf/pebble_udp_targets"
   "/sys/fs/bpf/pebble_rr_state"
   "/sys/fs/bpf/agent_udp_targets"
+  "/sys/fs/bpf/pebble_agent_state"
+  "/sys/fs/bpf/pebble_agent_slots"
 )
 
 for map in "${MAPS[@]}"; do

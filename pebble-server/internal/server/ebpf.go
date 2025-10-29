@@ -34,7 +34,7 @@ func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {
 	case "round_robin":
 		return loadRoundRobin(workers)
 	case "agent":
-		return loadAgent()
+		return loadAgent(workers)
 	default:
 		return nil, ErrInvalidConfig(fmt.Sprintf("unknown policy %q", policy))
 	}
@@ -72,7 +72,7 @@ func loadRoundRobin(workers int) (*ebpfPolicy, error) {
 	}, nil
 }
 
-func loadAgent() (*ebpfPolicy, error) {
+func loadAgent(workers int) (*ebpfPolicy, error) {
 	if err := ensureRlimit(); err != nil {
 		return nil, err
 	}
@@ -83,6 +83,23 @@ func loadAgent() (*ebpfPolicy, error) {
 	if err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {
 		return nil, fmt.Errorf("load agent objects: %w", err)
 	}
+
+	if workers < 0 {
+		objs.Close()
+		return nil, ErrInvalidConfig("workers must be non-negative")
+	}
+
+	var key uint32 = 0
+	state := ebpfutil.AgentSelectorAgentState{
+		Active: uint32(workers),
+	}
+	if objs.PebbleAgentState != nil {
+		if err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("configure agent state: %w", err)
+		}
+	}
+
 	return &ebpfPolicy{
 		name:    "agent",
 		program: objs.AgentUdpSelector,

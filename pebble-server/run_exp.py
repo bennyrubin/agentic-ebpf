@@ -11,7 +11,7 @@ from collections import defaultdict
 
 ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
-DEFAULT_POLICIES = ["default", "round_robin"]
+DEFAULT_POLICIES = ["default", "round_robin", "agent"]
 RATE_VALUES = [35000, 40000, 45000, 50000, 55000, 60000, 65000, 70000, 80000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
