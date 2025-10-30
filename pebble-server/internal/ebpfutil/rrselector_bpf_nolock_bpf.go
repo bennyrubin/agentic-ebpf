@@ -12,7 +12,6 @@ import (
 )
 
 type RrSelectorRrState struct {
-	Lock    struct{ Val uint32 }
 	Counter uint32
 	Active  uint32
 }
@@ -123,5 +122,5 @@ func _RrSelectorClose(closers ...io.Closer) error {
 
 // Do not access this directly.
 //
-//go:embed rrselector_bpf.o
+//go:embed rrselector_bpf_nolock_bpf.o
 var _RrSelectorBytes []byte

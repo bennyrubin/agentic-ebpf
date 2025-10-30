@@ -11,8 +11,10 @@ from collections import defaultdict
 
 ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
-DEFAULT_POLICIES = ["default", "round_robin", "agent"]
-RATE_VALUES = [35000, 40000, 45000, 50000, 55000, 60000, 65000, 70000, 80000]
+#DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
+DEFAULT_POLICIES = ["round_robin", "scan_split"]
+#RATE_VALUES = [35000, 40000, 45000, 50000, 55000, 60000, 65000, 70000, 80000]
+RATE_VALUES = [70000, 80000, 90000, 100000, 110000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -189,7 +191,7 @@ def generate_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.
             capsize=4,
             label=policy,
         )
-    plt.yscale("log")
+    plt.ylim(0, 100)
 
     plt.xlabel("Send rate (req/s)")
     plt.ylabel("Overall latency p99 (ms)")

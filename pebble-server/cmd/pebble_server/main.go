@@ -19,7 +19,7 @@ func main() {
 		dbPath       = flag.String("db", "", "path to Pebble database")
 		listen       = flag.String("listen", "127.0.0.1:9000", "UDP listen address")
 		workers      = flag.Int("workers", 4, "number of reuseport workers")
-		policy       = flag.String("policy", "default", "load-balancing policy: default|round_robin|agent")
+		policy       = flag.String("policy", "default", "load-balancing policy: default|round_robin|agent|scan_split")
 		maxScan      = flag.Int("max-scan", 1000, "maximum keys returned for SCAN")
 		logDir       = flag.String("log-dir", "logs/server", "directory for server logs")
 		resultsDir   = flag.String("results-dir", "results", "directory to store experiment artefacts")

@@ -12,7 +12,6 @@ struct {
 } pebble_udp_targets SEC(".maps");
 
 struct rr_state {
-    struct bpf_spin_lock lock;
     __u32 counter;
     __u32 active;
 };
@@ -27,12 +26,10 @@ struct {
 
 static __always_inline __u32 next_idx(struct rr_state *st)
 {
-    __u32 value;
-    bpf_spin_lock(&st->lock);
-    value = st->counter++;
     if (st->active == 0)
-        value = 0;
-    bpf_spin_unlock(&st->lock);
+        return 0;
+    __u32 value = st->counter;
+    st->counter = value + 1;
     return value;
 }
 

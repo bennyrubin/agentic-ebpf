@@ -16,7 +16,7 @@ usage() {
   cat <<USAGE
 Usage: $0 [options]
   -t <threads>   number of worker sockets (default: $THREADS)
-  -p <policy>    load-balancing policy: default|round_robin|agent
+  -p <policy>    load-balancing policy: default|round_robin|agent|scan_split
   -d <db-path>   Pebble directory (default: $DB_PATH)
   -l <address>   UDP listen address (default: $LISTEN)
   -o <log-dir>   directory for server logs (default: $LOG_DIR)

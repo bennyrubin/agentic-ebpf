@@ -35,6 +35,8 @@ func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {
 		return loadRoundRobin(workers)
 	case "agent":
 		return loadAgent(workers)
+	case "scan_split":
+		return loadScanSplit(workers)
 	default:
 		return nil, ErrInvalidConfig(fmt.Sprintf("unknown policy %q", policy))
 	}
@@ -103,6 +105,41 @@ func loadAgent(workers int) (*ebpfPolicy, error) {
 	return &ebpfPolicy{
 		name:    "agent",
 		program: objs.AgentUdpSelector,
+		close:   objs.Close,
+	}, nil
+}
+
+func loadScanSplit(workers int) (*ebpfPolicy, error) {
+	if err := ensureRlimit(); err != nil {
+		return nil, err
+	}
+	var objs ebpfutil.ScanSplitSelectorObjects
+	opts := &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{PinPath: "/sys/fs/bpf"},
+	}
+	if err := ebpfutil.LoadScanSplitSelectorObjects(&objs, opts); err != nil {
+		return nil, fmt.Errorf("load scan split objects: %w", err)
+	}
+
+	if workers < 0 {
+		objs.Close()
+		return nil, ErrInvalidConfig("workers must be non-negative")
+	}
+
+	var key uint32 = 0
+	state := ebpfutil.ScanSplitSelectorSplitState{
+		Active: uint32(workers),
+	}
+	if objs.PebbleSplitState != nil {
+		if err := objs.PebbleSplitState.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("configure scan split state: %w", err)
+		}
+	}
+
+	return &ebpfPolicy{
+		name:    "scan_split",
+		program: objs.SplitUdpSelector,
 		close:   objs.Close,
 	}, nil
 }

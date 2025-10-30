@@ -53,7 +53,7 @@ pebble-server/
   Pebble that exposes `Get` and forward iteration for scans.
 - Request parsing lives in `internal/server/handler.go`; the main worker loop is
   in `internal/server/server.go`.
-- Optional eBPF policies (default, `round_robin`, `agent`) are loaded from the
+- Optional eBPF policies (default, `round_robin`, `agent`, `scan_split`) are loaded from the
   assets in `internal/ebpfutil`. The round-robin policy keeps a pinned array map
   at `/sys/fs/bpf/pebble_rr_state`; both policies reuse
   `/sys/fs/bpf/pebble_udp_targets`.
@@ -64,7 +64,7 @@ Command-line flags (see `cmd/pebble_server/main.go`):
 -db              path to the Pebble database (required)
 -listen          UDP listen address (default 127.0.0.1:9000)
 -workers         reuseport workers (default 4)
--policy          default | round_robin | agent
+-policy          default | round_robin | agent | scan_split
 -max-scan        max keys returned per SCAN (default 100)
 -log-dir         destination for server logs (default logs/server)
 -results-dir     location for experiment metadata (default results)

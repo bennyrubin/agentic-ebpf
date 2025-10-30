@@ -11,11 +11,11 @@ NUM_KEYS=100000
 VALUE_BYTES=256
 DURATION=15
 RATE=45000
-GET_FRAC=0.95
+GET_FRAC=.95
 SCAN_LIMIT=100
 SEND_WORKERS=10
 KEY_PREFIX="key"
-KEY_SPACE=100000
+KEY_SPACE=10000
 LISTEN="127.0.0.1:9000"
 DESTROY_DB="false"
 ITERATIONS=3
@@ -24,7 +24,7 @@ usage() {
   cat <<USAGE
 Usage: $0 [options]
   --threads <n>       worker sockets (default: $THREADS)
-  --policy <name>     default|round_robin|agent (default: $POLICY)
+  --policy <name>     default|round_robin|agent|scan_split (default: $POLICY)
   --db <path>         Pebble database path (default: $DB_PATH)
   --keys <n>          number of keys to load (default: $NUM_KEYS)
   --value-bytes <n>   value size (default: $VALUE_BYTES)

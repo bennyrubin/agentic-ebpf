@@ -2,12 +2,14 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,8 +23,15 @@ type Server struct {
 	policy *ebpfPolicy
 	logger *log.Logger
 
-	conns []*net.UDPConn
-	wg    sync.WaitGroup
+	conns   []*net.UDPConn
+	stats   []workerStats
+	wg      sync.WaitGroup
+	statsWG sync.WaitGroup
+}
+
+type workerStats struct {
+	gets  atomic.Uint64
+	scans atomic.Uint64
 }
 
 // New instantiates the server and loads Pebble and optional eBPF policy.
@@ -58,6 +67,7 @@ func New(cfg Config, logger *log.Logger) (*Server, error) {
 		store:  store,
 		policy: policy,
 		logger: logger,
+		stats:  make([]workerStats, cfg.Workers),
 	}, nil
 }
 
@@ -74,6 +84,20 @@ func (s *Server) Close() error {
 
 // Run launches workers and blocks until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
+	if len(s.stats) != s.cfg.Workers {
+		s.stats = make([]workerStats, s.cfg.Workers)
+	}
+	for i := range s.stats {
+		s.stats[i].gets.Store(0)
+		s.stats[i].scans.Store(0)
+	}
+	logCtx, logCancel := context.WithCancel(ctx)
+	defer func() {
+		logCancel()
+		s.statsWG.Wait()
+	}()
+	s.startStatsLogger(logCtx)
+
 	for i := 0; i < s.cfg.Workers; i++ {
 		conn, fd, err := s.openWorker(i)
 		if err != nil {
@@ -92,6 +116,9 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
+	for _, conn := range s.conns {
+		conn.Close()
+	}
 	s.wg.Wait()
 	return nil
 }
@@ -151,37 +178,29 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
 		buf := make([]byte, 16*1024)
 
 		for {
-			if err := conn.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout)); err != nil {
-				s.logger.Printf("worker=%d read deadline: %v", idx, err)
-			}
 			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					select {
-					case <-ctx.Done():
-						return
-					default:
-						continue
-					}
-				}
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Printf("worker=%d read error: %v", idx, err)
 				continue
 			}
 
-			response := s.handleRequest(buf[:n])
+			response := s.handleRequest(idx, buf[:n])
 			if response == nil {
 				continue
 			}
 
-			if err := conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
-				s.logger.Printf("worker=%d write deadline: %v", idx, err)
-			}
 			if _, err := conn.WriteToUDP(response, addr); err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
 				s.logger.Printf("worker=%d write error: %v", idx, err)
 			}
 		}
@@ -190,7 +209,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
 
 const maxScanVisibleEntries = 10
 
-func (s *Server) handleRequest(payload []byte) []byte {
+func (s *Server) handleRequest(idx int, payload []byte) []byte {
 	cmd, args, err := parseRequest(payload)
 	if err != nil {
 		return []byte(fmt.Sprintf("ERR %v", err))
@@ -198,6 +217,9 @@ func (s *Server) handleRequest(payload []byte) []byte {
 
 	switch cmd {
 	case "GET":
+		if idx >= 0 && idx < len(s.stats) {
+			s.stats[idx].gets.Add(1)
+		}
 		var reqID string
 		if len(args) == 2 {
 			reqID = args[1]
@@ -214,6 +236,9 @@ func (s *Server) handleRequest(payload []byte) []byte {
 		return formatResponse("VALUE", reqID, val)
 
 	case "SCAN":
+		if idx >= 0 && idx < len(s.stats) {
+			s.stats[idx].scans.Add(1)
+		}
 		var reqID string
 		if len(args) == 3 {
 			reqID = args[2]
@@ -241,6 +266,30 @@ func (s *Server) handleRequest(payload []byte) []byte {
 	default:
 		return []byte("ERR unknown command")
 	}
+}
+
+func (s *Server) startStatsLogger(ctx context.Context) {
+	if s.logger == nil || len(s.stats) == 0 {
+		return
+	}
+	s.statsWG.Add(1)
+	go func() {
+		defer s.statsWG.Done()
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for i := range s.stats {
+					gets := s.stats[i].gets.Swap(0)
+					scans := s.stats[i].scans.Swap(0)
+					s.logger.Printf("worker=%d stats gets=%d scans=%d", i, gets, scans)
+				}
+			}
+		}
+	}()
 }
 
 func formatResponse(prefix, id string, payload []byte) []byte {
