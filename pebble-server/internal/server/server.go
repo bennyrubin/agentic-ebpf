@@ -111,8 +111,14 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 
+		scanIter, err := s.store.NewScanIterator()
+		if err != nil {
+			conn.Close()
+			return fmt.Errorf("worker %d iterator: %w", i, err)
+		}
+
 		s.conns = append(s.conns, conn)
-		s.spawnWorker(ctx, i, conn)
+		s.spawnWorker(ctx, i, conn, scanIter)
 	}
 
 	<-ctx.Done()
@@ -171,10 +177,13 @@ func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {
 	return udpConn, fd, nil
 }
 
-func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
+func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, scanIter *ScanIterator) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		if scanIter != nil {
+			defer scanIter.Close()
+		}
 		buf := make([]byte, 16*1024)
 
 		for {
@@ -192,7 +201,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
 				continue
 			}
 
-			response := s.handleRequest(idx, buf[:n])
+			response := s.handleRequest(idx, buf[:n], scanIter)
 			if response == nil {
 				continue
 			}
@@ -209,7 +218,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
 
 const maxScanVisibleEntries = 10
 
-func (s *Server) handleRequest(idx int, payload []byte) []byte {
+func (s *Server) handleRequest(idx int, payload []byte, scanIter *ScanIterator) []byte {
 	cmd, args, err := parseRequest(payload)
 	if err != nil {
 		return []byte(fmt.Sprintf("ERR %v", err))
@@ -226,9 +235,18 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 			args = args[:1]
 		}
 		key := []byte(args[0])
-		val, ok, err := s.store.Get(key)
-		if err != nil {
-			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("get %v", err)))
+		var (
+			val    []byte
+			ok     bool
+			getErr error
+		)
+		if scanIter != nil {
+			val, ok, getErr = scanIter.Get(key)
+		} else {
+			val, ok, getErr = s.store.Get(key)
+		}
+		if getErr != nil {
+			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("get %v", getErr)))
 		}
 		if !ok {
 			return formatResponse("MISS", reqID, []byte(args[0]))
@@ -251,7 +269,10 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 		if limit > s.cfg.MaxScanKeys {
 			limit = s.cfg.MaxScanKeys
 		}
-		result, err := s.store.Scan([]byte(args[0]), limit)
+		if scanIter == nil {
+			return formatResponse("ERR", reqID, []byte("scan iterator unavailable"))
+		}
+		result, err := scanIter.Scan([]byte(args[0]), limit)
 		if err != nil {
 			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("scan %v", err)))
 		}

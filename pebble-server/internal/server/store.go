@@ -21,6 +21,12 @@ type Store struct {
 	db *pebble.DB
 }
 
+// ScanIterator wraps a Pebble iterator for reuse by a single worker goroutine.
+type ScanIterator struct {
+	store *Store
+	iter  *pebble.Iterator
+}
+
 // OpenStore opens a Pebble database located at path.
 func OpenStore(path string) (*Store, error) {
 	db, err := pebble.Open(path, &pebble.Options{})
@@ -54,46 +60,122 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	return buf, true, nil
 }
 
-// Scan returns up to limit key/value pairs starting from startKey (inclusive).
-func (s *Store) Scan(startKey []byte, limit int) ([]ScanEntry, error) {
+// NewScanIterator constructs an iterator that can be reused by a single worker.
+func (s *Store) NewScanIterator() (*ScanIterator, error) {
 	iter, err := s.db.NewIter(nil)
 	if err != nil {
 		return nil, fmt.Errorf("pebble iter: %w", err)
 	}
+	return &ScanIterator{
+		store: s,
+		iter:  iter,
+	}, nil
+}
 
-	positioned := false
+// ensure resets the iterator if it was previously invalidated.
+func (it *ScanIterator) ensure() error {
+	if it == nil {
+		return fmt.Errorf("scan iterator is nil")
+	}
+	if it.iter != nil {
+		return nil
+	}
+	if it.store == nil || it.store.db == nil {
+		return fmt.Errorf("scan iterator store closed")
+	}
+	iter, err := it.store.db.NewIter(nil)
+	if err != nil {
+		return fmt.Errorf("pebble iter: %w", err)
+	}
+	it.iter = iter
+	return nil
+}
+
+// invalidate closes the underlying iterator and marks it as unusable until recreating.
+func (it *ScanIterator) invalidate() {
+	if it == nil || it.iter == nil {
+		return
+	}
+	_ = it.iter.Close()
+	it.iter = nil
+}
+
+// Close releases resources held by the iterator.
+func (it *ScanIterator) Close() error {
+	if it == nil || it.iter == nil {
+		return nil
+	}
+	err := it.iter.Close()
+	it.iter = nil
+	return err
+}
+
+// Scan returns up to limit key/value pairs starting from startKey (inclusive).
+// The caller must ensure Scan is not invoked concurrently.
+func (it *ScanIterator) Scan(startKey []byte, limit int) ([]ScanEntry, error) {
+	if err := it.ensure(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, nil
+	}
+	iter := it.iter
+	var positioned bool
 	if len(startKey) > 0 {
 		positioned = iter.SeekGE(startKey)
 	} else {
 		positioned = iter.First()
 	}
 	if !positioned {
-		if closeErr := iter.Close(); closeErr != nil {
-			return nil, fmt.Errorf("pebble iter close: %w", closeErr)
+		if iterErr := iter.Error(); iterErr != nil {
+			it.invalidate()
+			return nil, fmt.Errorf("pebble scan: %w", iterErr)
 		}
 		return nil, nil
 	}
 
 	entries := make([]ScanEntry, 0, limit)
-	count := 0
-	for ; iter.Valid() && count < limit; iter.Next() {
+	for iter.Valid() && len(entries) < limit {
 		key := append([]byte(nil), iter.Key()...)
 		val := append([]byte(nil), iter.Value()...)
 		entries = append(entries, ScanEntry{
 			Key:   string(key),
 			Value: val,
 		})
-		count++
+		iter.Next()
 	}
 
 	if iterErr := iter.Error(); iterErr != nil {
-		iter.Close()
+		it.invalidate()
 		return nil, fmt.Errorf("pebble scan: %w", iterErr)
 	}
-	if err := iter.Close(); err != nil {
-		return nil, fmt.Errorf("pebble iter close: %w", err)
-	}
 	return entries, nil
+}
+
+// Get seeks to key and returns the associated value if present.
+// The caller must ensure Get is not invoked concurrently.
+func (it *ScanIterator) Get(key []byte) ([]byte, bool, error) {
+	if err := it.ensure(); err != nil {
+		return nil, false, err
+	}
+
+	iter := it.iter
+	if !iter.SeekGE(key) {
+		if iterErr := iter.Error(); iterErr != nil {
+			it.invalidate()
+			return nil, false, fmt.Errorf("pebble get: %w", iterErr)
+		}
+		return nil, false, nil
+	}
+	if !bytes.Equal(iter.Key(), key) {
+		return nil, false, nil
+	}
+	val := append([]byte(nil), iter.Value()...)
+	if iterErr := iter.Error(); iterErr != nil {
+		it.invalidate()
+		return nil, false, fmt.Errorf("pebble get: %w", iterErr)
+	}
+	return val, true, nil
 }
 
 // MarshalScan converts a scan result into a wire-friendly representation.

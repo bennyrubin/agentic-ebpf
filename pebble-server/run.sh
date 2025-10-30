@@ -115,6 +115,9 @@ echo "== Starting server =="
 "$ROOT/scripts/launch_server.sh" -t "$THREADS" -p "$POLICY" -d "$DB_PATH" -l "$LISTEN" -o "$SERVER_LOG_DIR" -r "$RUN_DIR" >/dev/null
 SERVER_PID=$(cat "$ROOT/run/server.pid")
 
+echo "pprof available at http://127.0.0.1:6060/debug/pprof/"
+echo "block/mutex profiling enabled (SetBlockProfileRate=1)"
+
 sleep 2
 
 WORKLOAD_SUMMARY="$LOG_DIR/workload_summary.txt"

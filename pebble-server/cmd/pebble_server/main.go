@@ -5,11 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
+
+	_ "net/http/pprof"
 
 	"pebbleserver/internal/server"
 )
@@ -44,6 +48,15 @@ func main() {
 
 	logger := log.New(f, "", log.LstdFlags|log.Lmicroseconds)
 
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
+
+	go func() {
+		if err := http.ListenAndServe("127.0.0.1:6060", nil); err != nil {
+			logger.Printf("pprof server error: %v", err)
+		}
+	}()
+
 	cfg := server.Config{
 		DBPath:       *dbPath,
 		ListenAddr:   *listen,
@@ -65,7 +78,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Printf("server starting addr=%s workers=%d policy=%s", cfg.ListenAddr, cfg.Workers, cfg.Policy)
+	logger.Printf("server starting addr=%s workers=%d policy=%s pprof=127.0.0.1:6060", cfg.ListenAddr, cfg.Workers, cfg.Policy)
 
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
