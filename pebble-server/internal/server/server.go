@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -30,8 +29,103 @@ type Server struct {
 }
 
 type workerStats struct {
-	gets  atomic.Uint64
-	scans atomic.Uint64
+	mu sync.Mutex
+
+	getCount   uint64
+	getHits    uint64
+	getMisses  uint64
+	getErrors  uint64
+	getLatency time.Duration
+
+	scanCount   uint64
+	scanEntries uint64
+	scanErrors  uint64
+	scanLatency time.Duration
+}
+
+type workerStatsSnapshot struct {
+	getCount   uint64
+	getHits    uint64
+	getMisses  uint64
+	getErrors  uint64
+	getLatency time.Duration
+
+	scanCount   uint64
+	scanEntries uint64
+	scanErrors  uint64
+	scanLatency time.Duration
+}
+
+func (ws *workerStats) reset() {
+	ws.mu.Lock()
+	ws.getCount = 0
+	ws.getHits = 0
+	ws.getMisses = 0
+	ws.getErrors = 0
+	ws.getLatency = 0
+	ws.scanCount = 0
+	ws.scanEntries = 0
+	ws.scanErrors = 0
+	ws.scanLatency = 0
+	ws.mu.Unlock()
+}
+
+func (ws *workerStats) recordGet(duration time.Duration, hit bool, miss bool, err bool) {
+	ws.mu.Lock()
+	ws.getCount++
+	ws.getLatency += duration
+	if hit {
+		ws.getHits++
+	}
+	if miss {
+		ws.getMisses++
+	}
+	if err {
+		ws.getErrors++
+	}
+	ws.mu.Unlock()
+}
+
+func (ws *workerStats) recordScan(duration time.Duration, entries int, err bool) {
+	ws.mu.Lock()
+	ws.scanCount++
+	ws.scanLatency += duration
+	if err {
+		ws.scanErrors++
+	} else {
+		ws.scanEntries += uint64(entries)
+	}
+	ws.mu.Unlock()
+}
+
+func (ws *workerStats) snapshotAndReset() workerStatsSnapshot {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	snap := workerStatsSnapshot{
+		getCount:   ws.getCount,
+		getHits:    ws.getHits,
+		getMisses:  ws.getMisses,
+		getErrors:  ws.getErrors,
+		getLatency: ws.getLatency,
+
+		scanCount:   ws.scanCount,
+		scanEntries: ws.scanEntries,
+		scanErrors:  ws.scanErrors,
+		scanLatency: ws.scanLatency,
+	}
+
+	ws.getCount = 0
+	ws.getHits = 0
+	ws.getMisses = 0
+	ws.getErrors = 0
+	ws.getLatency = 0
+	ws.scanCount = 0
+	ws.scanEntries = 0
+	ws.scanErrors = 0
+	ws.scanLatency = 0
+
+	return snap
 }
 
 // New instantiates the server and loads Pebble and optional eBPF policy.
@@ -88,8 +182,7 @@ func (s *Server) Run(ctx context.Context) error {
 		s.stats = make([]workerStats, s.cfg.Workers)
 	}
 	for i := range s.stats {
-		s.stats[i].gets.Store(0)
-		s.stats[i].scans.Store(0)
+		s.stats[i].reset()
 	}
 	logCtx, logCancel := context.WithCancel(ctx)
 	defer func() {
@@ -111,14 +204,14 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 
-		scanIter, err := s.store.NewScanIterator()
+		iters, err := s.store.NewWorkerIterators()
 		if err != nil {
 			conn.Close()
 			return fmt.Errorf("worker %d iterator: %w", i, err)
 		}
 
 		s.conns = append(s.conns, conn)
-		s.spawnWorker(ctx, i, conn, scanIter)
+		s.spawnWorker(ctx, i, conn, iters)
 	}
 
 	<-ctx.Done()
@@ -177,12 +270,12 @@ func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {
 	return udpConn, fd, nil
 }
 
-func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, scanIter *ScanIterator) {
+func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, iters *WorkerIterators) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if scanIter != nil {
-			defer scanIter.Close()
+		if iters != nil {
+			defer iters.Close()
 		}
 		buf := make([]byte, 16*1024)
 
@@ -201,7 +294,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, sc
 				continue
 			}
 
-			response := s.handleRequest(idx, buf[:n], scanIter)
+			response := s.handleRequest(idx, buf[:n], iters)
 			if response == nil {
 				continue
 			}
@@ -218,17 +311,20 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, sc
 
 const maxScanVisibleEntries = 10
 
-func (s *Server) handleRequest(idx int, payload []byte, scanIter *ScanIterator) []byte {
+func (s *Server) handleRequest(idx int, payload []byte, iters *WorkerIterators) []byte {
 	cmd, args, err := parseRequest(payload)
 	if err != nil {
 		return []byte(fmt.Sprintf("ERR %v", err))
 	}
 
+	var stats *workerStats
+	if idx >= 0 && idx < len(s.stats) {
+		stats = &s.stats[idx]
+	}
+
 	switch cmd {
 	case "GET":
-		if idx >= 0 && idx < len(s.stats) {
-			s.stats[idx].gets.Add(1)
-		}
+		start := time.Now()
 		var reqID string
 		if len(args) == 2 {
 			reqID = args[1]
@@ -240,23 +336,30 @@ func (s *Server) handleRequest(idx int, payload []byte, scanIter *ScanIterator) 
 			ok     bool
 			getErr error
 		)
-		if scanIter != nil {
-			val, ok, getErr = scanIter.Get(key)
+		if iters != nil {
+			val, ok, getErr = iters.Get(key)
 		} else {
 			val, ok, getErr = s.store.Get(key)
 		}
 		if getErr != nil {
+			if stats != nil {
+				stats.recordGet(time.Since(start), false, false, true)
+			}
 			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("get %v", getErr)))
 		}
 		if !ok {
+			if stats != nil {
+				stats.recordGet(time.Since(start), false, true, false)
+			}
 			return formatResponse("MISS", reqID, []byte(args[0]))
+		}
+		if stats != nil {
+			stats.recordGet(time.Since(start), true, false, false)
 		}
 		return formatResponse("VALUE", reqID, val)
 
 	case "SCAN":
-		if idx >= 0 && idx < len(s.stats) {
-			s.stats[idx].scans.Add(1)
-		}
+		start := time.Now()
 		var reqID string
 		if len(args) == 3 {
 			reqID = args[2]
@@ -264,16 +367,25 @@ func (s *Server) handleRequest(idx int, payload []byte, scanIter *ScanIterator) 
 		}
 		limit, err := strconv.Atoi(args[1])
 		if err != nil || limit <= 0 {
+			if stats != nil {
+				stats.recordScan(time.Since(start), 0, true)
+			}
 			return formatResponse("ERR", reqID, []byte("invalid scan limit"))
 		}
 		if limit > s.cfg.MaxScanKeys {
 			limit = s.cfg.MaxScanKeys
 		}
-		if scanIter == nil {
+		if iters == nil || iters.Scan == nil {
+			if stats != nil {
+				stats.recordScan(time.Since(start), 0, true)
+			}
 			return formatResponse("ERR", reqID, []byte("scan iterator unavailable"))
 		}
-		result, err := scanIter.Scan([]byte(args[0]), limit)
+		result, err := iters.Scan.Scan([]byte(args[0]), limit)
 		if err != nil {
+			if stats != nil {
+				stats.recordScan(time.Since(start), 0, true)
+			}
 			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("scan %v", err)))
 		}
 		if len(result) > maxScanVisibleEntries {
@@ -281,7 +393,13 @@ func (s *Server) handleRequest(idx int, payload []byte, scanIter *ScanIterator) 
 		}
 		payload, ok := MarshalScan(result, maxScanResponseBytes)
 		if !ok {
+			if stats != nil {
+				stats.recordScan(time.Since(start), 0, true)
+			}
 			return formatResponse("ERR", reqID, []byte("scan payload too large; reduce limit"))
+		}
+		if stats != nil {
+			stats.recordScan(time.Since(start), len(result), false)
 		}
 		return formatResponse("SCAN", reqID, payload)
 	default:
@@ -303,11 +421,42 @@ func (s *Server) startStatsLogger(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				var total workerStatsSnapshot
 				for i := range s.stats {
-					gets := s.stats[i].gets.Swap(0)
-					scans := s.stats[i].scans.Swap(0)
-					s.logger.Printf("worker=%d stats gets=%d scans=%d", i, gets, scans)
+					snap := s.stats[i].snapshotAndReset()
+					total.getCount += snap.getCount
+					total.getHits += snap.getHits
+					total.getMisses += snap.getMisses
+					total.getErrors += snap.getErrors
+					total.getLatency += snap.getLatency
+					total.scanCount += snap.scanCount
+					total.scanEntries += snap.scanEntries
+					total.scanErrors += snap.scanErrors
+					total.scanLatency += snap.scanLatency
 				}
+				if total.getCount == 0 && total.scanCount == 0 {
+					continue
+				}
+				var avgGet time.Duration
+				if total.getCount > 0 {
+					avgGet = time.Duration(int64(total.getLatency) / int64(total.getCount))
+				}
+				var avgScan time.Duration
+				if total.scanCount > 0 {
+					avgScan = time.Duration(int64(total.scanLatency) / int64(total.scanCount))
+				}
+				s.logger.Printf(
+					"[perf] interval=1s gets=%d hits=%d misses=%d errors=%d avg_get=%s scans=%d entries=%d scan_errors=%d avg_scan=%s",
+					total.getCount,
+					total.getHits,
+					total.getMisses,
+					total.getErrors,
+					avgGet,
+					total.scanCount,
+					total.scanEntries,
+					total.scanErrors,
+					avgScan,
+				)
 			}
 		}
 	}()

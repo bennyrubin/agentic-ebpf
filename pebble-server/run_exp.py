@@ -13,8 +13,8 @@ ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
 DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
 #DEFAULT_POLICIES = ["round_robin", "scan_split"]
-RATE_VALUES = [40000, 50000, 60000, 70000, 80000, 90000, 100000, 110000]
-#RATE_VALUES = [120000, 130000, 140000, 150000]
+#RATE_VALUES = [30000, 40000, 50000, 60000]
+RATE_VALUES = [40000, 50000, 60000, 70000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -131,19 +131,19 @@ def load_summary(run_dir: pathlib.Path) -> dict:
         return json.load(fh)
 
 
-def extract_p99(summary: dict) -> tuple[float, float, list[float]]:
+def extract_metric(summary: dict, metric_key: str) -> tuple[float, float, list[float]]:
     summary_block = summary.get("summary", {})
-    overall_stats = summary_block.get("overall_latency_p99")
-    if not overall_stats:
-        raise KeyError("overall_latency_p99 missing from summary JSON")
-    if "average" not in overall_stats:
-        raise KeyError("overall_latency_p99.average missing from summary JSON")
-    average = float(overall_stats["average"])
-    stddev = float(overall_stats.get("stddev", 0.0))
+    metric_stats = summary_block.get(metric_key)
+    if not metric_stats:
+        raise KeyError(f"{metric_key} missing from summary JSON")
+    if "average" not in metric_stats:
+        raise KeyError(f"{metric_key}.average missing from summary JSON")
+    average = float(metric_stats["average"])
+    stddev = float(metric_stats.get("stddev", 0.0))
 
     iteration_vals = []
     for entry in summary.get("iterations", []):
-        value = entry.get("overall_latency_p99")
+        value = entry.get(metric_key)
         if value is not None:
             iteration_vals.append(float(value))
     return average, stddev, iteration_vals
@@ -164,7 +164,7 @@ def write_experiment_summary(
     print(f"\nWrote experiment summary: {out_path}")
 
 
-def generate_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.Path:
+def _load_matplotlib():
     try:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError as exc:
@@ -172,6 +172,11 @@ def generate_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.
             "matplotlib is required to generate plots. Install it (e.g. `pip install matplotlib`) "
             "or rerun with --skip-plot."
         ) from exc
+    return plt
+
+
+def generate_overall_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.Path:
+    plt = _load_matplotlib()
 
     by_policy = defaultdict(list)
     for record in records:
@@ -191,7 +196,7 @@ def generate_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.
             capsize=4,
             label=policy,
         )
-    plt.ylim(0, 100)
+    plt.ylim(0, 50)
 
     plt.xlabel("Send rate (req/s)")
     plt.ylabel("Overall latency p99 (ms)")
@@ -205,6 +210,43 @@ def generate_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.
     plt.close()
     print(f"Wrote plot: {plot_path}")
     return plot_path
+
+
+def generate_get_scan_plot(experiment_dir: pathlib.Path, records: list[dict]) -> pathlib.Path:
+    plt = _load_matplotlib()
+
+    by_policy = defaultdict(list)
+    for record in records:
+        by_policy[record["policy"]].append(record)
+
+    plt.figure(figsize=(8, 5))
+    for policy, items in by_policy.items():
+        items_sorted = sorted(items, key=lambda r: r["rate"])
+        rates = [r["rate"] for r in items_sorted]
+        get_p99s = [r["get_latency_p99_avg_ms"] for r in items_sorted]
+        scan_p99s = [r["scan_latency_p99_avg_ms"] for r in items_sorted]
+        plt.plot(rates, get_p99s, marker="o", label=f"{policy} GET p99")
+        plt.plot(rates, scan_p99s, marker="s", label=f"{policy} SCAN p99")
+
+    plt.xlabel("Send rate (req/s)")
+    plt.ylabel("Latency p99 (ms)")
+    plt.title("GET vs. SCAN p99 latency vs. send rate")
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.legend()
+    plt.tight_layout()
+
+    plot_path = experiment_dir / "get_scan_p99_vs_rate.png"
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+    print(f"Wrote plot: {plot_path}")
+    return plot_path
+
+
+def generate_plots(experiment_dir: pathlib.Path, records: list[dict]) -> dict[str, str]:
+    plots: dict[str, str] = {}
+    plots["overall_p99_vs_rate"] = generate_overall_plot(experiment_dir, records).name
+    plots["get_scan_p99_vs_rate"] = generate_get_scan_plot(experiment_dir, records).name
+    return plots
 
 
 def main() -> None:
@@ -231,14 +273,22 @@ def main() -> None:
         for rate in rates:
             run_dir = invoke_run_sh(policy, rate, args.threads, args.iterations, args.duration)
             summary = load_summary(run_dir)
-            avg_p99, stddev_p99, per_iteration = extract_p99(summary)
+            overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
+            get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
+            scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
 
             record = {
                 "policy": policy,
                 "rate": rate,
-                "overall_latency_p99_avg_ms": avg_p99,
-                "overall_latency_p99_stddev_ms": stddev_p99,
-                "overall_latency_p99_iterations_ms": per_iteration,
+                "overall_latency_p99_avg_ms": overall_avg,
+                "overall_latency_p99_stddev_ms": overall_stddev,
+                "overall_latency_p99_iterations_ms": overall_iterations,
+                "get_latency_p99_avg_ms": get_avg,
+                "get_latency_p99_stddev_ms": get_stddev,
+                "get_latency_p99_iterations_ms": get_iterations,
+                "scan_latency_p99_avg_ms": scan_avg,
+                "scan_latency_p99_stddev_ms": scan_stddev,
+                "scan_latency_p99_iterations_ms": scan_iterations,
                 "run_dir": str(run_dir),
             }
             records.append(record)
@@ -256,8 +306,8 @@ def main() -> None:
     write_experiment_summary(experiment_dir, metadata, records)
 
     if not args.skip_plot:
-        plot_path = generate_plot(experiment_dir, records)
-        metadata["plot"] = str(plot_path.name)
+        plots = generate_plots(experiment_dir, records)
+        metadata["plots"] = plots
         # Update summary with plot location
         write_experiment_summary(experiment_dir, metadata, records)
     else:

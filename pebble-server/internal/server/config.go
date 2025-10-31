@@ -27,7 +27,7 @@ func (c *Config) Validate() error {
 		c.Workers = 1
 	}
 	if c.MaxScanKeys <= 0 {
-		c.MaxScanKeys = 1000
+		c.MaxScanKeys = 100000
 	}
 	if c.ReadTimeout <= 0 {
 		c.ReadTimeout = 2 * time.Second
