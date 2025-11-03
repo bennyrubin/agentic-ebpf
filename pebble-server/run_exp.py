@@ -11,10 +11,10 @@ from collections import defaultdict
 
 ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
-DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
-#DEFAULT_POLICIES = ["round_robin", "scan_split"]
+#DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
+DEFAULT_POLICIES = ["default", "round_robin", "scan_split"]
 #RATE_VALUES = [30000, 40000, 50000, 60000]
-RATE_VALUES = [40000, 50000, 60000, 70000]
+RATE_VALUES = [50000, 90000, 120000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -24,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--policies",
-        default=",".join(DEFAULT_POLICIES),
-        help="Comma-separated list of policies to test (default: %(default)s)",
+        default=None,
+        help=f"Comma-separated list of policies to test (default: {','.join(DEFAULT_POLICIES)})",
     )
     parser.add_argument(
         "--threads",
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rates",
-        default=",".join(str(v) for v in RATE_VALUES),
-        help="Comma-separated list of send rates to sweep (default: %(default)s)",
+        default=None,
+        help=f"Comma-separated list of send rates to sweep (default: {','.join(str(v) for v in RATE_VALUES)})",
     )
     parser.add_argument(
         "--output-dir",
@@ -59,6 +59,15 @@ def parse_args() -> argparse.Namespace:
         "--skip-plot", 
         action="store_true",
         help="Skip generating the matplotlib plot (useful for headless environments).",
+    )
+    parser.add_argument(
+        "--manifest",
+        help="Reuse existing runs recorded in a dispatch manifest JSON file.",
+    )
+    parser.add_argument(
+        "--runs-root",
+        default=str(ROOT / "results"),
+        help="Root directory containing run-* directories when using --manifest (default: %(default)s)",
     )
     return parser.parse_args()
 
@@ -249,37 +258,70 @@ def generate_plots(experiment_dir: pathlib.Path, records: list[dict]) -> dict[st
     return plots
 
 
+def load_manifest_runs(manifest_path: pathlib.Path, runs_root: pathlib.Path) -> tuple[list[dict], dict]:
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    jobs = data.get("jobs", [])
+    runs: list[dict] = []
+
+    for job in jobs:
+        if job.get("status") not in {"ok"}:
+            continue
+        run_id = job.get("run_id")
+        policy = job.get("policy")
+        rate = job.get("rate")
+        if run_id is None or policy is None or rate is None:
+            continue
+        run_dir = runs_root / run_id
+        if not run_dir.exists():
+            raise FileNotFoundError(f"Run directory {run_dir} (from manifest) not found")
+        runs.append(
+            {
+                "run_dir": run_dir,
+                "policy": str(policy),
+                "rate": int(rate),
+            }
+        )
+    if not runs:
+        raise SystemExit(f"No completed runs in manifest {manifest_path}")
+    return runs, data
+
+
 def main() -> None:
     args = parse_args()
-    ensure_run_sh()
-
-    policies = [p.strip() for p in args.policies.split(",") if p.strip()]
-    if not policies:
-        sys.exit("No policies specified.")
-    try:
-        rates = [int(val.strip()) for val in args.rates.split(",") if val.strip()]
-    except ValueError as exc:
-        raise SystemExit(f"Failed to parse --rates: {exc}") from exc
-    if not rates:
-        sys.exit("No rates specified.")
-
     experiment_root = pathlib.Path(args.output_dir).resolve()
     experiment_id = dt.datetime.now().strftime("exp-%Y%m%d-%H%M%S")
     experiment_dir = experiment_root / experiment_id
 
     records: list[dict] = []
 
-    for policy in policies:
-        for rate in rates:
-            run_dir = invoke_run_sh(policy, rate, args.threads, args.iterations, args.duration)
+    if args.manifest:
+        manifest_path = pathlib.Path(args.manifest).resolve()
+        runs_root = pathlib.Path(args.runs_root).resolve()
+        run_infos, manifest_meta = load_manifest_runs(manifest_path, runs_root)
+
+        if args.policies:
+            selected = {p.strip() for p in args.policies.split(",") if p.strip()}
+            run_infos = [info for info in run_infos if info["policy"] in selected]
+        if args.rates:
+            try:
+                rate_filter = {int(val.strip()) for val in args.rates.split(",") if val.strip()}
+            except ValueError as exc:
+                raise SystemExit(f"Failed to parse --rates: {exc}") from exc
+            run_infos = [info for info in run_infos if info["rate"] in rate_filter]
+
+        if not run_infos:
+            sys.exit("No runs remain after applying filters.")
+
+        for info in run_infos:
+            run_dir = info["run_dir"]
             summary = load_summary(run_dir)
             overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
             get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
             scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
 
             record = {
-                "policy": policy,
-                "rate": rate,
+                "policy": info["policy"],
+                "rate": info["rate"],
                 "overall_latency_p99_avg_ms": overall_avg,
                 "overall_latency_p99_stddev_ms": overall_stddev,
                 "overall_latency_p99_iterations_ms": overall_iterations,
@@ -289,19 +331,75 @@ def main() -> None:
                 "scan_latency_p99_avg_ms": scan_avg,
                 "scan_latency_p99_stddev_ms": scan_stddev,
                 "scan_latency_p99_iterations_ms": scan_iterations,
-                "run_dir": str(run_dir),
+                "run_dir": str(run_dir.resolve()),
             }
             records.append(record)
 
-    metadata = {
-        "experiment_id": experiment_id,
-        "threads": args.threads,
-        "iterations_per_run": args.iterations,
-        "policies": policies,
-        "rates": rates,
-        "duration": args.duration,
-        "created_at": dt.datetime.now().isoformat(),
-    }
+        policies = sorted({rec["policy"] for rec in records})
+        rates = sorted({rec["rate"] for rec in records})
+        metadata = {
+            "experiment_id": experiment_id,
+            "created_at": dt.datetime.now().isoformat(),
+            "policies": policies,
+            "rates": rates,
+            "source_manifest": str(manifest_path),
+            "runs_root": str(runs_root),
+            "max_parallel": manifest_meta.get("max_parallel"),
+            "threads": manifest_meta.get("threads"),
+            "iterations_per_run": manifest_meta.get("iterations"),
+            "duration": manifest_meta.get("duration"),
+        }
+    else:
+        ensure_run_sh()
+        if args.policies:
+            policies = [p.strip() for p in args.policies.split(",") if p.strip()]
+        else:
+            policies = list(DEFAULT_POLICIES)
+        if not policies:
+            sys.exit("No policies specified.")
+        try:
+            if args.rates:
+                rates = [int(val.strip()) for val in args.rates.split(",") if val.strip()]
+            else:
+                rates = list(RATE_VALUES)
+        except ValueError as exc:
+            raise SystemExit(f"Failed to parse --rates: {exc}") from exc
+        if not rates:
+            sys.exit("No rates specified.")
+
+        for policy in policies:
+            for rate in rates:
+                run_dir = invoke_run_sh(policy, rate, args.threads, args.iterations, args.duration)
+                summary = load_summary(run_dir)
+                overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
+                get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
+                scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
+
+                record = {
+                    "policy": policy,
+                    "rate": rate,
+                    "overall_latency_p99_avg_ms": overall_avg,
+                    "overall_latency_p99_stddev_ms": overall_stddev,
+                    "overall_latency_p99_iterations_ms": overall_iterations,
+                    "get_latency_p99_avg_ms": get_avg,
+                    "get_latency_p99_stddev_ms": get_stddev,
+                    "get_latency_p99_iterations_ms": get_iterations,
+                    "scan_latency_p99_avg_ms": scan_avg,
+                    "scan_latency_p99_stddev_ms": scan_stddev,
+                    "scan_latency_p99_iterations_ms": scan_iterations,
+                    "run_dir": str(run_dir),
+                }
+                records.append(record)
+
+        metadata = {
+            "experiment_id": experiment_id,
+            "threads": args.threads,
+            "iterations_per_run": args.iterations,
+            "policies": policies,
+            "rates": rates,
+            "duration": args.duration,
+            "created_at": dt.datetime.now().isoformat(),
+        }
 
     write_experiment_summary(experiment_dir, metadata, records)
 

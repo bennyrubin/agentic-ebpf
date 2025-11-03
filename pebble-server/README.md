@@ -183,6 +183,80 @@ go build -o bin/workload_client ./cmd/workload_client
 
 ---
 
+## Docker-based Parallel Experiments
+
+To accelerate large experiment sweeps on a single host, a container image is
+provided that bundles the compiled binaries and a baseline Pebble dataset.
+Docker’s copy-on-write layers ensure each container gets an isolated, writable
+view of the database without duplicating the SSTables.
+
+1. **Build the image**
+
+   ```bash
+   make docker-build IMAGE_NAME=pebble-server:latest
+   ```
+
+2. **Launch parallel runs**
+
+   The dispatcher script (`scripts/dispatch_docker_experiments.py`) starts
+   multiple containers, copies the dataset for each run, and pins them to the
+   requested CPU sets. Results are written to the usual `results/run-*`
+   directories, so downstream tooling sees them as if they ran sequentially.
+
+   ```bash
+   make docker-dispatch IMAGE_NAME=pebble-server:latest \
+       ARGS="--max-parallel 4 \
+             --cpu-sets 0-3,4-7,8-11,12-15 \
+             --rates 30000,40000,50000,60000 \
+             --policies round_robin,scan_split"
+   ```
+
+   Each container is invoked with `--skip-db-setup`, so the baked-in dataset is
+   copied from `/opt/pebble-base` into a private workspace before `run.sh`
+   starts. The dispatcher drops a manifest alongside the results
+   (`results/dispatch-manifest-<timestamp>.json`) describing every container,
+   cpuset, and exit status.
+
+3. **Generate summaries and plots from the manifest**
+
+   `run_exp.py` now accepts `--manifest`, allowing you to reuse the dispatch
+   output without re-running experiments:
+
+   ```bash
+   python3 run_exp.py \
+     --manifest results/dispatch-manifest-20251030-120000.json \
+     --output-dir results/experiments
+   ```
+
+   The script rebuilds the same summary JSON and latency plots as the
+   sequential workflow, enabling apples-to-apples comparisons between batch
+   runs.
+
+4. **Ad-hoc runs**
+
+   For quick tests, launch a single container manually:
+
+   ```bash
+   make docker-run IMAGE_NAME=pebble-server:latest \
+       ARGS="--policy round_robin --rate 50000 --duration 20"
+   ```
+
+   Override `ARGS` to forward any `run.sh` flags. Mounts are created under
+   `results/` automatically; adjust `RESULTS_DIR` when invoking `make` if you
+   prefer another host path.
+
+> **Resource isolation:** Provide disjoint cpuset strings via
+> `--cpu-sets` (or `docker run --cpuset-cpus`) to keep tails tight when running
+> multiple containers concurrently. Memory limits can be added with
+> `docker run --memory`.
+>
+> **eBPF privileges:** Policies other than `default` need access to pinned BPF
+> maps under `/sys/fs/bpf`. When running inside Docker, grant the container
+> `--privileged` (or at minimum `--cap-bpf --cap-net-admin` and mount
+> `/sys/fs/bpf`) if you plan to exercise eBPF-based load balancing.
+
+---
+
 ## eBPF Requirements
 
 The eBPF programs are built with `clang` (CO-RE) and require root privileges to

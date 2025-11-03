@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+BIN_DIR="${BIN_DIR:-$ROOT/bin}"
+SETUPDB_BIN="${SETUPDB_BIN:-$BIN_DIR/setupdb}"
 
 DB_PATH="$ROOT/pebble.data"
 NUM_KEYS=10000
@@ -52,7 +54,11 @@ if [[ "$NEED_LOAD" == "false" ]]; then
   exit 0
 fi
 
-CMD=(go run ./cmd/setupdb -db "$DB_PATH" -keys "$NUM_KEYS" -value-bytes "$VALUE_BYTES" -key-prefix "$KEY_PREFIX")
+if [[ -x "$SETUPDB_BIN" ]]; then
+  CMD=("$SETUPDB_BIN" -db "$DB_PATH" -keys "$NUM_KEYS" -value-bytes "$VALUE_BYTES" -key-prefix "$KEY_PREFIX")
+else
+  CMD=(go run ./cmd/setupdb -db "$DB_PATH" -keys "$NUM_KEYS" -value-bytes "$VALUE_BYTES" -key-prefix "$KEY_PREFIX")
+fi
 if [[ "$DESTROY" == "true" ]]; then
   CMD+=( -destroy )
 fi
