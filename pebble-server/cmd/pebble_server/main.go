@@ -28,8 +28,13 @@ func main() {
 		resultsDir   = flag.String("results-dir", "results", "directory to store experiment artefacts")
 		readTimeout  = flag.Duration("read-timeout", 2*time.Second, "per-request read deadline")
 		writeTimeout = flag.Duration("write-timeout", 2*time.Second, "per-request write deadline")
-		getDelay     = flag.Duration("get-delay", 10*time.Microsecond, "simulated GET latency")
-		scanDelay    = flag.Duration("scan-delay", 2*time.Millisecond, "simulated SCAN latency")
+		getDelay     = flag.Duration("get-delay", 0, "optional delay added after GET lookups")
+		scanDelay    = flag.Duration("scan-delay", 0, "optional delay added after SCAN operations")
+		redisDB      = flag.Int("redis-db", 0, "logical Redis database number")
+		dbKeys       = flag.Int("db-keys", 100000, "number of keys to seed into the in-memory Redis store")
+		dbValueSize  = flag.Int("db-value-bytes", 64, "value size (bytes) used when seeding keys")
+		dbScanCount  = flag.Int("db-scan-count", 512, "maximum keys returned per store scan iteration")
+		dbKeyPrefix  = flag.String("db-key-prefix", "key", "key prefix used when seeding the store")
 	)
 	flag.Parse()
 
@@ -69,6 +74,11 @@ func main() {
 		ResultsDir:   *resultsDir,
 		GetDelay:     *getDelay,
 		ScanDelay:    *scanDelay,
+		RedisDB:      *redisDB,
+		StoreKeys:    *dbKeys,
+		StoreValue:   *dbValueSize,
+		StoreScan:    *dbScanCount,
+		StorePrefix:  *dbKeyPrefix,
 	}
 
 	srv, err := server.New(cfg, logger)
@@ -80,7 +90,18 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Printf("server starting addr=%s workers=%d policy=%s get_delay=%s scan_delay=%s pprof=127.0.0.1:6060", cfg.ListenAddr, cfg.Workers, cfg.Policy, cfg.GetDelay, cfg.ScanDelay)
+	logger.Printf(
+		"server starting addr=%s workers=%d policy=%s redis_db=%d store_keys=%d store_value=%d store_scan=%d get_delay=%s scan_delay=%s pprof=127.0.0.1:6060",
+		cfg.ListenAddr,
+		cfg.Workers,
+		cfg.Policy,
+		cfg.RedisDB,
+		cfg.StoreKeys,
+		cfg.StoreValue,
+		cfg.StoreScan,
+		cfg.GetDelay,
+		cfg.ScanDelay,
+	)
 
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)

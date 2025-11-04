@@ -8,9 +8,12 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	kvstore "pebbleserver/internal/store"
 
 	"golang.org/x/sys/unix"
 )
@@ -21,6 +24,7 @@ type Server struct {
 	policy *ebpfPolicy
 	logger *log.Logger
 
+	store   *kvstore.RedisStore
 	conns   []*net.UDPConn
 	stats   []workerStats
 	wg      sync.WaitGroup
@@ -122,23 +126,52 @@ func New(cfg Config, logger *log.Logger) (*Server, error) {
 		}
 	}
 
+	storeCfg := kvstore.Config{
+		DB:        cfg.RedisDB,
+		Keyspace:  cfg.StoreKeys,
+		ValueSize: cfg.StoreValue,
+		ScanCount: cfg.StoreScan,
+		KeyPrefix: cfg.StorePrefix,
+	}
+	dataStore, err := kvstore.NewRedisStore(context.Background(), storeCfg)
+	if err != nil {
+		if policy != nil {
+			policy.Close()
+		}
+		return nil, fmt.Errorf("initialise store: %w", err)
+	}
+
 	return &Server{
 		cfg:    cfg,
 		policy: policy,
 		logger: logger,
+		store:  dataStore,
 		stats:  make([]workerStats, cfg.Workers),
 	}, nil
 }
 
 // Close shuts down sockets and underlying resources.
 func (s *Server) Close() error {
+	var firstErr error
 	for _, conn := range s.conns {
-		conn.Close()
+		if conn == nil {
+			continue
+		}
+		if err := conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
 	if s.policy != nil {
-		s.policy.Close()
+		if err := s.policy.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	}
-	return nil
+	if s.store != nil {
+		if err := s.store.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Run launches workers and blocks until ctx is cancelled.
@@ -276,6 +309,10 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 		stats = &s.stats[idx]
 	}
 
+	if s.store == nil {
+		return []byte("ERR store unavailable")
+	}
+
 	switch cmd {
 	case "GET":
 		start := time.Now()
@@ -284,11 +321,25 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 			reqID = args[1]
 			args = args[:1]
 		}
-		time.Sleep(s.cfg.GetDelay)
-		if stats != nil {
-			stats.recordGet(time.Since(start), false)
+		key := args[0]
+		value, getErr := s.store.Get(context.Background(), key)
+		if s.cfg.GetDelay > 0 {
+			time.Sleep(s.cfg.GetDelay)
 		}
-		return formatResponse("VALUE", reqID, []byte(args[0]))
+		duration := time.Since(start)
+		if stats != nil {
+			stats.recordGet(duration, getErr != nil)
+		}
+		if getErr != nil {
+			var errMsg string
+			if errors.Is(getErr, kvstore.ErrNotFound) {
+				errMsg = "not found"
+			} else {
+				errMsg = getErr.Error()
+			}
+			return formatResponse("ERR", reqID, []byte(errMsg))
+		}
+		return formatResponse("VALUE", reqID, []byte(value))
 
 	case "SCAN":
 		start := time.Now()
@@ -307,11 +358,21 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 		if limit > s.cfg.MaxScanKeys {
 			limit = s.cfg.MaxScanKeys
 		}
-		time.Sleep(s.cfg.ScanDelay)
-		if stats != nil {
-			stats.recordScan(time.Since(start), false)
+		entries, scanErr := s.store.Scan(context.Background(), args[0], limit)
+		if s.cfg.ScanDelay > 0 {
+			time.Sleep(s.cfg.ScanDelay)
 		}
-		return formatResponse("SCAN", reqID, []byte("EMPTY"))
+		duration := time.Since(start)
+		if stats != nil {
+			stats.recordScan(duration, scanErr != nil)
+		}
+		if scanErr != nil {
+			return formatResponse("ERR", reqID, []byte(scanErr.Error()))
+		}
+		if len(entries) == 0 {
+			return formatResponse("SCAN", reqID, []byte("EMPTY"))
+		}
+		return formatResponse("SCAN", reqID, formatScanPayload(entries))
 	default:
 		return []byte("ERR unknown command")
 	}
@@ -397,4 +458,20 @@ func formatResponse(prefix, id string, payload []byte) []byte {
 		data = append(data, payload...)
 	}
 	return data
+}
+
+func formatScanPayload(entries []kvstore.Entry) []byte {
+	if len(entries) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for i, e := range entries {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(e.Key)
+		sb.WriteByte('=')
+		sb.WriteString(e.Value)
+	}
+	return []byte(sb.String())
 }

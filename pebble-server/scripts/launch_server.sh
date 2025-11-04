@@ -15,6 +15,11 @@ BUILD_SERVER_BIN="${BUILD_SERVER_BIN:-true}"
 SERVER_BIN="${PEBBLE_SERVER_BIN:-$BIN_DIR/pebble_server}"
 GET_DELAY="${GET_DELAY:-}"
 SCAN_DELAY="${SCAN_DELAY:-}"
+REDIS_DB="${REDIS_DB:-}"
+DB_KEYS="${DB_KEYS:-}"
+DB_VALUE_BYTES="${DB_VALUE_BYTES:-}"
+DB_SCAN_COUNT="${DB_SCAN_COUNT:-}"
+DB_KEY_PREFIX="${DB_KEY_PREFIX:-}"
 
 usage() {
   cat <<USAGE
@@ -75,6 +80,21 @@ if [[ -n "$GET_DELAY" ]]; then
 fi
 if [[ -n "$SCAN_DELAY" ]]; then
   SERVER_CMD+=(-scan-delay "$SCAN_DELAY")
+fi
+if [[ -n "$REDIS_DB" ]]; then
+  SERVER_CMD+=(-redis-db "$REDIS_DB")
+fi
+if [[ -n "$DB_KEYS" ]]; then
+  SERVER_CMD+=(-db-keys "$DB_KEYS")
+fi
+if [[ -n "$DB_VALUE_BYTES" ]]; then
+  SERVER_CMD+=(-db-value-bytes "$DB_VALUE_BYTES")
+fi
+if [[ -n "$DB_SCAN_COUNT" ]]; then
+  SERVER_CMD+=(-db-scan-count "$DB_SCAN_COUNT")
+fi
+if [[ -n "$DB_KEY_PREFIX" ]]; then
+  SERVER_CMD+=(-db-key-prefix "$DB_KEY_PREFIX")
 fi
 
 "${SERVER_CMD[@]}" &

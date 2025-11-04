@@ -6,11 +6,10 @@ protocol and exposes two operations:
 - `GET <key> [request-id]`
 - `SCAN <start_key> <limit> [request-id]`
 
-The original version of this project backed those calls with a Pebble key/value
-store. The current incarnation simulates storage behaviour by sleeping for a
-configurable amount of time on each request (default: 10µs for GET, 2ms for
-SCAN) while keeping the rest of the infrastructure – workload generator,
-eBPF-based load balancers, Docker helpers, and experiment orchestration – intact.
+The server embeds a pure-Go Redis implementation (miniredis) so GET and SCAN
+requests exercise a real in-memory dataset instead of placeholder sleeps. You
+can still opt into synthetic latency with `-get-delay`/`-scan-delay`, but the
+default responses now come straight from the store.
 
 ---
 
@@ -41,11 +40,15 @@ pebble-server/
 
 - Listens on UDP (default `127.0.0.1:9000`) with a configurable number of
   SO_REUSEPORT workers.
-- Every GET request sleeps for `get-delay` before echoing the requested key
-  back to the client (`VALUE <key>`). The optional request id is mirrored in the
-  response to simplify latency attribution.
-- Every SCAN request validates the limit, sleeps for `scan-delay`, and responds
-  with the placeholder payload `EMPTY`.
+- Seeds an in-process Redis key/value store on startup. Keys are deterministic
+  (`<prefix><zero-padded index>`) and values are generated to a configurable
+  size so workloads are reproducible.
+- GET requests read directly from the store and reply with `VALUE <req-id>
+  <value>`, returning `ERR not found` when the key is missing.
+- SCAN requests traverse the keyspace in lexicographical order using a single
+  goroutine to keep the operation blocking, returning comma-separated
+  `key=value` pairs up to the requested (and configured) limit. Empty results
+  respond with `SCAN <req-id> EMPTY`.
 - Worker-local statistics are aggregated once per second and written to the log
   directory so you can correlate synthetic latency with workload parameters.
 - Optional eBPF policies (`default`, `round_robin`, `agent`, `scan_split`) are
@@ -55,16 +58,21 @@ pebble-server/
 Command-line flags (see `cmd/pebble_server/main.go`):
 
 ```
--listen          UDP listen address (default 127.0.0.1:9000)
--workers         reuseport workers (default 4)
--policy          default | round_robin | agent | scan_split
--max-scan        max keys accepted per SCAN (default 100000)
--log-dir         destination for server logs (default logs/server)
--results-dir     location for experiment metadata (default results)
--read-timeout    per-request read deadline (default 2s)
--write-timeout   per-request write deadline (default 2s)
--get-delay       synthetic GET latency (default 10µs)
--scan-delay      synthetic SCAN latency (default 2ms)
+-listen           UDP listen address (default 127.0.0.1:9000)
+-workers          reuseport workers (default 4)
+-policy           default | round_robin | agent | scan_split
+-max-scan         max keys accepted per SCAN (default 100000)
+-redis-db         logical Redis database number (default 0)
+-db-keys          number of keys to seed into the in-memory store (default 100000)
+-db-value-bytes   value size (bytes) for seeded keys (default 64)
+-db-scan-count    maximum keys returned per store scan iteration (default 512)
+-db-key-prefix    key prefix used for seeded keys (default "key")
+-log-dir          destination for server logs (default logs/server)
+-results-dir      location for experiment metadata (default results)
+-read-timeout     per-request read deadline (default 2s)
+-write-timeout    per-request write deadline (default 2s)
+-get-delay        optional synthetic GET latency (default 0)
+-scan-delay       optional synthetic SCAN latency (default 0)
 ```
 
 ---
@@ -142,10 +150,12 @@ go build -o bin/workload_client ./cmd/workload_client
 # Rebuild eBPF maps/programs (requires clang/llvm)
 ./scripts/build_ebpf.sh
 
-# Launch the server with custom synthetic delays
+# Launch the server with a custom dataset and synthetic delays
 ./bin/pebble_server \
     -workers 4 \
     -policy default \
+    -db-keys 50000 \
+    -db-value-bytes 32 \
     -get-delay 15us \
     -scan-delay 5ms
 
