@@ -102,8 +102,6 @@ def build_jobs(
             f"{results_dir}:/results",
             "-v",
             f"{results_dir}/work:/opt/work",
-            "--mount",
-            "type=bind,src=/sys/fs/bpf,target=/sys/fs/bpf",
         ]
         if cpuset:
             cmd += ["--cpuset-cpus", cpuset]

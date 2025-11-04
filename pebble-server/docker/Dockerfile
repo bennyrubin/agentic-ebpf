@@ -62,6 +62,7 @@ RUN chmod +x /usr/local/bin/run_experiment.sh \
     ./scripts/*.sh
 
 ENV SKIP_EBPF_BUILD=true \
+    BUILD_SERVER_BIN=false \
     OUTPUT_ROOT=/results \
     RUN_STATE_DIR=/tmp/runstate \
     RESULTS_DIR=/results \

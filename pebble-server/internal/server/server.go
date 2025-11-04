@@ -424,6 +424,29 @@ func (s *Server) startStatsLogger(ctx context.Context) {
 				var total workerStatsSnapshot
 				for i := range s.stats {
 					snap := s.stats[i].snapshotAndReset()
+					if snap.getCount > 0 || snap.scanCount > 0 {
+						var workerAvgGet time.Duration
+						if snap.getCount > 0 {
+							workerAvgGet = time.Duration(int64(snap.getLatency) / int64(snap.getCount))
+						}
+						var workerAvgScan time.Duration
+						if snap.scanCount > 0 {
+							workerAvgScan = time.Duration(int64(snap.scanLatency) / int64(snap.scanCount))
+						}
+						s.logger.Printf(
+							"[perf] worker=%d gets=%d hits=%d misses=%d errors=%d avg_get=%s scans=%d entries=%d scan_errors=%d avg_scan=%s",
+							i,
+							snap.getCount,
+							snap.getHits,
+							snap.getMisses,
+							snap.getErrors,
+							workerAvgGet,
+							snap.scanCount,
+							snap.scanEntries,
+							snap.scanErrors,
+							workerAvgScan,
+						)
+					}
 					total.getCount += snap.getCount
 					total.getHits += snap.getHits
 					total.getMisses += snap.getMisses

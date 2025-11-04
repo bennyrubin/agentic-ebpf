@@ -10,6 +10,23 @@ timestamp() {
   date +%Y%m%d-%H%M%S
 }
 
+ensure_bpffs() {
+  if command -v findmnt >/dev/null 2>&1; then
+    if findmnt -n -t bpf /sys/fs/bpf >/dev/null 2>&1; then
+      return
+    fi
+  elif command -v mountpoint >/dev/null 2>&1 && mountpoint -q /sys/fs/bpf >/dev/null 2>&1; then
+    return
+  fi
+
+  mkdir -p /sys/fs/bpf
+  if ! mount -t bpf bpffs /sys/fs/bpf 2>/dev/null; then
+    mount -t bpf bpf /sys/fs/bpf
+  fi
+}
+
+ensure_bpffs
+
 EXP_ID=${EXP_ID:-exp-$(timestamp)-$RANDOM}
 RUN_ID=${RUN_ID:-run-$(timestamp)-$RANDOM}
 WORK_DIR="${WORK_ROOT}/${EXP_ID}"
