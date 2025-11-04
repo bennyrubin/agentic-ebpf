@@ -1,14 +1,16 @@
 # Pebble Server Playground
 
-This repository hosts a small UDP key/value service backed by the
-[`pebble`](https://github.com/cockroachdb/pebble) storage engine. It is designed
-as a sandbox for experimenting with reuseport-based load-balancing, eBPF
-policies, and workload measurements that separately track `GET` and `SCAN`
-latencies.
+This repository hosts a compact UDP service that understands a tiny text
+protocol and exposes two operations:
 
-The Go codebase is intentionally compact: a single server binary speaks a tiny
-text protocol, a dataset loader initialises a Pebble database, and a workload
-client fires open-loop requests while collecting latency stats.
+- `GET <key> [request-id]`
+- `SCAN <start_key> <limit> [request-id]`
+
+The original version of this project backed those calls with a Pebble key/value
+store. The current incarnation simulates storage behaviour by sleeping for a
+configurable amount of time on each request (default: 10µs for GET, 2ms for
+SCAN) while keeping the rest of the infrastructure – workload generator,
+eBPF-based load balancers, Docker helpers, and experiment orchestration – intact.
 
 ---
 
@@ -16,77 +18,58 @@ client fires open-loop requests while collecting latency stats.
 
 ```
 pebble-server/
-├── cmd/                  # Go entrypoints
-│   ├── pebble_server/    # UDP server binary (`-db`, `-policy`, `-workers`, …)
-│   ├── setupdb/          # Dataset loader (populates Pebble with random KV pairs)
+├── cmd/
+│   ├── pebble_server/    # UDP server entrypoint
 │   └── workload_client/  # Open-loop client that records GET/SCAN latencies
-├── ebpf/                 # C programs compiled to CO-RE eBPF bytecode
+├── docker/               # Container image and helper entrypoint
+├── ebpf/                 # CO-RE programs compiled into internal/ebpfutil/*
 ├── internal/
 │   ├── ebpfutil/         # Auto-generated go-ebpf bindings + pinned-map helpers
-│   └── server/           # Core server code (config, request handler, Pebble store)
-├── scripts/              # Helper scripts invoked by run.sh
+│   └── server/           # Config, request handler, worker loop, stats
+├── run.sh                # Orchestrates “build eBPF → launch server → run workload”
+├── scripts/              # Helper scripts invoked by run.sh/docker entrypoints
 │   ├── build_ebpf.sh     # Rebuilds eBPF assets into internal/ebpfutil
-│   ├── launch_server.sh  # Builds and launches the UDP server in the background
-│   └── setup_db.sh       # Thin wrapper around cmd/setupdb
-├── workload/             # Convenience wrapper to drive the client in isolation
-├── run.sh                # Orchestrates “build eBPF → load data → run workload”
-├── run/                  # PID file for the background server
-├── logs/                 # Default server logs (one subdir per run)
+│   └── launch_server.sh  # Builds and launches the UDP server in the background
 ├── results/              # Experiment artefacts (`experiment.json`, summary, logs)
-├── pebble.data/          # Default Pebble data directory (created by setupdb)
+├── logs/                 # Default server logs (one subdir per run)
 └── go.mod / go.sum       # Go module definition (module name: `pebbleserver`)
 ```
 
 ---
 
-## Components
+## Server (`cmd/pebble_server`)
 
-### Server (`cmd/pebble_server`)
-
-- Listens on UDP (default `127.0.0.1:9000`).
-- Supports two commands:
-  - `GET <key> [request-id]`
-  - `SCAN <start_key> <limit> [request-id]`
-- Responses echo the optional request id, making it easy to correlate latency
-  samples on the client side.
-- Storage is provided by `internal/server/store.go`, a thin wrapper around
-  Pebble that exposes `Get` and forward iteration for scans.
-- Request parsing lives in `internal/server/handler.go`; the main worker loop is
-  in `internal/server/server.go`.
-- Optional eBPF policies (default, `round_robin`, `agent`, `scan_split`) are loaded from the
-  assets in `internal/ebpfutil`. The round-robin policy keeps a pinned array map
-  at `/sys/fs/bpf/pebble_rr_state`; both policies reuse
-  `/sys/fs/bpf/pebble_udp_targets`.
+- Listens on UDP (default `127.0.0.1:9000`) with a configurable number of
+  SO_REUSEPORT workers.
+- Every GET request sleeps for `get-delay` before echoing the requested key
+  back to the client (`VALUE <key>`). The optional request id is mirrored in the
+  response to simplify latency attribution.
+- Every SCAN request validates the limit, sleeps for `scan-delay`, and responds
+  with the placeholder payload `EMPTY`.
+- Worker-local statistics are aggregated once per second and written to the log
+  directory so you can correlate synthetic latency with workload parameters.
+- Optional eBPF policies (`default`, `round_robin`, `agent`, `scan_split`) are
+  loaded from `internal/ebpfutil`. Policies that attach to SO_REUSEPORT continue
+  to use the pinned map at `/sys/fs/bpf/pebble_udp_targets`.
 
 Command-line flags (see `cmd/pebble_server/main.go`):
 
 ```
--db              path to the Pebble database (required)
 -listen          UDP listen address (default 127.0.0.1:9000)
 -workers         reuseport workers (default 4)
 -policy          default | round_robin | agent | scan_split
--max-scan        max keys returned per SCAN (default 100)
+-max-scan        max keys accepted per SCAN (default 100000)
 -log-dir         destination for server logs (default logs/server)
 -results-dir     location for experiment metadata (default results)
 -read-timeout    per-request read deadline (default 2s)
 -write-timeout   per-request write deadline (default 2s)
+-get-delay       synthetic GET latency (default 10µs)
+-scan-delay      synthetic SCAN latency (default 2ms)
 ```
 
-### Dataset Loader (`cmd/setupdb`)
+---
 
-Populates a Pebble database with random hex values.
-
-Useful flags:
-
-```
--db           destination directory (default ./pebble.data)
--keys         number of KV pairs (default 10,000)
--value-bytes  value size in bytes (default 256)
--key-prefix   string prefix for generated keys (default "key")
--destroy      wipe the destination directory before loading
-```
-
-### Workload Client (`cmd/workload_client`)
+## Workload Client (`cmd/workload_client`)
 
 Generates a constant-rate stream of UDP requests and records latencies. At the
 end of each run it prints:
@@ -103,7 +86,7 @@ Key flags:
 -rate         target send rate in requests/sec (default 1000)
 -get-frac     fraction of GET requests (default 0.8)
 -scan-limit   number of keys per SCAN (default 500)
--key-prefix   matches the dataset loader prefix (default "key")
+-key-prefix   prefix for generated keys (default "key")
 -key-space    upper bound on numeric suffix (default 100000)
 -log          client log output (default logs/client.log)
 -send-workers concurrent send goroutines (default runtime.NumCPU())
@@ -121,15 +104,11 @@ Key flags:
 
 1. `scripts/build_ebpf.sh` – compiles the C programs in `ebpf/` into CO-RE
    objects and regenerates `internal/ebpfutil/*`.
-2. `scripts/setup_db.sh` – builds and runs `cmd/setupdb` to populate
-   `<db-path>` (defaults to `pebble.data` in the repo root). The script caches
-   the last load parameters; unless you pass `--destroy-db` or change
-   `--keys/--value-bytes/--key-prefix`, subsequent runs reuse the existing
-   dataset for quicker iterations.
-3. `scripts/launch_server.sh` – builds `cmd/pebble_server`, starts it in the
+2. `scripts/launch_server.sh` – builds `cmd/pebble_server`, starts it in the
    background, and records its PID under `run/server.pid`.
-4. `cmd/workload_client` – runs with the provided rate/duration arguments and
+3. `cmd/workload_client` – runs with the provided rate/duration arguments and
    writes a concise summary to `results/<run-id>/workload_summary.txt`.
+4. Aggregates per-iteration metrics into `workload_summary.json`.
 5. Shuts down the background server and reports where artefacts were stored.
 
 Typical usage:
@@ -139,8 +118,7 @@ Typical usage:
   --threads 4 \
   --policy round_robin \
   --rate 500 \
-  --duration 15 \
-  --destroy-db
+  --duration 15
 ```
 
 Every invocation creates a fresh `results/run-<timestamp>/` directory containing:
@@ -148,6 +126,7 @@ Every invocation creates a fresh `results/run-<timestamp>/` directory containing
 - `experiment.json` – the parameters used for the run.
 - `logs/` – the server log for that execution.
 - `workload_summary.txt` – human-readable latency/throughput snapshot.
+- `workload_summary.json` – machine-readable summary.
 
 ---
 
@@ -158,20 +137,17 @@ If you prefer to run individual pieces yourself:
 ```bash
 # Build binaries (outputs to ./bin)
 go build -o bin/pebble_server ./cmd/pebble_server
-go build -o bin/setupdb ./cmd/setupdb
 go build -o bin/workload_client ./cmd/workload_client
 
 # Rebuild eBPF maps/programs (requires clang/llvm)
 ./scripts/build_ebpf.sh
 
-# Prepare a Pebble dataset
-./bin/setupdb -db ./pebble.data -keys 50000 -destroy
-
-# Launch the server
+# Launch the server with custom synthetic delays
 ./bin/pebble_server \
-    -db ./pebble.data \
     -workers 4 \
-    -policy default
+    -policy default \
+    -get-delay 15us \
+    -scan-delay 5ms
 
 # In another terminal, run the workload
 ./bin/workload_client \
@@ -183,12 +159,11 @@ go build -o bin/workload_client ./cmd/workload_client
 
 ---
 
-## Docker-based Parallel Experiments
+## Docker-based Experiments
 
 To accelerate large experiment sweeps on a single host, a container image is
-provided that bundles the compiled binaries and a baseline Pebble dataset.
-Docker’s copy-on-write layers ensure each container gets an isolated, writable
-view of the database without duplicating the SSTables.
+provided that bundles the compiled binaries. Each container keeps its own
+logs/results under `/results`, while sharing the same eBPF build cache.
 
 1. **Build the image**
 
@@ -198,127 +173,34 @@ view of the database without duplicating the SSTables.
 
 2. **Launch parallel runs**
 
-   The dispatcher script (`scripts/dispatch_docker_experiments.py`) starts
-   multiple containers, copies the dataset for each run, and pins them to the
-   requested CPU sets. Results are written to the usual `results/run-*`
-   directories, so downstream tooling sees them as if they ran sequentially.
-
    ```bash
    make docker-dispatch IMAGE_NAME=pebble-server:latest \
-       ARGS="--max-parallel 4 \
-             --cpu-sets 0-3,4-7,8-11,12-15 \
-             --rates 30000,40000,50000,60000 \
-             --policies round_robin,scan_split"
+     RUN_SCRIPT_ARGS="--threads 4 --rate 60000"
    ```
 
-   Each container is invoked with `--skip-db-setup`, so the baked-in dataset is
-   copied from `/opt/pebble-base` into a private workspace before `run.sh`
-   starts. The dispatcher drops a manifest alongside the results
-   (`results/dispatch-manifest-<timestamp>.json`) describing every container,
-   cpuset, and exit status.
+   The helper script spins up multiple containers, each invoking `run.sh` with
+   its own output directory.
 
-3. **Generate summaries and plots from the manifest**
-
-   `run_exp.py` now accepts `--manifest`, allowing you to reuse the dispatch
-   output without re-running experiments:
-
-   ```bash
-   python3 run_exp.py \
-     --manifest results/dispatch-manifest-20251030-120000.json \
-     --output-dir results/experiments
-   ```
-
-   The script rebuilds the same summary JSON and latency plots as the
-   sequential workflow, enabling apples-to-apples comparisons between batch
-   runs.
-
-4. **Ad-hoc runs**
-
-   For quick tests, launch a single container manually:
+3. **Inspect results**
 
    ```bash
    make docker-run IMAGE_NAME=pebble-server:latest \
-       ARGS="--policy round_robin --rate 50000 --duration 20"
+     RUN_SCRIPT_ARGS="--threads 2 --duration 20"
    ```
 
-   Override `ARGS` to forward any `run.sh` flags. Mounts are created under
-   `results/` automatically; adjust `RESULTS_DIR` when invoking `make` if you
-   prefer another host path.
-
-> **Resource isolation:** Provide disjoint cpuset strings via
-> `--cpu-sets` (or `docker run --cpuset-cpus`) to keep tails tight when running
-> multiple containers concurrently. Memory limits can be added with
-> `docker run --memory`.
->
-> **eBPF privileges:** Policies other than `default` need access to pinned BPF
-> maps under `/sys/fs/bpf`. The container entrypoint mounts a private bpffs on
-> first run, but you must still grant the container `--privileged` (or at
-> minimum `--cap-bpf --cap-net-admin`) so the mount and program loads succeed.
+   The container prints the location of the aggregated logs before exiting.
 
 ---
 
-## eBPF Requirements
+## Notes
 
-The eBPF programs are built with `clang` (CO-RE) and require root privileges to
-pin maps under `/sys/fs/bpf`. Ensure:
+- The UDP protocol is intentionally bare-bones to keep the focus on latency and
+  load-balancing behaviour. Feel free to extend it with additional commands if
+  your experiments need them.
+- eBPF policies assume the reuseport target map is pinned at
+  `/sys/fs/bpf/pebble_udp_targets`. The name is kept for compatibility with
+  existing tooling, even though the storage layer is synthetic.
+- If you update the eBPF programs, rebuild them with `scripts/build_ebpf.sh`
+  before relaunching the server.
 
-- Linux kernel with BPF support (`bpftool` is handy for inspection).
-- `clang`/`llvm-strip`/`llc` available in `PATH`.
-- Sufficient RLIMIT_MEMLOCK (handled by `internal/server/ebpf.go`).
-
-Pinned maps created:
-
-- `/sys/fs/bpf/pebble_udp_targets` – reuseport socket array shared by policies.
-- `/sys/fs/bpf/pebble_rr_state` – (round robin only) a single entry storing
-  worker count and counter.
-
-Use `bpftool map show` to inspect them after launches.
-
----
-
-## Generated Artefacts & Clean-up
-
-- `pebble.data/` contains the on-disk Pebble database. Use `setupdb -destroy`
-  or remove the directory manually to start from scratch.
-- `logs/` and `results/` accumulate data per run. Remove subdirectories once you
-  have extracted the information you need.
-- `run/server.pid` tracks the background server spawned by `launch_server.sh`.
-  It is cleared automatically by `run.sh`, but double-check before rerunning if
-  you abort early.
-
----
-
-## Prerequisites
-
-- Go 1.22 or newer.
-- clang/llvm toolchain (for eBPF builds).
-- Linux with `/sys/fs/bpf` mounted (e.g. `sudo mount bpffs /sys/fs/bpf -t bpf`)
-  when running the server directly on the host.
-
-Optional tools:
-
-- `bpftool` for debugging pinned maps/programs.
-- `perf` / `bcc` utilities if you wish to extend observability.
-
----
-
-## Extending the Playground
-
-Ideas for further exploration:
-
-- Experiment with new eBPF policies: drop additional `.c` files in `ebpf/`,
-  extend `internal/server/ebpf.go` to load them, and supplement `build_ebpf.sh`.
-- Modify `cmd/workload_client` to issue `SET`/`DELETE` commands and track write
-  latency profiles.
-- Evolve the request protocol (add JSON, experiment with framing, etc.) and
-  update `internal/server/handler.go` accordingly.
-- Integrate metrics exporters or tracing to observe refill/scan behaviour.
-
-Pull requests that keep the focus on Pebble-backed reuseport experiments are
-especially welcome.
-
----
-
-Happy hacking! If you run into issues with the eBPF build or Pebble storage
-layer, the `scripts/` folder is a useful starting point for debugging the
-invocation chain. Feel free to open an issue with logs or `bpftool` output. ***
+Happy benchmarking!

@@ -15,10 +15,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Server hosts UDP workers backed by Pebble.
+// Server hosts UDP workers that simulate storage latency.
 type Server struct {
 	cfg    Config
-	store  *Store
 	policy *ebpfPolicy
 	logger *log.Logger
 
@@ -31,27 +30,19 @@ type Server struct {
 type workerStats struct {
 	mu sync.Mutex
 
-	getCount   uint64
-	getHits    uint64
-	getMisses  uint64
-	getErrors  uint64
-	getLatency time.Duration
-
+	getCount    uint64
+	getErrors   uint64
+	getLatency  time.Duration
 	scanCount   uint64
-	scanEntries uint64
 	scanErrors  uint64
 	scanLatency time.Duration
 }
 
 type workerStatsSnapshot struct {
-	getCount   uint64
-	getHits    uint64
-	getMisses  uint64
-	getErrors  uint64
-	getLatency time.Duration
-
+	getCount    uint64
+	getErrors   uint64
+	getLatency  time.Duration
 	scanCount   uint64
-	scanEntries uint64
 	scanErrors  uint64
 	scanLatency time.Duration
 }
@@ -59,41 +50,30 @@ type workerStatsSnapshot struct {
 func (ws *workerStats) reset() {
 	ws.mu.Lock()
 	ws.getCount = 0
-	ws.getHits = 0
-	ws.getMisses = 0
 	ws.getErrors = 0
 	ws.getLatency = 0
 	ws.scanCount = 0
-	ws.scanEntries = 0
 	ws.scanErrors = 0
 	ws.scanLatency = 0
 	ws.mu.Unlock()
 }
 
-func (ws *workerStats) recordGet(duration time.Duration, hit bool, miss bool, err bool) {
+func (ws *workerStats) recordGet(duration time.Duration, err bool) {
 	ws.mu.Lock()
 	ws.getCount++
 	ws.getLatency += duration
-	if hit {
-		ws.getHits++
-	}
-	if miss {
-		ws.getMisses++
-	}
 	if err {
 		ws.getErrors++
 	}
 	ws.mu.Unlock()
 }
 
-func (ws *workerStats) recordScan(duration time.Duration, entries int, err bool) {
+func (ws *workerStats) recordScan(duration time.Duration, err bool) {
 	ws.mu.Lock()
 	ws.scanCount++
 	ws.scanLatency += duration
 	if err {
 		ws.scanErrors++
-	} else {
-		ws.scanEntries += uint64(entries)
 	}
 	ws.mu.Unlock()
 }
@@ -103,32 +83,25 @@ func (ws *workerStats) snapshotAndReset() workerStatsSnapshot {
 	defer ws.mu.Unlock()
 
 	snap := workerStatsSnapshot{
-		getCount:   ws.getCount,
-		getHits:    ws.getHits,
-		getMisses:  ws.getMisses,
-		getErrors:  ws.getErrors,
-		getLatency: ws.getLatency,
-
+		getCount:    ws.getCount,
+		getErrors:   ws.getErrors,
+		getLatency:  ws.getLatency,
 		scanCount:   ws.scanCount,
-		scanEntries: ws.scanEntries,
 		scanErrors:  ws.scanErrors,
 		scanLatency: ws.scanLatency,
 	}
 
 	ws.getCount = 0
-	ws.getHits = 0
-	ws.getMisses = 0
 	ws.getErrors = 0
 	ws.getLatency = 0
 	ws.scanCount = 0
-	ws.scanEntries = 0
 	ws.scanErrors = 0
 	ws.scanLatency = 0
 
 	return snap
 }
 
-// New instantiates the server and loads Pebble and optional eBPF policy.
+// New instantiates the server and loads any configured eBPF policy.
 func New(cfg Config, logger *log.Logger) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -137,20 +110,13 @@ func New(cfg Config, logger *log.Logger) (*Server, error) {
 		logger = log.New(os.Stdout, "[server] ", log.LstdFlags|log.Lmicroseconds)
 	}
 
-	store, err := OpenStore(cfg.DBPath)
-	if err != nil {
-		return nil, err
-	}
-
 	policy, err := loadEBPF(cfg.Policy, cfg.Workers)
 	if err != nil {
-		store.Close()
 		return nil, err
 	}
 
 	if policy != nil && policy.program != nil {
 		if err := clearTargets(cfg.Workers); err != nil {
-			store.Close()
 			policy.Close()
 			return nil, fmt.Errorf("clear reuseport map: %w", err)
 		}
@@ -158,7 +124,6 @@ func New(cfg Config, logger *log.Logger) (*Server, error) {
 
 	return &Server{
 		cfg:    cfg,
-		store:  store,
 		policy: policy,
 		logger: logger,
 		stats:  make([]workerStats, cfg.Workers),
@@ -173,7 +138,7 @@ func (s *Server) Close() error {
 	if s.policy != nil {
 		s.policy.Close()
 	}
-	return s.store.Close()
+	return nil
 }
 
 // Run launches workers and blocks until ctx is cancelled.
@@ -204,14 +169,8 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 
-		iters, err := s.store.NewWorkerIterators()
-		if err != nil {
-			conn.Close()
-			return fmt.Errorf("worker %d iterator: %w", i, err)
-		}
-
 		s.conns = append(s.conns, conn)
-		s.spawnWorker(ctx, i, conn, iters)
+		s.spawnWorker(ctx, i, conn)
 	}
 
 	<-ctx.Done()
@@ -270,13 +229,10 @@ func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {
 	return udpConn, fd, nil
 }
 
-func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, iters *WorkerIterators) {
+func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if iters != nil {
-			defer iters.Close()
-		}
 		buf := make([]byte, 16*1024)
 
 		for {
@@ -294,7 +250,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, it
 				continue
 			}
 
-			response := s.handleRequest(idx, buf[:n], iters)
+			response := s.handleRequest(idx, buf[:n])
 			if response == nil {
 				continue
 			}
@@ -309,9 +265,7 @@ func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn, it
 	}()
 }
 
-const maxScanVisibleEntries = 10
-
-func (s *Server) handleRequest(idx int, payload []byte, iters *WorkerIterators) []byte {
+func (s *Server) handleRequest(idx int, payload []byte) []byte {
 	cmd, args, err := parseRequest(payload)
 	if err != nil {
 		return []byte(fmt.Sprintf("ERR %v", err))
@@ -330,33 +284,11 @@ func (s *Server) handleRequest(idx int, payload []byte, iters *WorkerIterators) 
 			reqID = args[1]
 			args = args[:1]
 		}
-		key := []byte(args[0])
-		var (
-			val    []byte
-			ok     bool
-			getErr error
-		)
-		if iters != nil {
-			val, ok, getErr = iters.Get(key)
-		} else {
-			val, ok, getErr = s.store.Get(key)
-		}
-		if getErr != nil {
-			if stats != nil {
-				stats.recordGet(time.Since(start), false, false, true)
-			}
-			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("get %v", getErr)))
-		}
-		if !ok {
-			if stats != nil {
-				stats.recordGet(time.Since(start), false, true, false)
-			}
-			return formatResponse("MISS", reqID, []byte(args[0]))
-		}
+		time.Sleep(s.cfg.GetDelay)
 		if stats != nil {
-			stats.recordGet(time.Since(start), true, false, false)
+			stats.recordGet(time.Since(start), false)
 		}
-		return formatResponse("VALUE", reqID, val)
+		return formatResponse("VALUE", reqID, []byte(args[0]))
 
 	case "SCAN":
 		start := time.Now()
@@ -368,40 +300,18 @@ func (s *Server) handleRequest(idx int, payload []byte, iters *WorkerIterators) 
 		limit, err := strconv.Atoi(args[1])
 		if err != nil || limit <= 0 {
 			if stats != nil {
-				stats.recordScan(time.Since(start), 0, true)
+				stats.recordScan(time.Since(start), true)
 			}
 			return formatResponse("ERR", reqID, []byte("invalid scan limit"))
 		}
 		if limit > s.cfg.MaxScanKeys {
 			limit = s.cfg.MaxScanKeys
 		}
-		if iters == nil || iters.Scan == nil {
-			if stats != nil {
-				stats.recordScan(time.Since(start), 0, true)
-			}
-			return formatResponse("ERR", reqID, []byte("scan iterator unavailable"))
-		}
-		result, err := iters.Scan.Scan([]byte(args[0]), limit)
-		if err != nil {
-			if stats != nil {
-				stats.recordScan(time.Since(start), 0, true)
-			}
-			return formatResponse("ERR", reqID, []byte(fmt.Sprintf("scan %v", err)))
-		}
-		if len(result) > maxScanVisibleEntries {
-			result = result[:maxScanVisibleEntries]
-		}
-		payload, ok := MarshalScan(result, maxScanResponseBytes)
-		if !ok {
-			if stats != nil {
-				stats.recordScan(time.Since(start), 0, true)
-			}
-			return formatResponse("ERR", reqID, []byte("scan payload too large; reduce limit"))
-		}
+		time.Sleep(s.cfg.ScanDelay)
 		if stats != nil {
-			stats.recordScan(time.Since(start), len(result), false)
+			stats.recordScan(time.Since(start), false)
 		}
-		return formatResponse("SCAN", reqID, payload)
+		return formatResponse("SCAN", reqID, []byte("EMPTY"))
 	default:
 		return []byte("ERR unknown command")
 	}
@@ -434,26 +344,20 @@ func (s *Server) startStatsLogger(ctx context.Context) {
 							workerAvgScan = time.Duration(int64(snap.scanLatency) / int64(snap.scanCount))
 						}
 						s.logger.Printf(
-							"[perf] worker=%d gets=%d hits=%d misses=%d errors=%d avg_get=%s scans=%d entries=%d scan_errors=%d avg_scan=%s",
+							"[perf] worker=%d gets=%d get_errors=%d avg_get=%s scans=%d scan_errors=%d avg_scan=%s",
 							i,
 							snap.getCount,
-							snap.getHits,
-							snap.getMisses,
 							snap.getErrors,
 							workerAvgGet,
 							snap.scanCount,
-							snap.scanEntries,
 							snap.scanErrors,
 							workerAvgScan,
 						)
 					}
 					total.getCount += snap.getCount
-					total.getHits += snap.getHits
-					total.getMisses += snap.getMisses
 					total.getErrors += snap.getErrors
 					total.getLatency += snap.getLatency
 					total.scanCount += snap.scanCount
-					total.scanEntries += snap.scanEntries
 					total.scanErrors += snap.scanErrors
 					total.scanLatency += snap.scanLatency
 				}
@@ -469,14 +373,11 @@ func (s *Server) startStatsLogger(ctx context.Context) {
 					avgScan = time.Duration(int64(total.scanLatency) / int64(total.scanCount))
 				}
 				s.logger.Printf(
-					"[perf] interval=1s gets=%d hits=%d misses=%d errors=%d avg_get=%s scans=%d entries=%d scan_errors=%d avg_scan=%s",
+					"[perf] interval=1s gets=%d get_errors=%d avg_get=%s scans=%d scan_errors=%d avg_scan=%s",
 					total.getCount,
-					total.getHits,
-					total.getMisses,
 					total.getErrors,
 					avgGet,
 					total.scanCount,
-					total.scanEntries,
 					total.scanErrors,
 					avgScan,
 				)
