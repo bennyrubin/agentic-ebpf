@@ -12,9 +12,9 @@ from collections import defaultdict
 ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
 #DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
-DEFAULT_POLICIES = ["default", "round_robin", "scan_split"]
+DEFAULT_POLICIES = ["round_robin", "scan_split"]
 #RATE_VALUES = [30000, 40000, 50000, 60000]
-RATE_VALUES = [50000, 90000, 120000]
+RATE_VALUES = [90000,100000,110000,120000,130000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -36,13 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--iterations",
         type=int,
-        default=4,
+        default=3,
         help="Iterations per run.sh invocation (default: %(default)s)",
     )
     parser.add_argument(
         "--duration",
         type=int,
-        default=15,
+        default=20,
         help="Duration in seconds for each workload run (default: %(default)s)",
     )
     parser.add_argument(
@@ -314,10 +314,14 @@ def main() -> None:
 
         for info in run_infos:
             run_dir = info["run_dir"]
-            summary = load_summary(run_dir)
-            overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
-            get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
-            scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
+            try:
+                summary = load_summary(run_dir)
+                overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
+                get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
+                scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
+            except (FileNotFoundError, KeyError) as exc:
+                print(f"Skipping run {run_dir} ({info['policy']} @ {info['rate']} rps): {exc}")
+                continue
 
             record = {
                 "policy": info["policy"],
@@ -334,6 +338,9 @@ def main() -> None:
                 "run_dir": str(run_dir.resolve()),
             }
             records.append(record)
+
+        if not records:
+            sys.exit("No runs with complete metrics available after filtering manifest.")
 
         policies = sorted({rec["policy"] for rec in records})
         rates = sorted({rec["rate"] for rec in records})
@@ -370,10 +377,14 @@ def main() -> None:
         for policy in policies:
             for rate in rates:
                 run_dir = invoke_run_sh(policy, rate, args.threads, args.iterations, args.duration)
-                summary = load_summary(run_dir)
-                overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
-                get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
-                scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
+                try:
+                    summary = load_summary(run_dir)
+                    overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
+                    get_avg, get_stddev, get_iterations = extract_metric(summary, "get_latency_p99")
+                    scan_avg, scan_stddev, scan_iterations = extract_metric(summary, "scan_latency_p99")
+                except (FileNotFoundError, KeyError) as exc:
+                    print(f"Skipping run {run_dir} ({policy} @ {rate} rps): {exc}")
+                    continue
 
                 record = {
                     "policy": policy,
@@ -390,6 +401,9 @@ def main() -> None:
                     "run_dir": str(run_dir),
                 }
                 records.append(record)
+
+        if not records:
+            sys.exit("No runs with complete metrics were produced.")
 
         metadata = {
             "experiment_id": experiment_id,

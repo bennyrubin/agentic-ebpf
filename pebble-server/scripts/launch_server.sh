@@ -12,7 +12,7 @@ LISTEN="127.0.0.1:9000"
 LOG_DIR="$ROOT/logs/server"
 RESULTS_DIR="$ROOT/results"
 RUN_STATE_DIR="${RUN_STATE_DIR:-$ROOT/run}"
-BUILD_SERVER_BIN="${BUILD_SERVER_BIN:-false}"
+BUILD_SERVER_BIN="${BUILD_SERVER_BIN:-true}"
 SERVER_BIN="${PEBBLE_SERVER_BIN:-$BIN_DIR/pebble_server}"
 
 usage() {
@@ -42,9 +42,12 @@ done
 
 mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$RUN_STATE_DIR"
 
-if [[ ! -x "$SERVER_BIN" || "$BUILD_SERVER_BIN" == "true" ]]; then
-  export GOCACHE="${GOCACHE:-$ROOT/.gocache}"
+export GOCACHE="${GOCACHE:-$ROOT/.gocache}"
+if [[ "$BUILD_SERVER_BIN" == "true" ]]; then
   go build -o "$SERVER_BIN" ./cmd/pebble_server
+elif [[ ! -x "$SERVER_BIN" ]]; then
+  echo "Server binary missing at $SERVER_BIN; set BUILD_SERVER_BIN=true to build automatically." >&2
+  exit 1
 fi
 
 PID_FILE="$RUN_STATE_DIR/server.pid"

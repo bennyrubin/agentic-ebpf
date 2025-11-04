@@ -26,8 +26,9 @@ const (
 	idSeqHexLen  = 8
 	idTotalLen   = idTimeHexLen + idSeqHexLen + 1
 
-	reqTypeGet  = byte('G')
-	reqTypeScan = byte('S')
+	reqTypeGet     = byte('G')
+	reqTypeScan    = byte('S')
+	hotKeyFraction = 0.01
 )
 
 var hexDigits = [...]byte{'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'}
@@ -102,6 +103,15 @@ func main() {
 	}
 	defer lf.Close()
 	logger := log.New(lf, "[client] ", log.LstdFlags|log.Lmicroseconds)
+
+	hotKeyCount := int(math.Ceil(float64(*keySpace) * hotKeyFraction))
+	if hotKeyCount < 1 {
+		hotKeyCount = 1
+	}
+	if hotKeyCount > *keySpace {
+		hotKeyCount = *keySpace
+	}
+	logger.Printf("hot key strategy enabled: %.2f%% of key space (%d keys) reserved for GET traffic", hotKeyFraction*100, hotKeyCount)
 
 	udpAddr, err := net.ResolveUDPAddr("udp", *serverAddr)
 	if err != nil {
@@ -201,7 +211,7 @@ func main() {
 				}
 				sendTime := time.Now()
 				reqID := makeReqID(sendTime.UnixNano(), currSeq, isGet)
-				payload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, *scanLimit)
+				payload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, hotKeyCount, *scanLimit)
 				if _, err := conn.Write(payload); err != nil {
 					logger.Printf("write error (worker=%d): %v", workerID, err)
 					buf = payload[:0]
@@ -360,11 +370,14 @@ func parseHex(src []byte) (uint64, bool) {
 	return v, true
 }
 
-func buildPayload(rng *rand.Rand, buf []byte, reqType, reqID, prefix string, keySpace, scanLimit int) []byte {
+func buildPayload(rng *rand.Rand, buf []byte, reqType, reqID, prefix string, keySpace, hotKeyCount, scanLimit int) []byte {
 	buf = buf[:0]
 	buf = append(buf, reqType...)
 	buf = append(buf, ' ')
 	keyIdx := rng.Intn(keySpace)
+	if reqType == "GET" && hotKeyCount > 0 {
+		keyIdx = rng.Intn(hotKeyCount)
+	}
 	buf = appendKey(buf, prefix, keyIdx)
 	if reqType == "SCAN" {
 		buf = append(buf, ' ')

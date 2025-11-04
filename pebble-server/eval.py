@@ -6,10 +6,10 @@ The evaluator receives the path to a candidate eBPF program, swaps it into
 ``ebpf/agent.c``, runs ``run.sh`` to build and benchmark the system, and
 aggregates latency metrics from the freshest ``results/run-*`` directory.
 
-The returned metrics dictionary must include ``combined_score``; per the
-project's convention we expose the overall p99 latency (milliseconds) both as
-``combined_score`` and under ``overall_latency_p99``.  Lower values therefore
-represent better programs.
+The returned metrics dictionary must include ``combined_score``; OpenEvolve
+maximises that value, so we expose the negated overall p99 latency (milliseconds)
+as ``combined_score`` and report the raw latency under
+``overall_latency_p99``. Higher combined scores therefore mean lower latency.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = REPO_ROOT / "results"
 AGENT_SOURCE = REPO_ROOT / "ebpf" / "agent.c"
 RUN_SCRIPT = REPO_ROOT / "run.sh"
+
 def evaluate(program_path: str) -> Dict[str, float]:
     """
     Evaluate the given program file and return latency metrics.
@@ -49,7 +50,7 @@ def _evaluate(program_path: Path) -> Dict[str, float]:
         candidate_source = program_path.read_text()
     except Exception as exc:
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": f"failed to read candidate program: {exc}",
         }
@@ -58,7 +59,7 @@ def _evaluate(program_path: Path) -> Dict[str, float]:
         AGENT_SOURCE.write_text(candidate_source)
     except Exception as exc:
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": f"failed to write agent.c: {exc}",
         }
@@ -78,7 +79,7 @@ def _evaluate(program_path: Path) -> Dict[str, float]:
     if completed.returncode != 0:
         # Bubble up the failure with a large (bad) combined score.
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": "run.sh failed",
             "stderr_message": completed.stderr.strip(),
@@ -87,14 +88,14 @@ def _evaluate(program_path: Path) -> Dict[str, float]:
     run_dir = _locate_new_run(pre_existing_runs)
     if run_dir is None:
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": "could not locate new results directory",
         }
 
     metrics = _extract_metrics(run_dir)
     metrics.setdefault("run_timestamp", run_dir.stat().st_mtime)
-    metrics.setdefault("combined_score", float("inf"))
+    metrics.setdefault("combined_score", float("-inf"))
 
     return metrics
 
@@ -121,7 +122,7 @@ def _extract_metrics(run_dir: Path) -> Dict[str, float]:
     summary_path = run_dir / "workload_summary.json"
     if not summary_path.exists():
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": f"missing workload_summary.json in {run_dir}",
         }
@@ -130,7 +131,7 @@ def _extract_metrics(run_dir: Path) -> Dict[str, float]:
         payload = json.loads(summary_path.read_text())
     except json.JSONDecodeError as exc:
         return {
-            "combined_score": float("inf"),
+            "combined_score": float("-inf"),
             "error": 1.0,
             "error_message": f"invalid JSON in workload_summary.json: {exc}",
         }
@@ -140,8 +141,8 @@ def _extract_metrics(run_dir: Path) -> Dict[str, float]:
 
     overall_p99 = _pull_metric(summary, "overall_latency_p99")
     if overall_p99 is not None:
-        metrics["combined_score"] = overall_p99
         metrics["overall_latency_p99"] = overall_p99
+        metrics["combined_score"] = -overall_p99
 
     # Add a few extra helpful metrics when present.
     for key in (

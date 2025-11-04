@@ -13,7 +13,6 @@ docker-run:
 		--privileged \
 		-v $(RESULTS_DIR):/results \
 		-v $(RESULTS_DIR)/work:/opt/work \
-		--mount type=bind,src=/sys/fs/bpf,target=/sys/fs/bpf \
 		$(IMAGE_NAME) $(ARGS)
 
 docker-dispatch:

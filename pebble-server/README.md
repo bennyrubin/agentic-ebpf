@@ -251,9 +251,9 @@ view of the database without duplicating the SSTables.
 > `docker run --memory`.
 >
 > **eBPF privileges:** Policies other than `default` need access to pinned BPF
-> maps under `/sys/fs/bpf`. When running inside Docker, grant the container
-> `--privileged` (or at minimum `--cap-bpf --cap-net-admin` and mount
-> `/sys/fs/bpf`) if you plan to exercise eBPF-based load balancing.
+> maps under `/sys/fs/bpf`. The container entrypoint mounts a private bpffs on
+> first run, but you must still grant the container `--privileged` (or at
+> minimum `--cap-bpf --cap-net-admin`) so the mount and program loads succeed.
 
 ---
 
@@ -292,7 +292,8 @@ Use `bpftool map show` to inspect them after launches.
 
 - Go 1.22 or newer.
 - clang/llvm toolchain (for eBPF builds).
-- Linux with `/sys/fs/bpf` mounted (e.g. `sudo mount bpffs /sys/fs/bpf -t bpf`).
+- Linux with `/sys/fs/bpf` mounted (e.g. `sudo mount bpffs /sys/fs/bpf -t bpf`)
+  when running the server directly on the host.
 
 Optional tools:
 

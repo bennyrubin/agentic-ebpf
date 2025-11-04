@@ -18,7 +18,8 @@ import pathlib
 import shlex
 import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Iterable, Optional, Sequence, Union
+import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -30,10 +31,62 @@ except Exception:  # pragma: no cover - fallback if run_exp moves.
     RUN_EXP_RATES = [30000, 40000, 50000, 60000]
 
 
-def parse_cpu_sets(value: str) -> list[str]:
-    if not value:
+CpuSetArg = Union[str, Sequence[str]]
+
+
+def parse_cpu_sets(raw: CpuSetArg) -> list[str]:
+    if not raw:
         return []
-    return [token.strip() for token in value.split(",") if token.strip()]
+    if isinstance(raw, str):
+        values = [raw]
+    else:
+        values = list(raw)
+    result: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        # Allow semicolons as optional group separators when the caller quotes them.
+        cleaned = value.replace(";", " ")
+        for token in cleaned.split():
+            token = token.strip()
+            if token:
+                result.append(token)
+    return result
+
+
+def expand_cpu_list(spec: str) -> list[int]:
+    cpus: set[int] = set()
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = token.split("-", 1)
+            start_i = int(start, 10)
+            end_i = int(end, 10)
+            if start_i > end_i:
+                start_i, end_i = end_i, start_i
+            cpus.update(range(start_i, end_i + 1))
+        else:
+            cpus.add(int(token, 10))
+    return sorted(cpus)
+
+
+def load_cpu_node_map() -> dict[int, int]:
+    try:
+        output = subprocess.check_output(["lscpu", "-p=cpu,node"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    mapping: dict[int, int] = {}
+    for line in output.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        cpu_str, node_str = line.split(",", 1)
+        try:
+            mapping[int(cpu_str, 10)] = int(node_str, 10)
+        except ValueError:
+            continue
+    return mapping
 
 
 def parse_rates(value: str) -> list[int]:
@@ -60,6 +113,7 @@ class Job:
     policy: str
     rate: int
     cpuset: Optional[str]
+    mems: Optional[str]
     run_id: str
     exp_id: str
     container_name: str
@@ -73,6 +127,7 @@ def build_jobs(
     rates: Iterable[int],
     timestamp: str,
     cpu_sets: list[str],
+    cpu_node_map: dict[int, int],
     results_dir: pathlib.Path,
     logs_dir: pathlib.Path,
     image: str,
@@ -102,11 +157,24 @@ def build_jobs(
             f"{results_dir}:/results",
             "-v",
             f"{results_dir}/work:/opt/work",
-            "--mount",
-            "type=bind,src=/sys/fs/bpf,target=/sys/fs/bpf",
         ]
+        mems_arg: Optional[str] = None
         if cpuset:
             cmd += ["--cpuset-cpus", cpuset]
+            if cpu_node_map:
+                cpu_ids = expand_cpu_list(cpuset)
+                nodes = {cpu_node_map.get(cpu) for cpu in cpu_ids if cpu in cpu_node_map}
+                nodes.discard(None)
+                if len(nodes) == 1:
+                    mems_arg = str(nodes.pop())
+        if mems_arg is not None:
+            cmd += ["--cpuset-mems", mems_arg]
+        if cpuset:
+            print(
+                f"[dispatch] job={container_name} cpuset={cpuset}"
+                f" mems={'auto' if mems_arg is None else mems_arg}",
+                flush=True,
+            )
         for env_kv in extra_env:
             cmd += ["-e", env_kv]
 
@@ -131,6 +199,7 @@ def build_jobs(
                 policy=policy,
                 rate=rate,
                 cpuset=cpuset,
+                mems=mems_arg,
                 run_id=run_id,
                 exp_id=exp_id,
                 container_name=container_name,
@@ -141,12 +210,19 @@ def build_jobs(
     return jobs
 
 
-async def run_job(job: Job, *, dry_run: bool, semaphore: asyncio.Semaphore) -> dict:
+async def run_job(
+    job: Job,
+    *,
+    dry_run: bool,
+    semaphore: asyncio.Semaphore,
+    cpuset_locks: dict[str, asyncio.Lock],
+) -> dict:
     meta = {
         "index": job.index,
         "policy": job.policy,
         "rate": job.rate,
         "cpuset": job.cpuset,
+        "mems": job.mems,
         "run_id": job.run_id,
         "exp_id": job.exp_id,
         "container": job.container_name,
@@ -159,7 +235,7 @@ async def run_job(job: Job, *, dry_run: bool, semaphore: asyncio.Semaphore) -> d
         meta["status"] = "dry-run"
         return meta
 
-    async with semaphore:
+    async def launch() -> dict:
         job.log_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"[dispatch] starting {job.run_id} ({job.policy} @ {job.rate} rps)")
         proc = await asyncio.create_subprocess_exec(
@@ -186,6 +262,13 @@ async def run_job(job: Job, *, dry_run: bool, semaphore: asyncio.Semaphore) -> d
         meta["status"] = "ok"
         return meta
 
+    cpuset_lock = cpuset_locks.get(job.cpuset) if job.cpuset else None
+    async with semaphore:
+        if cpuset_lock is None:
+            return await launch()
+        async with cpuset_lock:
+            return await launch()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -209,8 +292,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cpu-sets",
-        default="",
-        help="Comma-separated list of cpuset strings to pin containers (e.g. '0-3,4-7')",
+        action="append",
+        default=[],
+        help=(
+            "Pin containers to specific CPU groups. Provide multiple occurrences for"
+            " separate groups (e.g. --cpu-sets 0,2,4,6 --cpu-sets 16,18,20,22)."
+            " Semicolons inside a quoted value are also treated as separators."
+        ),
     )
     parser.add_argument(
         "--policies",
@@ -293,11 +381,16 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.extra_run_args:
         base_command += shlex.split(args.extra_run_args)
 
+    cpu_node_map = load_cpu_node_map()
+
+    cpuset_locks = {cpuset: asyncio.Lock() for cpuset in set(cpu_sets) if cpuset}
+
     jobs = build_jobs(
         policies=policies,
         rates=rates,
         timestamp=timestamp,
         cpu_sets=cpu_sets,
+        cpu_node_map=cpu_node_map,
         results_dir=results_dir,
         logs_dir=logs_dir,
         image=args.image,
@@ -307,7 +400,17 @@ async def main_async(args: argparse.Namespace) -> None:
 
     manifest: list[dict] = []
     sem = asyncio.Semaphore(args.max_parallel)
-    tasks = [asyncio.create_task(run_job(job, dry_run=args.dry_run, semaphore=sem)) for job in jobs]
+    tasks = [
+        asyncio.create_task(
+            run_job(
+                job,
+                dry_run=args.dry_run,
+                semaphore=sem,
+                cpuset_locks=cpuset_locks,
+            )
+        )
+        for job in jobs
+    ]
 
     try:
         for task in asyncio.as_completed(tasks):
@@ -330,6 +433,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "duration": args.duration,
             "iterations": args.iterations,
             "cpu_sets": cpu_sets,
+            "cpu_node_map": cpu_node_map,
             "env": args.env,
             "dry_run": args.dry_run,
             "jobs": manifest,
