@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Launch multiple pebble experiments in parallel using Docker containers.
+Launch multiple synthetic-latency experiments in parallel using Docker containers.
 
-Each container runs run.sh with its own copy of the Pebble dataset and writes
-results into the shared results directory. The script enforces a configurable
-level of parallelism and optional CPU pinning via cpusets to minimise cross-run
+Each container runs run.sh with its own isolated working directory and writes
+results into the shared output volume. The script enforces a configurable level
+of parallelism and optional CPU pinning via cpusets to minimise cross-run
 interference.
 """
 from __future__ import annotations
@@ -285,7 +285,6 @@ async def main_async(args: argparse.Namespace) -> None:
         str(args.duration),
         "--iterations",
         str(args.iterations),
-        "--skip-db-setup",
     ]
 
     if args.extra_run_args:

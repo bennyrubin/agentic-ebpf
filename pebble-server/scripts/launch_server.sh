@@ -7,34 +7,37 @@ mkdir -p "$BIN_DIR"
 
 THREADS=4
 POLICY="default"
-DB_PATH="$ROOT/pebble.data"
 LISTEN="127.0.0.1:9000"
 LOG_DIR="$ROOT/logs/server"
 RESULTS_DIR="$ROOT/results"
 RUN_STATE_DIR="${RUN_STATE_DIR:-$ROOT/run}"
 BUILD_SERVER_BIN="${BUILD_SERVER_BIN:-true}"
 SERVER_BIN="${PEBBLE_SERVER_BIN:-$BIN_DIR/pebble_server}"
+GET_DELAY="${GET_DELAY:-}"
+SCAN_DELAY="${SCAN_DELAY:-}"
 
 usage() {
   cat <<USAGE
 Usage: $0 [options]
   -t <threads>   number of worker sockets (default: $THREADS)
   -p <policy>    load-balancing policy: default|round_robin|agent|scan_split
-  -d <db-path>   Pebble directory (default: $DB_PATH)
   -l <address>   UDP listen address (default: $LISTEN)
   -o <log-dir>   directory for server logs (default: $LOG_DIR)
   -r <results>   directory to store experiment metadata (default: $RESULTS_DIR)
+  -g <duration>  synthetic GET latency (passed to -get-delay)
+  -s <duration>  synthetic SCAN latency (passed to -scan-delay)
 USAGE
 }
 
-while getopts ":t:p:d:l:o:r:" opt; do
+while getopts ":t:p:l:o:r:g:s:" opt; do
   case "$opt" in
     t) THREADS="$OPTARG" ;;
     p) POLICY="$OPTARG" ;;
-    d) DB_PATH="$OPTARG" ;;
     l) LISTEN="$OPTARG" ;;
     o) LOG_DIR="$OPTARG" ;;
     r) RESULTS_DIR="$OPTARG" ;;
+    g) GET_DELAY="$OPTARG" ;;
+    s) SCAN_DELAY="$OPTARG" ;;
     :) echo "Option -$OPTARG requires an argument." >&2; exit 1 ;;
     \?) usage; exit 1 ;;
   esac
@@ -59,13 +62,22 @@ if [[ -f "$PID_FILE" ]]; then
   fi
 fi
 
-"$SERVER_BIN" \
-  -db "$DB_PATH" \
-  -listen "$LISTEN" \
-  -workers "$THREADS" \
-  -policy "$POLICY" \
-  -log-dir "$LOG_DIR" \
-  -results-dir "$RESULTS_DIR" &
+SERVER_CMD=(
+  "$SERVER_BIN"
+  -listen "$LISTEN"
+  -workers "$THREADS"
+  -policy "$POLICY"
+  -log-dir "$LOG_DIR"
+  -results-dir "$RESULTS_DIR"
+)
+if [[ -n "$GET_DELAY" ]]; then
+  SERVER_CMD+=(-get-delay "$GET_DELAY")
+fi
+if [[ -n "$SCAN_DELAY" ]]; then
+  SERVER_CMD+=(-scan-delay "$SCAN_DELAY")
+fi
+
+"${SERVER_CMD[@]}" &
 
 PID=$!
 echo "$PID" > "$PID_FILE"

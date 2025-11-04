@@ -20,7 +20,6 @@ import (
 
 func main() {
 	var (
-		dbPath       = flag.String("db", "", "path to Pebble database")
 		listen       = flag.String("listen", "127.0.0.1:9000", "UDP listen address")
 		workers      = flag.Int("workers", 4, "number of reuseport workers")
 		policy       = flag.String("policy", "default", "load-balancing policy: default|round_robin|agent|scan_split")
@@ -29,6 +28,8 @@ func main() {
 		resultsDir   = flag.String("results-dir", "results", "directory to store experiment artefacts")
 		readTimeout  = flag.Duration("read-timeout", 2*time.Second, "per-request read deadline")
 		writeTimeout = flag.Duration("write-timeout", 2*time.Second, "per-request write deadline")
+		getDelay     = flag.Duration("get-delay", 10*time.Microsecond, "simulated GET latency")
+		scanDelay    = flag.Duration("scan-delay", 2*time.Millisecond, "simulated SCAN latency")
 	)
 	flag.Parse()
 
@@ -58,7 +59,6 @@ func main() {
 	}()
 
 	cfg := server.Config{
-		DBPath:       *dbPath,
 		ListenAddr:   *listen,
 		Workers:      *workers,
 		Policy:       *policy,
@@ -67,6 +67,8 @@ func main() {
 		MaxScanKeys:  *maxScan,
 		LogDir:       *logDir,
 		ResultsDir:   *resultsDir,
+		GetDelay:     *getDelay,
+		ScanDelay:    *scanDelay,
 	}
 
 	srv, err := server.New(cfg, logger)
@@ -78,7 +80,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Printf("server starting addr=%s workers=%d policy=%s pprof=127.0.0.1:6060", cfg.ListenAddr, cfg.Workers, cfg.Policy)
+	logger.Printf("server starting addr=%s workers=%d policy=%s get_delay=%s scan_delay=%s pprof=127.0.0.1:6060", cfg.ListenAddr, cfg.Workers, cfg.Policy, cfg.GetDelay, cfg.ScanDelay)
 
 	if err := srv.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)

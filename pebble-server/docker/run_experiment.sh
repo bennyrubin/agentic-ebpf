@@ -2,7 +2,6 @@
 set -euo pipefail
 
 APP_HOME=${APP_HOME:-/opt/app}
-BASE_DATA_DIR=${BASE_DATA_DIR:-/opt/pebble-base}
 WORK_ROOT=${WORK_ROOT:-/opt/work}
 RESULTS_ROOT=${OUTPUT_ROOT:-/results}
 
@@ -30,19 +29,13 @@ ensure_bpffs
 EXP_ID=${EXP_ID:-exp-$(timestamp)-$RANDOM}
 RUN_ID=${RUN_ID:-run-$(timestamp)-$RANDOM}
 WORK_DIR="${WORK_ROOT}/${EXP_ID}"
-DB_COPY_DIR="${WORK_DIR}/pebble.data"
 STATE_DIR="${WORK_DIR}/state"
 
-mkdir -p "$RESULTS_ROOT" "$WORK_DIR" "$DB_COPY_DIR" "$STATE_DIR"
+mkdir -p "$RESULTS_ROOT" "$WORK_DIR" "$STATE_DIR"
 
-echo "[entrypoint] Preparing dataset copy for $EXP_ID"
-rsync -a --delete "${BASE_DATA_DIR}/" "${DB_COPY_DIR}/"
-
-export DB_PATH="$DB_COPY_DIR"
 export OUTPUT_ROOT="$RESULTS_ROOT"
 export RUN_ID="$RUN_ID"
 export RUN_STATE_DIR="$STATE_DIR"
-export SKIP_DB_SETUP="${SKIP_DB_SETUP:-true}"
 export SKIP_EBPF_BUILD="${SKIP_EBPF_BUILD:-true}"
 
 cd "$APP_HOME"
