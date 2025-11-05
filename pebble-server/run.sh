@@ -12,8 +12,8 @@ GET_FRAC=${GET_FRAC:-.995}
 SCAN_LIMIT=${SCAN_LIMIT:-1500}
 SEND_WORKERS=${SEND_WORKERS:-7}
 LISTEN=${LISTEN:-127.0.0.1:9000}
-GET_DELAY=${GET_DELAY:-}
-SCAN_DELAY=${SCAN_DELAY:-}
+GET_DELAY=${GET_DELAY:-10us}
+SCAN_DELAY=${SCAN_DELAY:-2ms}
 ITERATIONS=${ITERATIONS:-3}
 WARMUP_DURATION=${WARMUP_DURATION:-1}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$ROOT/results}
@@ -74,6 +74,11 @@ LOG_DIR="$RUN_DIR/logs"
 STATE_DIR="${RUN_STATE_DIR_OVERRIDE:-$RUN_DIR/runstate}"
 mkdir -p "$LOG_DIR" "$STATE_DIR"
 export RUN_STATE_DIR="$STATE_DIR"
+
+BPF_PIN_BASE=${BPF_PIN_BASE:-/sys/fs/bpf/pebble}
+BPF_PIN_PATH=${BPF_PIN_PATH:-$BPF_PIN_BASE/$RUN_ID}
+export BPF_PIN_BASE BPF_PIN_PATH
+mkdir -p "$BPF_PIN_PATH"
 
 WORKLOAD_BIN="${WORKLOAD_BIN:-$ROOT/bin/workload_client}"
 
@@ -253,5 +258,8 @@ if kill "$SERVER_PID" >/dev/null 2>&1; then
   wait "$SERVER_PID" 2>/dev/null || true
 fi
 rm -f "$PID_FILE"
+if [[ -n "${BPF_PIN_PATH:-}" ]]; then
+  rm -rf "$BPF_PIN_PATH" 2>/dev/null || true
+fi
 
 echo "Logs and results stored in $RUN_DIR"

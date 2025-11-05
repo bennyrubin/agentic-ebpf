@@ -14,7 +14,7 @@ RUN_SH = ROOT / "run.sh"
 #DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
 DEFAULT_POLICIES = ["round_robin", "scan_split"]
 #RATE_VALUES = [30000, 40000, 50000, 60000]
-RATE_VALUES = [90000,100000,110000,120000,130000]
+RATE_VALUES = [90000,100000,110000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--duration",
         type=int,
-        default=20,
+        default=10,
         help="Duration in seconds for each workload run (default: %(default)s)",
     )
     parser.add_argument(

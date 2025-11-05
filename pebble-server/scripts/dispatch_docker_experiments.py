@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import shlex
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
@@ -30,10 +31,31 @@ except Exception:  # pragma: no cover - fallback if run_exp moves.
     RUN_EXP_RATES = [30000, 40000, 50000, 60000]
 
 
-def parse_cpu_sets(value: str) -> list[str]:
+def parse_cpu_sets(value: str, extras: Optional[list[str]] = None) -> list[str]:
     if not value:
-        return []
-    return [token.strip() for token in value.split(",") if token.strip()]
+        tokens: list[str] = []
+    else:
+        tokens = []
+
+        has_group_sep = any(delim in value for delim in (";", "|"))
+        grouped: list[str] = []
+        for part in value.split(";"):
+            grouped.extend(part.split("|"))
+        grouped = [item.strip() for item in grouped if item.strip()]
+
+        if has_group_sep and grouped:
+            tokens.extend(grouped)
+        else:
+            for item in grouped or [value.strip()]:
+                tokens.extend(part.strip() for part in item.split(",") if part.strip())
+
+    if extras:
+        for entry in extras:
+            entry = entry.strip()
+            if entry:
+                tokens.append(entry)
+
+    return tokens
 
 
 def parse_rates(value: str) -> list[int]:
@@ -139,7 +161,13 @@ def build_jobs(
     return jobs
 
 
-async def run_job(job: Job, *, dry_run: bool, semaphore: asyncio.Semaphore) -> dict:
+async def run_job(
+    job: Job,
+    *,
+    dry_run: bool,
+    semaphore: asyncio.Semaphore,
+    cpu_locks: dict[str, asyncio.Lock],
+) -> dict:
     meta = {
         "index": job.index,
         "policy": job.policy,
@@ -157,32 +185,42 @@ async def run_job(job: Job, *, dry_run: bool, semaphore: asyncio.Semaphore) -> d
         meta["status"] = "dry-run"
         return meta
 
-    async with semaphore:
-        job.log_path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[dispatch] starting {job.run_id} ({job.policy} @ {job.rate} rps)")
-        proc = await asyncio.create_subprocess_exec(
-            *job.command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+    async def execute_job() -> dict:
+        async with semaphore:
+            job.log_path.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[dispatch] starting {job.run_id} ({job.policy} @ {job.rate} rps)")
+            proc = await asyncio.create_subprocess_exec(
+                *job.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
 
-        assert proc.stdout is not None
-        with job.log_path.open("w", encoding="utf-8") as log_fh:
-            async for raw in proc.stdout:
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                log_fh.write(line + "\n")
-                log_fh.flush()
-                print(f"[{job.run_id}] {line}")
+            assert proc.stdout is not None
+            with job.log_path.open("w", encoding="utf-8") as log_fh:
+                async for raw in proc.stdout:
+                    line = raw.decode("utf-8", errors="replace").rstrip()
+                    log_fh.write(line + "\n")
+                    log_fh.flush()
+                    print(f"[{job.run_id}] {line}")
 
-        returncode = await proc.wait()
-        meta["exit_code"] = returncode
-        if returncode != 0:
-            meta["status"] = "failed"
-            raise RuntimeError(f"Container {job.container_name} exited with {returncode}")
+            returncode = await proc.wait()
+            meta["exit_code"] = returncode
+            if returncode != 0:
+                meta["status"] = "failed"
+                raise RuntimeError(
+                    f"Container {job.container_name} exited with {returncode}"
+                )
 
-        print(f"[dispatch] completed {job.run_id}")
-        meta["status"] = "ok"
-        return meta
+            print(f"[dispatch] completed {job.run_id}")
+            meta["status"] = "ok"
+            return meta
+
+    cpu_lock = cpu_locks.get(job.cpuset) if job.cpuset else None
+    if cpu_lock is None:
+        return await execute_job()
+
+    async with cpu_lock:
+        return await execute_job()
 
 
 def parse_args() -> argparse.Namespace:
@@ -208,7 +246,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-sets",
         default="",
-        help="Comma-separated list of cpuset strings to pin containers (e.g. '0-3,4-7')",
+        help=(
+            "List of cpuset strings. Separate multiple sets with commas as before "
+            "(e.g. '0-3,4-7'), or use ';'/'|' when an individual set already contains "
+            "commas (e.g. '0,2,4,6,8;10,12,14,16,18')."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-set",
+        action="append",
+        dest="cpu_set",
+        default=None,
+        help=(
+            "Repeatable cpuset string for finer control. Example: "
+            "--cpu-set 0,2,4,6,8 --cpu-set 10,12,14,16,18."
+        ),
     )
     parser.add_argument(
         "--policies",
@@ -254,6 +306,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print docker commands without executing them.",
     )
+    parser.add_argument(
+        "--skip-run-exp",
+        action="store_true",
+        help="Skip invoking run_exp.py after dispatch completes.",
+    )
+    parser.add_argument(
+        "--run-exp-path",
+        default=str(ROOT / "run_exp.py"),
+        help="Path to run_exp.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--run-exp-output-dir",
+        default=str(ROOT / "results" / "experiments"),
+        help="Output directory passed to run_exp.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--run-exp-extra-args",
+        default="",
+        help="Additional arguments appended to run_exp.py (shell-split).",
+    )
     return parser.parse_args()
 
 
@@ -269,7 +341,8 @@ async def main_async(args: argparse.Namespace) -> None:
 
     policies = parse_policies(args.policies)
     rates = parse_rates(args.rates)
-    cpu_sets = parse_cpu_sets(args.cpu_sets)
+    cpu_sets = parse_cpu_sets(args.cpu_sets, args.cpu_set)
+    cpu_locks = {cpuset: asyncio.Lock() for cpuset in {c for c in cpu_sets if c}}
 
     if not policies:
         raise SystemExit("No policies specified.")
@@ -290,6 +363,17 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.extra_run_args:
         base_command += shlex.split(args.extra_run_args)
 
+    quoted_base = " ".join(shlex.quote(part) for part in base_command)
+    print(
+        "[dispatch] configuration:",
+        f"max_parallel={args.max_parallel}",
+        f"policies={policies}",
+        f"rates={rates}",
+        f"cpu_sets={cpu_sets or ['<none>']}",
+        f"base_command={quoted_base}",
+        f"extra_env={args.env or ['<none>']}",
+    )
+
     jobs = build_jobs(
         policies=policies,
         rates=rates,
@@ -302,10 +386,22 @@ async def main_async(args: argparse.Namespace) -> None:
         extra_env=args.env,
     )
 
+    print(f"[dispatch] scheduled {len(jobs)} jobs")
+
     manifest: list[dict] = []
     sem = asyncio.Semaphore(args.max_parallel)
-    tasks = [asyncio.create_task(run_job(job, dry_run=args.dry_run, semaphore=sem)) for job in jobs]
-
+    tasks = [
+        asyncio.create_task(
+            run_job(
+                job,
+                dry_run=args.dry_run,
+                semaphore=sem,
+                cpu_locks=cpu_locks,
+            )
+        )
+        for job in jobs
+    ]
+    dispatch_failed = False
     try:
         for task in asyncio.as_completed(tasks):
             manifest.append(await task)
@@ -313,6 +409,7 @@ async def main_async(args: argparse.Namespace) -> None:
         for t in tasks:
             t.cancel()
         print(f"[dispatch] error: {exc}", file=sys.stderr)
+        dispatch_failed = True
         raise
     finally:
         manifest.sort(key=lambda entry: entry.get("index", 0))
@@ -333,6 +430,43 @@ async def main_async(args: argparse.Namespace) -> None:
         }
         manifest_path.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
         print(f"[dispatch] wrote manifest to {manifest_path}")
+        pointer_path = results_dir / "latest-dispatch-manifest.txt"
+        pointer_path.write_text(str(manifest_path), encoding="utf-8")
+        print(f"[dispatch] updated manifest pointer {pointer_path}")
+
+        if dispatch_failed:
+            print("[dispatch] skipping run_exp.py because one or more jobs failed", file=sys.stderr)
+        elif args.dry_run:
+            print("[dispatch] dry-run requested; skipping run_exp.py")
+        elif args.skip_run_exp:
+            print("[dispatch] run_exp.py invocation disabled via --skip-run-exp")
+        else:
+            run_exp_path = pathlib.Path(args.run_exp_path)
+            if not run_exp_path.is_absolute():
+                run_exp_path = ROOT / run_exp_path
+            run_exp_output_dir = pathlib.Path(args.run_exp_output_dir)
+            run_exp_cmd = [
+                sys.executable or "python3",
+                str(run_exp_path),
+                "--manifest",
+                str(manifest_path),
+                "--runs-root",
+                str(results_dir),
+                "--output-dir",
+                str(run_exp_output_dir),
+            ]
+            if args.run_exp_extra_args:
+                run_exp_cmd += shlex.split(args.run_exp_extra_args)
+
+            print("[dispatch] invoking run_exp.py:", " ".join(shlex.quote(part) for part in run_exp_cmd))
+            try:
+                subprocess.run(run_exp_cmd, check=True)
+            except FileNotFoundError as exc:
+                print(f"[dispatch] run_exp.py not found: {exc}", file=sys.stderr)
+                raise
+            except subprocess.CalledProcessError as exc:
+                print(f"[dispatch] run_exp.py exited with {exc.returncode}", file=sys.stderr)
+                raise
 
 
 def main() -> None:

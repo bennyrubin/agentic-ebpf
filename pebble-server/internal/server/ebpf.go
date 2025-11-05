@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
+	"path/filepath"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -12,12 +14,30 @@ import (
 	"pebbleserver/internal/ebpfutil"
 )
 
-const targetMapPath = "/sys/fs/bpf/pebble_udp_targets"
-
 type ebpfPolicy struct {
 	name    string
 	program *ebpf.Program
 	close   func() error
+}
+
+const defaultPinBase = "/sys/fs/bpf"
+
+func pinDirectory() string {
+	if path := os.Getenv("BPF_PIN_PATH"); path != "" {
+		return path
+	}
+	if base := os.Getenv("BPF_PIN_BASE"); base != "" {
+		return base
+	}
+	return defaultPinBase
+}
+
+func ensurePinDirectory(path string) error {
+	return os.MkdirAll(path, 0o755)
+}
+
+func targetMapPath() string {
+	return filepath.Join(pinDirectory(), "pebble_udp_targets")
 }
 
 func ensureRlimit() error {
@@ -46,9 +66,13 @@ func loadRoundRobin(workers int) (*ebpfPolicy, error) {
 	if err := ensureRlimit(); err != nil {
 		return nil, err
 	}
+	pinDir := pinDirectory()
+	if err := ensurePinDirectory(pinDir); err != nil {
+		return nil, fmt.Errorf("ensure pin directory: %w", err)
+	}
 	var objs ebpfutil.RrSelectorObjects
 	opts := &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: "/sys/fs/bpf"},
+		Maps: ebpf.MapOptions{PinPath: pinDir},
 	}
 	if err := ebpfutil.LoadRrSelectorObjects(&objs, opts); err != nil {
 		return nil, fmt.Errorf("load round robin objects: %w", err)
@@ -78,9 +102,13 @@ func loadAgent(workers int) (*ebpfPolicy, error) {
 	if err := ensureRlimit(); err != nil {
 		return nil, err
 	}
+	pinDir := pinDirectory()
+	if err := ensurePinDirectory(pinDir); err != nil {
+		return nil, fmt.Errorf("ensure pin directory: %w", err)
+	}
 	var objs ebpfutil.AgentSelectorObjects
 	opts := &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: "/sys/fs/bpf"},
+		Maps: ebpf.MapOptions{PinPath: pinDir},
 	}
 	if err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {
 		return nil, fmt.Errorf("load agent objects: %w", err)
@@ -113,9 +141,13 @@ func loadScanSplit(workers int) (*ebpfPolicy, error) {
 	if err := ensureRlimit(); err != nil {
 		return nil, err
 	}
+	pinDir := pinDirectory()
+	if err := ensurePinDirectory(pinDir); err != nil {
+		return nil, fmt.Errorf("ensure pin directory: %w", err)
+	}
 	var objs ebpfutil.ScanSplitSelectorObjects
 	opts := &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: "/sys/fs/bpf"},
+		Maps: ebpf.MapOptions{PinPath: pinDir},
 	}
 	if err := ebpfutil.LoadScanSplitSelectorObjects(&objs, opts); err != nil {
 		return nil, fmt.Errorf("load scan split objects: %w", err)
@@ -162,7 +194,7 @@ func (p *ebpfPolicy) attach(fd int) error {
 }
 
 func updateTargetsMap(slot uint32, fd int) error {
-	m, err := ebpf.LoadPinnedMap(targetMapPath, nil)
+	m, err := ebpf.LoadPinnedMap(targetMapPath(), nil)
 	if err != nil {
 		return fmt.Errorf("load target map: %w", err)
 	}
@@ -176,7 +208,7 @@ func updateTargetsMap(slot uint32, fd int) error {
 }
 
 func clearTargets(numSlots int) error {
-	m, err := ebpf.LoadPinnedMap(targetMapPath, nil)
+	m, err := ebpf.LoadPinnedMap(targetMapPath(), nil)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
