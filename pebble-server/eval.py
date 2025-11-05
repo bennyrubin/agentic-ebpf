@@ -26,6 +26,83 @@ REPO_ROOT = Path(__file__).resolve().parent
 RESULTS_DIR = REPO_ROOT / "results"
 AGENT_SOURCE = REPO_ROOT / "ebpf" / "agent.c"
 RUN_SCRIPT = REPO_ROOT / "run.sh"
+NUMA_NODE0_CPULIST = Path("/sys/devices/system/node/node0/cpulist")
+
+
+def _expand_cpu_spec(spec: str) -> list[int]:
+    cleaned = spec.replace("\n", "").replace("\r", "").strip()
+    if not cleaned:
+        return []
+    cpus: list[int] = []
+    for token in cleaned.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            try:
+                start = int(start_s)
+                end = int(end_s)
+            except ValueError as exc:
+                raise ValueError(f"Invalid CPU range '{token}'") from exc
+            if start > end:
+                raise ValueError(f"Invalid CPU range '{token}' (start > end)")
+            cpus.extend(range(start, end + 1))
+        else:
+            try:
+                cpus.append(int(token))
+            except ValueError as exc:
+                raise ValueError(f"Invalid CPU token '{token}'") from exc
+    return cpus
+
+
+def _resolve_core_counts() -> tuple[int, int]:
+    env_server = os.environ.get("SERVER_CORES") or os.environ.get("EVAL_SERVER_CORES")
+    env_client = os.environ.get("CLIENT_CORES") or os.environ.get("EVAL_CLIENT_CORES")
+
+    if env_server and env_client:
+        try:
+            server = int(env_server)
+            client = int(env_client)
+        except ValueError as exc:
+            raise ValueError(f"Invalid SERVER_CORES/CLIENT_CORES values: {exc}") from exc
+        if server <= 0 or client <= 0:
+            raise ValueError("SERVER_CORES and CLIENT_CORES must be positive integers.")
+        return server, client
+    if env_server or env_client:
+        raise ValueError("Both SERVER_CORES and CLIENT_CORES must be provided together.")
+
+    if not NUMA_NODE0_CPULIST.exists():
+        raise ValueError(
+            f"NUMA node 0 CPU list not found at {NUMA_NODE0_CPULIST}; set SERVER_CORES and CLIENT_CORES explicitly."
+        )
+
+    raw = NUMA_NODE0_CPULIST.read_text(encoding="utf-8").strip()
+    if not raw:
+        raise ValueError(
+            f"NUMA node 0 CPU list at {NUMA_NODE0_CPULIST} is empty; set SERVER_CORES and CLIENT_CORES explicitly."
+        )
+    try:
+        cpus = _expand_cpu_spec(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Failed to parse NUMA node 0 CPU list '{raw}': {exc}. "
+            "Set SERVER_CORES and CLIENT_CORES explicitly."
+        ) from exc
+
+    total = len(cpus)
+    if total < 2:
+        raise ValueError(
+            f"NUMA node 0 only exposes {total} CPU(s); specify SERVER_CORES and CLIENT_CORES explicitly."
+        )
+    server = total // 2
+    client = total - server
+    if server == 0 or client == 0:
+        raise ValueError(
+            f"Unable to derive positive server/client core counts from NUMA node 0 cpu list ({cpus}); "
+            "set SERVER_CORES and CLIENT_CORES explicitly."
+        )
+    return server, client
 
 def evaluate(program_path: str) -> Dict[str, float]:
     """
@@ -67,7 +144,23 @@ def _evaluate(program_path: Path) -> Dict[str, float]:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     pre_existing_runs = {path.name for path in RESULTS_DIR.glob("run-*") if path.is_dir()}
 
-    run_cmd = ["bash", str(RUN_SCRIPT)]
+    try:
+        server_cores, client_cores = _resolve_core_counts()
+    except ValueError as exc:
+        return {
+            "combined_score": float("-inf"),
+            "error": 1.0,
+            "error_message": str(exc),
+        }
+
+    run_cmd = [
+        "bash",
+        str(RUN_SCRIPT),
+        "--server-cores",
+        str(server_cores),
+        "--client-cores",
+        str(client_cores),
+    ]
     completed = subprocess.run(
         run_cmd,
         cwd=str(REPO_ROOT),

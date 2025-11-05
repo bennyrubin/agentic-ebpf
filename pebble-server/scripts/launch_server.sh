@@ -15,6 +15,8 @@ BUILD_SERVER_BIN="${BUILD_SERVER_BIN:-true}"
 SERVER_BIN="${PEBBLE_SERVER_BIN:-$BIN_DIR/pebble_server}"
 GET_DELAY="${GET_DELAY:-}"
 SCAN_DELAY="${SCAN_DELAY:-}"
+SERVER_CPUSET="${SERVER_CPUSET:-}"
+TASKSET_BIN="${TASKSET_BIN:-taskset}"
 
 usage() {
   cat <<USAGE
@@ -77,7 +79,16 @@ if [[ -n "$SCAN_DELAY" ]]; then
   SERVER_CMD+=(-scan-delay "$SCAN_DELAY")
 fi
 
-"${SERVER_CMD[@]}" &
+SERVER_PREFIX=()
+if [[ -n "$SERVER_CPUSET" ]]; then
+  if ! command -v "$TASKSET_BIN" >/dev/null 2>&1; then
+    echo "CPU pinning requested but '$TASKSET_BIN' is not available" >&2
+    exit 1
+  fi
+  SERVER_PREFIX=("$TASKSET_BIN" "-c" "$SERVER_CPUSET")
+fi
+
+"${SERVER_PREFIX[@]}" "${SERVER_CMD[@]}" &
 
 PID=$!
 echo "$PID" > "$PID_FILE"

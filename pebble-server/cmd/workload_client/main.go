@@ -199,8 +199,8 @@ func main() {
 					reqType = "SCAN"
 					isGet = false
 				}
-				sendTime := time.Now()
-				reqID := makeReqID(sendTime.UnixNano(), currSeq, isGet)
+				// Capture timestamp, build payload, and send immediately
+				reqID := makeReqID(time.Now().UnixNano(), currSeq, isGet)
 				payload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, *scanLimit)
 				if _, err := conn.Write(payload); err != nil {
 					logger.Printf("write error (worker=%d): %v", workerID, err)
@@ -221,16 +221,16 @@ func main() {
 		go func(workerID int, conn *net.UDPConn) {
 			defer recvWG.Done()
 			buf := make([]byte, 64*1024)
+			// Set read deadline once to avoid blocking forever
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			for {
-				if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-					if errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
-						return
-					}
-					logger.Printf("set read deadline (worker=%d): %v", workerID, err)
-				}
 				n, err := conn.Read(buf)
+				// Capture receive timestamp immediately
+				recvNano := time.Now().UnixNano()
 				if err != nil {
 					if ne, ok := err.(net.Error); ok && ne.Timeout() {
+						// Reset deadline on timeout
+						conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 						select {
 						case <-quit:
 							return
@@ -253,7 +253,7 @@ func main() {
 				if !ok {
 					continue
 				}
-				latencyMs := float64(time.Now().UnixNano()-sendNano) / 1e6
+				latencyMs := float64(recvNano-sendNano) / 1e6
 				select {
 				case latencyCh <- latencyRecord{latency: latencyMs, isGet: isGet}:
 				case <-quit:

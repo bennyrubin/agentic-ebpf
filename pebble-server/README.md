@@ -111,10 +111,17 @@ Key flags:
 4. Aggregates per-iteration metrics into `workload_summary.json`.
 5. Shuts down the background server and reports where artefacts were stored.
 
-Typical usage:
+CPU pinning is baked into the workflow: the server and client each receive an
+exclusive CPU set carved from NUMA node 0. If you omit `--server-cores` and
+`--client-cores`, `run.sh` defaults to the worker counts (`--threads` for the
+server, `--send-workers` for the client); provide explicit values when you need a
+different allocation. The script still refuses to start if the request cannot be
+satisfied.
 
 ```bash
 ./run.sh \
+  --server-cores 8 \
+  --client-cores 8 \
   --threads 4 \
   --policy round_robin \
   --rate 500 \
@@ -123,7 +130,8 @@ Typical usage:
 
 Every invocation creates a fresh `results/run-<timestamp>/` directory containing:
 
-- `experiment.json` – the parameters used for the run.
+- `experiment.json` – the parameters used for the run, including
+  `server_cores`, `client_cores`, and the resolved cpusets.
 - `logs/` – the server log for that execution.
 - `workload_summary.txt` – human-readable latency/throughput snapshot.
 - `workload_summary.json` – machine-readable summary.
@@ -175,17 +183,20 @@ logs/results under `/results`, while sharing the same eBPF build cache.
 
    ```bash
    make docker-dispatch IMAGE_NAME=pebble-server:latest \
-     RUN_SCRIPT_ARGS="--threads 4 --rate 60000"
+     RUN_SCRIPT_ARGS="--server-cores 8 --client-cores 8 --threads 4 --rate 60000"
    ```
 
    The helper script spins up multiple containers, each invoking `run.sh` with
-   its own output directory.
+   its own output directory. It validates the requested core counts against
+   NUMA node 0 and refuses to start if `--max-parallel` would overcommit the
+   available CPUs. To adjust synthetic latencies, add flags such as
+   `--get-delay 15us --scan-delay 2ms` inside `ARGS="..."`.
 
 3. **Inspect results**
 
    ```bash
    make docker-run IMAGE_NAME=pebble-server:latest \
-     RUN_SCRIPT_ARGS="--threads 2 --duration 20"
+     RUN_SCRIPT_ARGS="--server-cores 8 --client-cores 8 --threads 2 --duration 20"
    ```
 
    The container prints the location of the aggregated logs before exiting.

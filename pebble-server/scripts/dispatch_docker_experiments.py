@@ -76,6 +76,51 @@ def now_ts() -> str:
     return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def expand_cpu_spec(spec: str) -> list[int]:
+    result: list[int] = []
+    cleaned = spec.replace("\n", "").replace("\r", "").strip()
+    if not cleaned:
+        return result
+    for token in cleaned.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_s, end_s = token.split("-", 1)
+            try:
+                start = int(start_s)
+                end = int(end_s)
+            except ValueError as exc:
+                raise ValueError(f"Invalid CPU range '{token}'") from exc
+            if start > end:
+                raise ValueError(f"Invalid CPU range '{token}' (start > end)")
+            result.extend(range(start, end + 1))
+        else:
+            try:
+                result.append(int(token))
+            except ValueError as exc:
+                raise ValueError(f"Invalid CPU token '{token}'") from exc
+    return result
+
+
+def read_node0_cpu_list() -> list[int]:
+    path = pathlib.Path("/sys/devices/system/node/node0/cpulist")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise SystemExit(f"NUMA node 0 CPU list not found at {path}") from exc
+    cleaned = raw.strip()
+    if not cleaned:
+        raise SystemExit(f"NUMA node 0 CPU list at {path} is empty.")
+    try:
+        cpus = expand_cpu_spec(cleaned)
+    except ValueError as exc:
+        raise SystemExit(f"Failed to parse NUMA node 0 CPU list '{cleaned}': {exc}") from exc
+    if not cpus:
+        raise SystemExit(f"NUMA node 0 CPU list at {path} resolved to no CPUs.")
+    return cpus
+
+
 @dataclass
 class Job:
     index: int
@@ -126,7 +171,7 @@ def build_jobs(
             f"{results_dir}/work:/opt/work",
         ]
         if cpuset:
-            cmd += ["--cpuset-cpus", cpuset]
+            cmd += ["--cpuset-cpus", cpuset, "-e", f"CPUSET_POOL={cpuset}"]
         for env_kv in extra_env:
             cmd += ["-e", env_kv]
 
@@ -244,6 +289,18 @@ def parse_args() -> argparse.Namespace:
         help="Maximum concurrent containers (default: %(default)s)",
     )
     parser.add_argument(
+        "--server-cores",
+        type=int,
+        required=True,
+        help="Dedicated NUMA node 0 cores per container for the server.",
+    )
+    parser.add_argument(
+        "--client-cores",
+        type=int,
+        required=True,
+        help="Dedicated NUMA node 0 cores per container for the client.",
+    )
+    parser.add_argument(
         "--cpu-sets",
         default="",
         help=(
@@ -281,13 +338,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--duration",
         type=int,
-        default=15,
+        default=10,
         help="Workload duration seconds (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--get-delay",
+        default="",
+        help="Synthetic GET delay passed to run.sh (--get-delay).",
+    )
+    parser.add_argument(
+        "--scan-delay",
+        default="",
+        help="Synthetic SCAN delay passed to run.sh (--scan-delay).",
     )
     parser.add_argument(
         "--iterations",
         type=int,
-        default=4,
+        default=3,
         help="Iterations per run (default: %(default)s)",
     )
     parser.add_argument(
@@ -341,8 +408,7 @@ async def main_async(args: argparse.Namespace) -> None:
 
     policies = parse_policies(args.policies)
     rates = parse_rates(args.rates)
-    cpu_sets = parse_cpu_sets(args.cpu_sets, args.cpu_set)
-    cpu_locks = {cpuset: asyncio.Lock() for cpuset in {c for c in cpu_sets if c}}
+    manual_cpu_sets = parse_cpu_sets(args.cpu_sets, args.cpu_set)
 
     if not policies:
         raise SystemExit("No policies specified.")
@@ -351,7 +417,73 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.max_parallel <= 0:
         raise SystemExit("--max-parallel must be positive.")
 
+    if args.server_cores <= 0 or args.client_cores <= 0:
+        raise SystemExit("--server-cores and --client-cores must be positive integers.")
+
+    node0_cpus = read_node0_cpu_list()
+    total_node0 = len(node0_cpus)
+    per_container_total = args.server_cores + args.client_cores
+    if per_container_total > total_node0:
+        raise SystemExit(
+            f"Requested {per_container_total} total cores per container "
+            f"(server={args.server_cores}, client={args.client_cores}) "
+            f"but NUMA node 0 only has {total_node0} cores."
+        )
+
+    max_parallel_capacity = total_node0 // per_container_total
+    if max_parallel_capacity == 0:
+        raise SystemExit(
+            f"NUMA node 0 ({total_node0} cores) cannot satisfy even a single container "
+            f"with {per_container_total} total requested cores."
+        )
+    if args.max_parallel > max_parallel_capacity:
+        raise SystemExit(
+            f"--max-parallel={args.max_parallel} exceeds NUMA node 0 capacity of "
+            f"{max_parallel_capacity} containers ({total_node0} cores available, "
+            f"{per_container_total} required per container)."
+        )
+
+    if manual_cpu_sets:
+        node0_set = set(node0_cpus)
+        validated_sets: list[str] = []
+        for cpuset in manual_cpu_sets:
+            try:
+                cpus = expand_cpu_spec(cpuset)
+            except ValueError as exc:
+                raise SystemExit(f"Invalid --cpu-set '{cpuset}': {exc}") from exc
+            if len(cpus) < per_container_total:
+                raise SystemExit(
+                    f"cpuset '{cpuset}' contains {len(cpus)} CPUs but "
+                    f"{per_container_total} are required (server={args.server_cores}, client={args.client_cores})."
+                )
+            missing = [cpu for cpu in cpus if cpu not in node0_set]
+            if missing:
+                raise SystemExit(
+                    f"cpuset '{cpuset}' includes CPUs outside NUMA node 0: {missing} "
+                    f"(available node 0 cores: {node0_cpus})."
+                )
+            validated_sets.append(cpuset)
+        cpu_sets = validated_sets
+    else:
+        cpu_sets = []
+        for slot in range(args.max_parallel):
+            start = slot * per_container_total
+            end = start + per_container_total
+            slice_cpus = node0_cpus[start:end]
+            if len(slice_cpus) != per_container_total:
+                raise SystemExit(
+                    f"Internal error computing cpuset slice for slot {slot}: "
+                    f"expected {per_container_total} CPUs, got {slice_cpus}."
+                )
+            cpu_sets.append(",".join(str(cpu) for cpu in slice_cpus))
+
+    cpu_locks = {cpuset: asyncio.Lock() for cpuset in {c for c in cpu_sets if c}}
+
     base_command = [
+        "--server-cores",
+        str(args.server_cores),
+        "--client-cores",
+        str(args.client_cores),
         "--threads",
         str(args.threads),
         "--duration",
@@ -359,6 +491,10 @@ async def main_async(args: argparse.Namespace) -> None:
         "--iterations",
         str(args.iterations),
     ]
+    if args.get_delay:
+        base_command += ["--get-delay", args.get_delay]
+    if args.scan_delay:
+        base_command += ["--scan-delay", args.scan_delay]
 
     if args.extra_run_args:
         base_command += shlex.split(args.extra_run_args)
@@ -367,9 +503,14 @@ async def main_async(args: argparse.Namespace) -> None:
     print(
         "[dispatch] configuration:",
         f"max_parallel={args.max_parallel}",
+        f"server_cores={args.server_cores}",
+        f"client_cores={args.client_cores}",
+        f"get_delay={args.get_delay or '<default>'}",
+        f"scan_delay={args.scan_delay or '<default>'}",
         f"policies={policies}",
         f"rates={rates}",
         f"cpu_sets={cpu_sets or ['<none>']}",
+        f"node0_cores={node0_cpus}",
         f"base_command={quoted_base}",
         f"extra_env={args.env or ['<none>']}",
     )
@@ -423,6 +564,12 @@ async def main_async(args: argparse.Namespace) -> None:
             "threads": args.threads,
             "duration": args.duration,
             "iterations": args.iterations,
+            "server_cores": args.server_cores,
+            "client_cores": args.client_cores,
+            "per_container_total_cores": per_container_total,
+            "numa_node0_cores": node0_cpus,
+            "get_delay": args.get_delay,
+            "scan_delay": args.scan_delay,
             "cpu_sets": cpu_sets,
             "env": args.env,
             "dry_run": args.dry_run,

@@ -278,20 +278,23 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 
 	switch cmd {
 	case "GET":
-		start := time.Now()
 		var reqID string
 		if len(args) == 2 {
 			reqID = args[1]
 			args = args[:1]
 		}
-		time.Sleep(s.cfg.GetDelay)
+		// Busy wait for accurate timing
+		start := time.Now()
+		deadline := start.Add(s.cfg.GetDelay)
+		for time.Now().Before(deadline) {
+		}
+		elapsed := time.Since(start)
 		if stats != nil {
-			stats.recordGet(time.Since(start), false)
+			stats.recordGet(elapsed, false)
 		}
 		return formatResponse("VALUE", reqID, []byte(args[0]))
 
 	case "SCAN":
-		start := time.Now()
 		var reqID string
 		if len(args) == 3 {
 			reqID = args[2]
@@ -300,16 +303,21 @@ func (s *Server) handleRequest(idx int, payload []byte) []byte {
 		limit, err := strconv.Atoi(args[1])
 		if err != nil || limit <= 0 {
 			if stats != nil {
-				stats.recordScan(time.Since(start), true)
+				stats.recordScan(0, true)
 			}
 			return formatResponse("ERR", reqID, []byte("invalid scan limit"))
 		}
 		if limit > s.cfg.MaxScanKeys {
 			limit = s.cfg.MaxScanKeys
 		}
-		time.Sleep(s.cfg.ScanDelay)
+		// Busy wait for accurate timing
+		start := time.Now()
+		deadline := start.Add(s.cfg.ScanDelay)
+		for time.Now().Before(deadline) {
+		}
+		elapsed := time.Since(start)
 		if stats != nil {
-			stats.recordScan(time.Since(start), false)
+			stats.recordScan(elapsed, false)
 		}
 		return formatResponse("SCAN", reqID, []byte("EMPTY"))
 	default:

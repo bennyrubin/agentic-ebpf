@@ -8,13 +8,14 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from typing import Optional
 
 ROOT = pathlib.Path(__file__).resolve().parent
 RUN_SH = ROOT / "run.sh"
 #DEFAULT_POLICIES = ["default", "round_robin", "agent", "scan_split"]
 DEFAULT_POLICIES = ["round_robin", "scan_split"]
 #RATE_VALUES = [30000, 40000, 50000, 60000]
-RATE_VALUES = [90000,100000,110000]
+RATE_VALUES = [110000,120000,130000,140000]
 RUN_DIR_RE = re.compile(r"Logs and results stored in (.+)")
 
 
@@ -32,6 +33,32 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Number of worker threads to pass to run.sh (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--send-workers",
+        type=int,
+        default=7,
+        help="Client send workers passed to run.sh (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--get-delay",
+        default=None,
+        help="Synthetic GET delay passed to run.sh (e.g. 10us).",
+    )
+    parser.add_argument(
+        "--scan-delay",
+        default=None,
+        help="Synthetic SCAN delay passed to run.sh (e.g. 2ms).",
+    )
+    parser.add_argument(
+        "--server-cores",
+        type=int,
+        help="Dedicated NUMA node 0 cores for the server (falls back to run.sh default when omitted).",
+    )
+    parser.add_argument(
+        "--client-cores",
+        type=int,
+        help="Dedicated NUMA node 0 cores for the client (falls back to run.sh default when omitted).",
     )
     parser.add_argument(
         "--iterations",
@@ -79,11 +106,24 @@ def ensure_run_sh() -> None:
         sys.exit(f"run.sh is not executable: {RUN_SH}")
 
 
-def invoke_run_sh(policy: str, rate: int, threads: int, iterations: int, duration: int) -> pathlib.Path:
+def invoke_run_sh(
+    policy: str,
+    rate: int,
+    threads: int,
+    iterations: int,
+    duration: int,
+    send_workers: int,
+    server_cores: int,
+    client_cores: int,
+    get_delay: Optional[str],
+    scan_delay: Optional[str],
+) -> pathlib.Path:
     cmd = [
         str(RUN_SH),
         "--threads",
         str(threads),
+        "--send-workers",
+        str(send_workers),
         "--policy",
         policy,
         "--rate",
@@ -93,6 +133,15 @@ def invoke_run_sh(policy: str, rate: int, threads: int, iterations: int, duratio
         "--duration",
         str(duration),
     ]
+    if server_cores <= 0:
+        raise ValueError("server_cores must be a positive integer.")
+    if client_cores <= 0:
+        raise ValueError("client_cores must be a positive integer.")
+    cmd += ["--server-cores", str(server_cores), "--client-cores", str(client_cores)]
+    if get_delay is not None:
+        cmd += ["--get-delay", get_delay]
+    if scan_delay is not None:
+        cmd += ["--scan-delay", scan_delay]
     print(f"\n=== Running experiment policy={policy} rate={rate} iterations={iterations} ===")
     process = subprocess.Popen(
         cmd,
@@ -355,6 +404,11 @@ def main() -> None:
             "threads": manifest_meta.get("threads"),
             "iterations_per_run": manifest_meta.get("iterations"),
             "duration": manifest_meta.get("duration"),
+            "server_cores": manifest_meta.get("server_cores"),
+            "client_cores": manifest_meta.get("client_cores"),
+            "send_workers": manifest_meta.get("send_workers"),
+            "get_delay": manifest_meta.get("get_delay"),
+            "scan_delay": manifest_meta.get("scan_delay"),
         }
     else:
         ensure_run_sh()
@@ -374,9 +428,32 @@ def main() -> None:
         if not rates:
             sys.exit("No rates specified.")
 
+        if args.threads <= 0:
+            sys.exit("--threads must be a positive integer.")
+        if args.send_workers <= 0:
+            sys.exit("--send-workers must be a positive integer.")
+        if args.server_cores is not None and args.server_cores <= 0:
+            sys.exit("--server-cores must be a positive integer.")
+        if args.client_cores is not None and args.client_cores <= 0:
+            sys.exit("--client-cores must be a positive integer.")
+
+        resolved_server_cores = args.server_cores if args.server_cores is not None else args.threads
+        resolved_client_cores = args.client_cores if args.client_cores is not None else args.send_workers
+
         for policy in policies:
             for rate in rates:
-                run_dir = invoke_run_sh(policy, rate, args.threads, args.iterations, args.duration)
+                run_dir = invoke_run_sh(
+                    policy,
+                    rate,
+                    args.threads,
+                    args.iterations,
+                    args.duration,
+                    args.send_workers,
+                    resolved_server_cores,
+                    resolved_client_cores,
+                    args.get_delay,
+                    args.scan_delay,
+                )
                 try:
                     summary = load_summary(run_dir)
                     overall_avg, overall_stddev, overall_iterations = extract_metric(summary, "overall_latency_p99")
@@ -413,6 +490,11 @@ def main() -> None:
             "rates": rates,
             "duration": args.duration,
             "created_at": dt.datetime.now().isoformat(),
+            "send_workers": args.send_workers,
+            "server_cores": resolved_server_cores,
+            "client_cores": resolved_client_cores,
+            "get_delay": args.get_delay,
+            "scan_delay": args.scan_delay,
         }
 
     write_experiment_summary(experiment_dir, metadata, records)
