@@ -2,279 +2,460 @@
 """
 OpenEvolve evaluation entry point for the Pebble server playground.
 
-The evaluator receives the path to a candidate eBPF program, swaps it into
-``ebpf/agent.c``, runs ``run.sh`` to build and benchmark the system, and
-aggregates latency metrics from the freshest ``results/run-*`` directory.
-
-The returned metrics dictionary must include ``combined_score``; OpenEvolve
-maximises that value, so we expose the negated overall p99 latency (milliseconds)
-as ``combined_score`` and report the raw latency under
-``overall_latency_p99``. Higher combined scores therefore mean lower latency.
+This evaluator compiles the project eBPF assets, runs a full experiment sweep
+via run_exp.py for the agent policy across a set of request rates, and reports
+latency metrics together with a negative area-under-the-curve score suitable for
+OpenEvolve's maximisation objective.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-RESULTS_DIR = REPO_ROOT / "results"
-AGENT_SOURCE = REPO_ROOT / "ebpf" / "agent.c"
-RUN_SCRIPT = REPO_ROOT / "run.sh"
-NUMA_NODE0_CPULIST = Path("/sys/devices/system/node/node0/cpulist")
+OPENEVOLVE_ROOT = (REPO_ROOT.parent.parent / "openevolve").resolve()
+if str(OPENEVOLVE_ROOT) not in sys.path:
+    sys.path.insert(0, str(OPENEVOLVE_ROOT))
+
+from openevolve.evaluation_result import EvaluationResult
+
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+BUILD_SCRIPT = SCRIPTS_DIR / "build_ebpf.sh"
+RUN_EXP_SCRIPT = REPO_ROOT / "run_exp.py"
+DISPATCH_SCRIPT = SCRIPTS_DIR / "dispatch_docker_experiments.py"
+SERVER_LOG_RELATIVE = Path("logs") / "server" / "server.log"
+
+SUMMARY_PATTERN = re.compile(r"Wrote experiment summary:\s*(.+)")
+
+DEFAULT_POLICY = "agent"
+DEFAULT_RATES: Tuple[int, ...] = (40000, 50000, 60000, 70000, 80000)
+DEFAULT_THREADS = 6
+DEFAULT_SEND_WORKERS = 7
+DEFAULT_ITERATIONS = 2
+DEFAULT_DURATION = 7
+
+# Flip this flag to run experiments via the Docker dispatcher instead of python run_exp.py.
+RUN_EXPERIMENT_VIA_DISPATCH = False
+DISPATCH_IMAGE = "pebble-server:latest"
+DISPATCH_RESULTS_DIR = REPO_ROOT / "results"
+DISPATCH_MAX_PARALLEL = 2
+
+PERSIST_FAILURE_RESULTS = True
+FAILURE_RESULTS_DIR = REPO_ROOT / "results" / "eval-failures"
+
+FAIL_SCORE = float("-inf")
 
 
-def _expand_cpu_spec(spec: str) -> list[int]:
-    cleaned = spec.replace("\n", "").replace("\r", "").strip()
-    if not cleaned:
-        return []
-    cpus: list[int] = []
-    for token in cleaned.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        if "-" in token:
-            start_s, end_s = token.split("-", 1)
-            try:
-                start = int(start_s)
-                end = int(end_s)
-            except ValueError as exc:
-                raise ValueError(f"Invalid CPU range '{token}'") from exc
-            if start > end:
-                raise ValueError(f"Invalid CPU range '{token}' (start > end)")
-            cpus.extend(range(start, end + 1))
-        else:
-            try:
-                cpus.append(int(token))
-            except ValueError as exc:
-                raise ValueError(f"Invalid CPU token '{token}'") from exc
-    return cpus
+def _run_build() -> tuple[bool, str]:
+    """Invoke the eBPF build script and capture its output."""
+    env = os.environ.copy()
+    env.pop("SKIP_EBPF_BUILD", None)
+    completed = subprocess.run(
+        ("sudo", "-E", str(BUILD_SCRIPT)),
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    output = (completed.stdout or "") + (completed.stderr or "")
+    return completed.returncode == 0, output.strip()
 
 
-def _resolve_core_counts() -> tuple[int, int]:
-    env_server = os.environ.get("SERVER_CORES") or os.environ.get("EVAL_SERVER_CORES")
-    env_client = os.environ.get("CLIENT_CORES") or os.environ.get("EVAL_CLIENT_CORES")
+def _persist_failure_result(result: EvaluationResult, candidate_source: Optional[str]) -> None:
+    """Persist failed evaluation output for later inspection."""
+    if not PERSIST_FAILURE_RESULTS:
+        return
 
-    if env_server and env_client:
-        try:
-            server = int(env_server)
-            client = int(env_client)
-        except ValueError as exc:
-            raise ValueError(f"Invalid SERVER_CORES/CLIENT_CORES values: {exc}") from exc
-        if server <= 0 or client <= 0:
-            raise ValueError("SERVER_CORES and CLIENT_CORES must be positive integers.")
-        return server, client
-    if env_server or env_client:
-        raise ValueError("Both SERVER_CORES and CLIENT_CORES must be provided together.")
-
-    if not NUMA_NODE0_CPULIST.exists():
-        raise ValueError(
-            f"NUMA node 0 CPU list not found at {NUMA_NODE0_CPULIST}; set SERVER_CORES and CLIENT_CORES explicitly."
-        )
-
-    raw = NUMA_NODE0_CPULIST.read_text(encoding="utf-8").strip()
-    if not raw:
-        raise ValueError(
-            f"NUMA node 0 CPU list at {NUMA_NODE0_CPULIST} is empty; set SERVER_CORES and CLIENT_CORES explicitly."
-        )
+    timestamp = dt.datetime.now().strftime("failure-%Y%m%d-%H%M%S")
     try:
-        cpus = _expand_cpu_spec(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"Failed to parse NUMA node 0 CPU list '{raw}': {exc}. "
-            "Set SERVER_CORES and CLIENT_CORES explicitly."
-        ) from exc
+        FAILURE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        target_dir = FAILURE_RESULTS_DIR / timestamp
+        suffix = 1
+        while target_dir.exists():
+            suffix += 1
+            target_dir = FAILURE_RESULTS_DIR / f"{timestamp}-{suffix:02d}"
+        target_dir.mkdir()
 
-    total = len(cpus)
-    if total < 2:
-        raise ValueError(
-            f"NUMA node 0 only exposes {total} CPU(s); specify SERVER_CORES and CLIENT_CORES explicitly."
+        payload = {
+            "metrics": result.metrics,
+            "artifacts": result.artifacts,
+        }
+        (target_dir / "evaluation_result.json").write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
         )
-    server = total // 2
-    client = total - server
-    if server == 0 or client == 0:
-        raise ValueError(
-            f"Unable to derive positive server/client core counts from NUMA node 0 cpu list ({cpus}); "
-            "set SERVER_CORES and CLIENT_CORES explicitly."
-        )
-    return server, client
 
-def evaluate(program_path: str) -> Dict[str, float]:
+        program_text: Optional[str] = candidate_source
+        if program_text is None:
+            try:
+                program_text = (REPO_ROOT / "ebpf" / "agent.c").read_text(encoding="utf-8")
+            except OSError:
+                program_text = None
+        if program_text is not None:
+            (target_dir / "agent.c").write_text(program_text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _run_experiment(rates: Sequence[int]) -> tuple[subprocess.CompletedProcess[str], Optional[Path], str]:
+    """Invoke run_exp.py for the agent policy and capture its outputs."""
+    env = os.environ.copy()
+    env["SKIP_EBPF_BUILD"] = "true"
+
+    rate_arg = ",".join(str(rate) for rate in rates)
+    if RUN_EXPERIMENT_VIA_DISPATCH:
+        python_bin = sys.executable or "python3"
+        cmd = [
+            "sudo",
+            "-E",
+            python_bin,
+            str(DISPATCH_SCRIPT),
+            "--results-dir",
+            str(DISPATCH_RESULTS_DIR),
+            "--max-parallel",
+            str(DISPATCH_MAX_PARALLEL),
+            "--server-cores",
+            str(DEFAULT_THREADS),
+            "--client-cores",
+            str(DEFAULT_SEND_WORKERS),
+            "--policies",
+            DEFAULT_POLICY,
+            "--rates",
+            rate_arg,
+            "--threads",
+            str(DEFAULT_THREADS),
+            "--iterations",
+            str(DEFAULT_ITERATIONS),
+            "--duration",
+            str(DEFAULT_DURATION),
+            "--extra-run-args",
+            f"--send-workers {DEFAULT_SEND_WORKERS}",
+        ]
+    else:
+        cmd = [
+            "sudo",
+            "-E",
+            "python3",
+            str(RUN_EXP_SCRIPT),
+            "--policies",
+            DEFAULT_POLICY,
+            "--rates",
+            rate_arg,
+            "--threads",
+            str(DEFAULT_THREADS),
+            "--iterations",
+            str(DEFAULT_ITERATIONS),
+            "--duration",
+            str(DEFAULT_DURATION),
+            "--send-workers",
+            str(DEFAULT_SEND_WORKERS),
+        ]
+
+    completed = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    combined_output = "\n".join(
+        part for part in (completed.stdout or "", completed.stderr or "") if part
+    )
+    summary_path: Optional[Path] = None
+    matches = SUMMARY_PATTERN.findall(combined_output)
+    if matches:
+        raw_path = matches[-1].strip()
+        candidate = Path(raw_path)
+        if not candidate.is_absolute():
+            candidate = (REPO_ROOT / candidate).resolve()
+        summary_path = candidate
+
+    return completed, summary_path, combined_output.strip()
+
+
+def _safe_read_text(path: Path) -> Optional[str]:
+    """Best-effort file reader that tolerates missing files."""
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        return f"Failed to read {path}: {exc}"
+
+
+def _check_load_success(run_dir: Path) -> bool:
+    """Inspect the server log for a successful agent policy start."""
+    log_path = run_dir / SERVER_LOG_RELATIVE
+    if not log_path.exists():
+        return False
+
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+    started = False
+    for line in content.splitlines():
+        if "server starting" in line and f"policy={DEFAULT_POLICY}" in line:
+            started = True
+        if "initialise server" in line.lower() or "load agent objects" in line.lower():
+            return False
+    return started
+
+
+RATE_SCALE = 10000.0
+
+
+def _compute_negative_auc(points: Sequence[Tuple[float, float]]) -> float:
+    """Compute the (negative) area under the latency curve."""
+    if not points:
+        return FAIL_SCORE
+
+    ordered = sorted(points, key=lambda item: item[0])
+    if len(ordered) == 1:
+        x, y = ordered[0]
+        return -((x / RATE_SCALE) * y)
+
+    area = 0.0
+    for (x0, y0), (x1, y1) in zip(ordered, ordered[1:]):
+        width = (x1 - x0) / RATE_SCALE
+        height = (y0 + y1) / 2.0
+        area += width * height
+    return -area
+
+
+def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     """
-    Evaluate the given program file and return latency metrics.
+    Execute the evaluation workflow and return metrics for OpenEvolve.
 
     Args:
-        program_path: Path to the candidate eBPF source file.
-
-    Returns:
-        Dictionary of metric name to floating-point score.
+        _ (Optional[str]): Present for backwards compatibility; ignored.
     """
 
-    return _evaluate(Path(program_path))
+    metrics: Dict[str, float] = {
+        "policy": DEFAULT_POLICY,
+        "rates": [],
+        "load_p99_curve": [],
+        "load_p99_stddev_curve": [],
+        "compile": 0.0,
+        "load": 0.0,
+        "combined_score": FAIL_SCORE,
+        "run_success": 0.0,
+    }
+    artifacts: Dict[str, str] = {}
 
+    candidate_source: Optional[str] = None
+    if program_path:
+        try:
+            candidate_source = Path(program_path).read_text(encoding="utf-8")
+            target_path = REPO_ROOT / "ebpf" / "agent.c"
+            target_path.write_text(candidate_source, encoding="utf-8")
+        except OSError as exc:
+            metrics["error"] = f"Failed to prepare candidate program: {exc}"
+            result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+            _persist_failure_result(result, candidate_source)
+            return result
 
-def _evaluate(program_path: Path) -> Dict[str, float]:
-    """
-    Perform the evaluation while holding the global lock.
-    """
+    rates = list(DEFAULT_RATES)
+    metrics["rates"] = rates
 
-    try:
-        candidate_source = program_path.read_text()
-    except Exception as exc:
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": f"failed to read candidate program: {exc}",
-        }
+    build_ok, build_output = _run_build()
+    if not build_ok:
+        metrics["error"] = "eBPF compilation failed."
+        if build_output:
+            artifacts["build_output"] = build_output
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
 
-    try:
-        AGENT_SOURCE.write_text(candidate_source)
-    except Exception as exc:
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": f"failed to write agent.c: {exc}",
-        }
+    metrics["compile"] = 1.0
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    pre_existing_runs = {path.name for path in RESULTS_DIR.glob("run-*") if path.is_dir()}
-
-    try:
-        server_cores, client_cores = _resolve_core_counts()
-    except ValueError as exc:
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": str(exc),
-        }
-
-    run_cmd = [
-        "bash",
-        str(RUN_SCRIPT),
-        "--server-cores",
-        str(server_cores),
-        "--client-cores",
-        str(client_cores),
-    ]
-    completed = subprocess.run(
-        run_cmd,
-        cwd=str(REPO_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    completed, summary_path, run_exp_output = _run_experiment(rates)
+    run_exp_stdout = (completed.stdout or "").strip()
+    run_exp_stderr = (completed.stderr or "").strip()
 
     if completed.returncode != 0:
-        # Bubble up the failure with a large (bad) combined score.
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": "run.sh failed",
-            "stderr_message": completed.stderr.strip(),
-        }
+        metrics["error"] = "run_exp.py failed."
+        if run_exp_stdout:
+            artifacts["run_exp_stdout"] = run_exp_stdout
+        if run_exp_stderr:
+            artifacts["run_exp_stderr"] = run_exp_stderr
+        elif run_exp_output:
+            artifacts["run_exp_output"] = run_exp_output
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
 
-    run_dir = _locate_new_run(pre_existing_runs)
-    if run_dir is None:
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": "could not locate new results directory",
-        }
-
-    metrics = _extract_metrics(run_dir)
-    metrics.setdefault("run_timestamp", run_dir.stat().st_mtime)
-    metrics.setdefault("combined_score", float("-inf"))
-
-    return metrics
-
-
-def _locate_new_run(previous: set[str]) -> Optional[Path]:
-    """
-    Identify the newest run-* directory created by run.sh.
-    """
-
-    candidates = [path for path in RESULTS_DIR.glob("run-*") if path.is_dir()]
-    if not candidates:
-        return None
-
-    new_dirs = [path for path in candidates if path.name not in previous]
-    search_space = new_dirs if new_dirs else candidates
-    return max(search_space, key=lambda path: path.stat().st_mtime)
-
-
-def _extract_metrics(run_dir: Path) -> Dict[str, float]:
-    """
-    Parse workload_summary.json and convert relevant numbers to metrics.
-    """
-
-    summary_path = run_dir / "workload_summary.json"
-    if not summary_path.exists():
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": f"missing workload_summary.json in {run_dir}",
-        }
+    if summary_path is None or not summary_path.exists():
+        metrics["error"] = "Experiment summary not found."
+        if run_exp_output:
+            artifacts["run_exp_output"] = run_exp_output
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
 
     try:
-        payload = json.loads(summary_path.read_text())
+        subprocess.run(
+            (
+                "sudo",
+                "-E",
+                "chown",
+                "-R",
+                f"{os.getuid()}:{os.getgid()}",
+                str(summary_path.parent),
+            ),
+            check=False,
+            cwd=str(REPO_ROOT),
+        )
+    except Exception:
+        pass
+
+    summary_raw = _safe_read_text(summary_path)
+    if summary_raw is None:
+        metrics["error"] = "Failed to read experiment summary."
+        if run_exp_output:
+            artifacts["run_exp_output"] = run_exp_output
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
+
+    try:
+        summary_payload = json.loads(summary_raw)
     except json.JSONDecodeError as exc:
-        return {
-            "combined_score": float("-inf"),
-            "error": 1.0,
-            "error_message": f"invalid JSON in workload_summary.json: {exc}",
-        }
+        metrics["error"] = f"Invalid JSON in experiment summary: {exc}"
+        artifacts["experiment_summary"] = summary_raw
+        if run_exp_output:
+            artifacts.setdefault("run_exp_output", run_exp_output)
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
 
-    summary = payload.get("summary", {})
-    metrics: Dict[str, float] = {}
+    records = summary_payload.get("records", [])
+    agent_records = [record for record in records if record.get("policy") == DEFAULT_POLICY]
+    if not agent_records:
+        metrics["error"] = "Experiment summary missing agent policy records."
+        artifacts["experiment_summary"] = summary_raw
+        if run_exp_output:
+            artifacts.setdefault("run_exp_output", run_exp_output)
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
 
-    overall_p99 = _pull_metric(summary, "overall_latency_p99")
-    if overall_p99 is not None:
-        metrics["overall_latency_p99"] = overall_p99
-        metrics["combined_score"] = -overall_p99
+    curve: List[Tuple[float, float]] = []
+    std_curve: List[Tuple[float, float]] = []
+    load_ok = True
+    error_reason: Optional[str] = None
 
-    # Add a few extra helpful metrics when present.
-    for key in (
-        "overall_latency_p90",
-        "overall_latency_p50",
-        "overall_latency_avg",
-        "get_latency_p99",
-        "scan_latency_p99",
-        "throughput",
-    ):
-        value = _pull_metric(summary, key)
-        if value is not None:
-            metrics[key] = value
+    for record in agent_records:
+        rate = record.get("rate")
+        p99 = record.get("overall_latency_p99_avg_ms")
+        p99_stddev = record.get("overall_latency_p99_stddev_ms")
+        run_dir_raw = record.get("run_dir")
 
-    return metrics
+        run_dir_path: Optional[Path] = None
+        if run_dir_raw:
+            run_dir_path = Path(run_dir_raw)
+            if not run_dir_path.is_absolute():
+                run_dir_path = (summary_path.parent / run_dir_path).resolve()
+
+        if (
+            rate is None
+            or p99 is None
+            or p99_stddev is None
+            or run_dir_path is None
+            or not run_dir_path.exists()
+        ):
+            load_ok = False
+            error_reason = f"Incomplete record data for rate {rate}."
+            break
+
+        if not _check_load_success(run_dir_path):
+            load_ok = False
+            error_reason = f"Agent policy failed to load at rate {rate}."
+            log_path = run_dir_path / SERVER_LOG_RELATIVE
+            log_text = _safe_read_text(log_path)
+            if log_text:
+                artifacts[f"server_log_rate_{rate}"] = log_text
+            break
+
+        curve.append((float(rate), float(p99)))
+        std_curve.append((float(rate), float(p99_stddev)))
+
+    metrics["load_p99_curve"] = sorted(curve, key=lambda item: item[0])
+    metrics["load_p99_stddev_curve"] = sorted(std_curve, key=lambda item: item[0])
+
+    if not metrics["load_p99_curve"] or not load_ok:
+        metrics["load"] = 0.0
+        metrics["combined_score"] = FAIL_SCORE
+        if not error_reason and not metrics["load_p99_curve"]:
+            error_reason = "No latency data collected."
+        if error_reason:
+            metrics["error"] = error_reason
+        artifacts["experiment_summary"] = summary_raw
+        if run_exp_stdout:
+            artifacts.setdefault("run_exp_stdout", run_exp_stdout)
+        if run_exp_stderr:
+            artifacts.setdefault("run_exp_stderr", run_exp_stderr)
+        elif run_exp_output:
+            artifacts.setdefault("run_exp_output", run_exp_output)
+        result = EvaluationResult(metrics=metrics, artifacts=artifacts)
+        _persist_failure_result(result, candidate_source)
+        return result
+
+    metrics["load"] = 1.0
+    metrics["run_success"] = 1.0
+    metrics["combined_score"] = _compute_negative_auc(metrics["load_p99_curve"])
+    result = EvaluationResult(metrics=metrics, artifacts=artifacts)
 
 
-def _pull_metric(summary: Dict[str, Any], key: str) -> Optional[float]:
-    """
-    Extract the average value for ``key`` from the summary section.
-    """
+    if summary_path is not None and summary_path.exists():
+        try:
+            output_payload = {
+                "metrics": result.metrics,
+                "artifacts": result.artifacts,
+            }
+            result_path = summary_path.parent / "evaluation_result.json"
+            result_path.write_text(json.dumps(output_payload, indent=2), encoding="utf-8")
+        except OSError as exc:
+            print(f"FAILED TO PRINT EVAL RESULT JSON TO SUMMARY PATH: {exc}")
+            print(f"Tried to write to: {result_path}")
+            import traceback
+            traceback.print_exc()
+            pass
 
-    entry = summary.get(key)
-    if isinstance(entry, dict):
-        entry = entry.get("average")
+    if candidate_source and summary_path is not None and summary_path.exists():
+        try:
+            experiment_dir = summary_path.parent
+            experiment_dir.mkdir(parents=True, exist_ok=True)
+            (experiment_dir / "agent.c").write_text(candidate_source, encoding="utf-8")
+        except OSError:
+            pass
 
-    if entry is None:
-        return None
-
-    try:
-        return float(entry)
-    except (TypeError, ValueError):
-        return None
+    return result
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <path-to-ebpf-program>", file=sys.stderr)
-        sys.exit(1)
-
-    metrics = evaluate(sys.argv[1])
-    print(json.dumps(metrics, indent=2))
+    result = evaluate()
+    json.dump(result.to_dict(), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    if result.artifacts:
+        sys.stdout.write("\nArtifacts:\n")
+        for name, payload in result.artifacts.items():
+            if isinstance(payload, bytes):
+                try:
+                    text_payload = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    text_payload = payload.decode("utf-8", errors="replace")
+            else:
+                text_payload = str(payload)
+            sys.stdout.write(f"--- {name} ---\n{text_payload}\n")

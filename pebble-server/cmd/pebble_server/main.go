@@ -22,7 +22,7 @@ func main() {
 	var (
 		listen       = flag.String("listen", "127.0.0.1:9000", "UDP listen address")
 		workers      = flag.Int("workers", 4, "number of reuseport workers")
-		policy       = flag.String("policy", "default", "load-balancing policy: default|round_robin|agent|scan_split")
+		policy       = flag.String("policy", "default", "load-balancing policy: default|round_robin|agent|scan_split|hash")
 		maxScan      = flag.Int("max-scan", 100000, "maximum keys returned for SCAN")
 		logDir       = flag.String("log-dir", "logs/server", "directory for server logs")
 		resultsDir   = flag.String("results-dir", "results", "directory to store experiment artefacts")
@@ -73,6 +73,7 @@ func main() {
 
 	srv, err := server.New(cfg, logger)
 	if err != nil {
+		logger.Printf("initialise server: %v", err)
 		log.Fatalf("initialise server: %v", err)
 	}
 	defer srv.Close()

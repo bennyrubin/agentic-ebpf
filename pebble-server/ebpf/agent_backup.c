@@ -34,20 +34,21 @@ enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
     if (!state || state->active == 0)
         return SK_PASS;
 
-    /* direct selection for a single active socket to avoid expensive loops */
-    __u32 active = state->active;
-    if (active == 1) {
-        __u32 slot = 0;
-        bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0);
-        return SK_PASS;
+    __u32 start = reuse->hash % state->active;
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 128; i++) {
+        if (i >= state->active)
+            break;
+
+        __u32 slot = start + i;
+        if (slot >= state->active)
+            slot -= state->active;
+
+        if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)
+            return SK_PASS;
     }
-    /* prefer hardware RSS hash for flow locality, fallback to PRNG */
-    __u32 h = reuse->hash;
-    if (h == 0)
-        h = bpf_get_prandom_u32();
-    __u64 prod = (__u64)h * active;
-    __u32 slot = prod >> 32;
-    bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0);
+
     return SK_PASS;
 }
 // EVOLVE-BLOCK-END

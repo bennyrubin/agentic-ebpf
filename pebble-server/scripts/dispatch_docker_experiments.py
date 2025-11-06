@@ -19,7 +19,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -103,22 +103,34 @@ def expand_cpu_spec(spec: str) -> list[int]:
     return result
 
 
-def read_node0_cpu_list() -> list[int]:
-    path = pathlib.Path("/sys/devices/system/node/node0/cpulist")
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise SystemExit(f"NUMA node 0 CPU list not found at {path}") from exc
-    cleaned = raw.strip()
-    if not cleaned:
-        raise SystemExit(f"NUMA node 0 CPU list at {path} is empty.")
-    try:
-        cpus = expand_cpu_spec(cleaned)
-    except ValueError as exc:
-        raise SystemExit(f"Failed to parse NUMA node 0 CPU list '{cleaned}': {exc}") from exc
-    if not cpus:
-        raise SystemExit(f"NUMA node 0 CPU list at {path} resolved to no CPUs.")
-    return cpus
+def read_numa_cpu_map() -> Dict[int, list[int]]:
+    node_dir = pathlib.Path("/sys/devices/system/node")
+    if not node_dir.is_dir():
+        raise SystemExit(f"NUMA node directory missing at {node_dir}")
+
+    cpu_map: Dict[int, list[int]] = {}
+    for entry in sorted(node_dir.glob("node[0-9]*"), key=lambda p: int(p.name[4:])):
+        cpulist_path = entry / "cpulist"
+        try:
+            raw = cpulist_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        try:
+            cpus = expand_cpu_spec(cleaned)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Failed to parse NUMA node {entry.name} CPU list '{cleaned}': {exc}"
+            ) from exc
+        if cpus:
+            cpu_map[int(entry.name[4:])] = cpus
+
+    if not cpu_map:
+        raise SystemExit(f"No NUMA nodes with CPUs found under {node_dir}")
+
+    return cpu_map
 
 
 @dataclass
@@ -292,13 +304,13 @@ def parse_args() -> argparse.Namespace:
         "--server-cores",
         type=int,
         required=True,
-        help="Dedicated NUMA node 0 cores per container for the server.",
+        help="Dedicated cores per container for the server (from a single NUMA node).",
     )
     parser.add_argument(
         "--client-cores",
         type=int,
         required=True,
-        help="Dedicated NUMA node 0 cores per container for the client.",
+        help="Dedicated cores per container for the client (from the same NUMA node).",
     )
     parser.add_argument(
         "--cpu-sets",
@@ -420,31 +432,32 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.server_cores <= 0 or args.client_cores <= 0:
         raise SystemExit("--server-cores and --client-cores must be positive integers.")
 
-    node0_cpus = read_node0_cpu_list()
-    total_node0 = len(node0_cpus)
+    numa_cpu_map = read_numa_cpu_map()
+    cpu_to_node: Dict[int, int] = {
+        cpu: node for node, cpus in numa_cpu_map.items() for cpu in cpus
+    }
+
     per_container_total = args.server_cores + args.client_cores
-    if per_container_total > total_node0:
+    eligible_nodes: list[Tuple[int, list[int]]] = [
+        (node, cpus)
+        for node, cpus in sorted(numa_cpu_map.items())
+        if len(cpus) >= per_container_total
+    ]
+    if not eligible_nodes:
         raise SystemExit(
-            f"Requested {per_container_total} total cores per container "
-            f"(server={args.server_cores}, client={args.client_cores}) "
-            f"but NUMA node 0 only has {total_node0} cores."
+            f"No NUMA node has at least {per_container_total} CPUs to satisfy "
+            f"server={args.server_cores}, client={args.client_cores}."
         )
 
-    max_parallel_capacity = total_node0 // per_container_total
-    if max_parallel_capacity == 0:
-        raise SystemExit(
-            f"NUMA node 0 ({total_node0} cores) cannot satisfy even a single container "
-            f"with {per_container_total} total requested cores."
-        )
+    max_parallel_capacity = len(eligible_nodes)
     if args.max_parallel > max_parallel_capacity:
         raise SystemExit(
-            f"--max-parallel={args.max_parallel} exceeds NUMA node 0 capacity of "
-            f"{max_parallel_capacity} containers ({total_node0} cores available, "
-            f"{per_container_total} required per container)."
+            f"--max-parallel={args.max_parallel} exceeds NUMA node capacity of "
+            f"{max_parallel_capacity} containers (nodes with sufficient CPUs: "
+            f"{[node for node, _ in eligible_nodes]})."
         )
 
     if manual_cpu_sets:
-        node0_set = set(node0_cpus)
         validated_sets: list[str] = []
         for cpuset in manual_cpu_sets:
             try:
@@ -456,26 +469,31 @@ async def main_async(args: argparse.Namespace) -> None:
                     f"cpuset '{cpuset}' contains {len(cpus)} CPUs but "
                     f"{per_container_total} are required (server={args.server_cores}, client={args.client_cores})."
                 )
-            missing = [cpu for cpu in cpus if cpu not in node0_set]
-            if missing:
+            nodes = {cpu_to_node.get(cpu) for cpu in cpus}
+            if None in nodes:
+                unknown = [cpu for cpu in cpus if cpu_to_node.get(cpu) is None]
                 raise SystemExit(
-                    f"cpuset '{cpuset}' includes CPUs outside NUMA node 0: {missing} "
-                    f"(available node 0 cores: {node0_cpus})."
+                    f"cpuset '{cpuset}' references CPUs not present in NUMA topology: {unknown}"
+                )
+            if len(nodes) != 1:
+                raise SystemExit(
+                    f"cpuset '{cpuset}' spans multiple NUMA nodes ({sorted(nodes)}); "
+                    f"please restrict each container to a single node."
                 )
             validated_sets.append(cpuset)
         cpu_sets = validated_sets
     else:
         cpu_sets = []
-        for slot in range(args.max_parallel):
-            start = slot * per_container_total
-            end = start + per_container_total
-            slice_cpus = node0_cpus[start:end]
+        for node, node_cpus in eligible_nodes[:args.max_parallel]:
+            slice_cpus = node_cpus[:per_container_total]
             if len(slice_cpus) != per_container_total:
                 raise SystemExit(
-                    f"Internal error computing cpuset slice for slot {slot}: "
-                    f"expected {per_container_total} CPUs, got {slice_cpus}."
+                    f"NUMA node {node} does not have enough CPUs for the requested "
+                    f"allocation (needed {per_container_total}, have {len(node_cpus)})."
                 )
             cpu_sets.append(",".join(str(cpu) for cpu in slice_cpus))
+
+    numa_summary = {node: cpus for node, cpus in eligible_nodes}
 
     cpu_locks = {cpuset: asyncio.Lock() for cpuset in {c for c in cpu_sets if c}}
 
@@ -510,7 +528,7 @@ async def main_async(args: argparse.Namespace) -> None:
         f"policies={policies}",
         f"rates={rates}",
         f"cpu_sets={cpu_sets or ['<none>']}",
-        f"node0_cores={node0_cpus}",
+        f"numa_nodes={numa_summary}",
         f"base_command={quoted_base}",
         f"extra_env={args.env or ['<none>']}",
     )
@@ -567,7 +585,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "server_cores": args.server_cores,
             "client_cores": args.client_cores,
             "per_container_total_cores": per_container_total,
-            "numa_node0_cores": node0_cpus,
+            "numa_nodes": numa_summary,
             "get_delay": args.get_delay,
             "scan_delay": args.scan_delay,
             "cpu_sets": cpu_sets,

@@ -68,25 +68,19 @@ ensure_positive_int() {
 
 resolve_cpu_pool() {
   local source="$1"
-  local path="/sys/devices/system/node/node0/cpulist"
-  if [[ ! -r "$path" ]]; then
-    echo "Unable to read NUMA node 0 CPU list from $path" >&2
-    exit 1
-  fi
-  local node0_raw
-  node0_raw=$(tr -d '[:space:]' < "$path")
-  local -a NODE0_CPUS=()
-  mapfile -t NODE0_CPUS < <(expand_cpu_list "$node0_raw") || {
-    echo "Failed to parse NUMA node 0 CPU list '$node0_raw'" >&2
-    exit 1
-  }
+  local cpulist=""
 
-  local cpulist
   if [[ -n "$source" ]]; then
     cpulist="${source//[[:space:]]/}"
   else
-    cpulist="$node0_raw"
+    local default_path="/sys/devices/system/node/node0/cpulist"
+    if [[ ! -r "$default_path" ]]; then
+      echo "Unable to read NUMA node 0 CPU list from $default_path" >&2
+      exit 1
+    fi
+    cpulist=$(tr -d '[:space:]' < "$default_path")
   fi
+
   if [[ -z "$cpulist" ]]; then
     echo "Resolved CPU pool is empty" >&2
     exit 1
@@ -101,17 +95,15 @@ resolve_cpu_pool() {
     exit 1
   fi
 
-  local -A NODE0_LOOKUP=()
-  local cpu
-  for cpu in "${NODE0_CPUS[@]}"; do
-    NODE0_LOOKUP["$cpu"]=1
-  done
-  for cpu in "${AVAILABLE_CPUS[@]}"; do
-    if [[ -z "${NODE0_LOOKUP[$cpu]:-}" ]]; then
-      echo "CPU $cpu is not part of NUMA node 0 (allowed: $node0_raw)" >&2
-      exit 1
-    fi
-  done
+  if [[ -n "$source" ]]; then
+    local cpu
+    for cpu in "${AVAILABLE_CPUS[@]}"; do
+      if [[ ! -d "/sys/devices/system/cpu/cpu${cpu}" ]]; then
+        echo "CPU $cpu is not present on this system" >&2
+        exit 1
+      fi
+    done
+  fi
 }
 
 ensure_taskset_available() {
@@ -125,7 +117,7 @@ usage() {
   cat <<USAGE
 Usage: $0 [options]
   --threads <n>       worker sockets (default: $THREADS)
-  --policy <name>     default|round_robin|agent|scan_split (default: $POLICY)
+  --policy <name>     default|round_robin|agent|scan_split|hash (default: $POLICY)
   --duration <sec>    workload duration seconds (default: $DURATION)
   --rate <rps>        send rate (default: $RATE)
   --get-frac <f>      GET fraction (default: $GET_FRAC)
@@ -204,7 +196,7 @@ CLIENT_CORES=$((CLIENT_CORES))
 
 total_requested=$((SERVER_CORES + CLIENT_CORES))
 if (( total_requested > ${#AVAILABLE_CPUS[@]} )); then
-  echo "Insufficient NUMA node 0 CPUs: requested ${total_requested}, available ${#AVAILABLE_CPUS[@]} (${AVAILABLE_CPUS[*]})." >&2
+  echo "Insufficient CPUs in selected pool: requested ${total_requested}, available ${#AVAILABLE_CPUS[@]} (${AVAILABLE_CPUS[*]})." >&2
   exit 1
 fi
 
@@ -302,8 +294,31 @@ SERVER_PID=""
 
 start_server() {
   "$ROOT/scripts/launch_server.sh" "${LAUNCH_ARGS[@]}" >/dev/null
+  if [[ ! -f "$PID_FILE" ]]; then
+    echo "Failed to start server: expected PID file at $PID_FILE" >&2
+    SERVER_PID=""
+    return 1
+  fi
+
   SERVER_PID=$(cat "$PID_FILE")
   sleep 2
+
+  if ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+    echo "Server process (pid=$SERVER_PID) exited immediately after launch; see logs under $SERVER_LOG_DIR" >&2
+    SERVER_PID=""
+    return 1
+  fi
+
+  local server_log="$SERVER_LOG_DIR/server.log"
+  if [[ -f "$server_log" ]]; then
+    if grep -qiE "initialise server|load agent objects" "$server_log"; then
+      echo "Server reported an agent load failure; see $server_log" >&2
+      stop_server
+      return 1
+    fi
+  fi
+
+  return 0
 }
 
 stop_server() {
@@ -324,7 +339,7 @@ stop_server() {
   SERVER_PID=""
 }
 
-start_server
+start_server || exit 1
 
 echo "pprof available at http://127.0.0.1:6060/debug/pprof/"
 echo "block/mutex profiling enabled (SetBlockProfileRate=1)"
@@ -356,7 +371,10 @@ for ((i = 1; i <= ITERATIONS; i++)); do
   ITERATION_LOGS+=("$ITER_LOG")
   echo "-- Iteration $i/$ITERATIONS --"
   echo "Restarting server for iteration $i"
-  start_server
+  if ! start_server; then
+    echo "Failed to start server for iteration $i; aborting run" >&2
+    exit 1
+  fi
   run_client \
     -server "$LISTEN" \
     -duration "${DURATION}s" \
@@ -365,6 +383,21 @@ for ((i = 1; i <= ITERATIONS; i++)); do
     -scan-limit "$SCAN_LIMIT" \
     -send-workers "$SEND_WORKERS" \
     -log "$CLIENT_LOG_FILE" | tee "$ITER_LOG"
+  if grep -qiE 'initialise server|load agent objects' "$ITER_LOG"; then
+    echo "Detected server load failure during iteration $i; aborting remaining runs." >&2
+    stop_server
+    exit 1
+  fi
+  if grep -qi 'connection refused' "$CLIENT_LOG_FILE"; then
+    echo "Client observed connection refusals during iteration $i; aborting remaining runs." >&2
+    stop_server
+    exit 1
+  fi
+  if grep -qi 'No responses received' "$ITER_LOG"; then
+    echo "Workload reported no responses during iteration $i; aborting remaining runs." >&2
+    stop_server
+    exit 1
+  fi
   stop_server
 done
 popd >/dev/null

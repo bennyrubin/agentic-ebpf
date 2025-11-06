@@ -33,6 +33,14 @@ STATE_DIR="${WORK_DIR}/state"
 
 mkdir -p "$RESULTS_ROOT" "$WORK_DIR" "$STATE_DIR"
 
+PIN_BASE=${BPF_PIN_BASE:-/sys/fs/bpf}
+AUTO_PIN_PATH=false
+if [[ -z "${BPF_PIN_PATH:-}" ]]; then
+  BPF_PIN_PATH="${PIN_BASE}/${RUN_ID}"
+  AUTO_PIN_PATH=true
+fi
+export BPF_PIN_PATH
+
 export OUTPUT_ROOT="$RESULTS_ROOT"
 export RUN_ID="$RUN_ID"
 export RUN_STATE_DIR="$STATE_DIR"
@@ -47,4 +55,8 @@ echo "[entrypoint] Completed run $RUN_ID (exp $EXP_ID)"
 
 if [[ "${PRESERVE_WORKDIR:-false}" != "true" ]]; then
   rm -rf "$WORK_DIR"
+fi
+
+if [[ "$AUTO_PIN_PATH" == "true" && "${PRESERVE_BPF_PIN_PATH:-false}" != "true" ]]; then
+  rm -rf "$BPF_PIN_PATH" 2>/dev/null || true
 fi

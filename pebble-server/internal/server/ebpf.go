@@ -57,6 +57,8 @@ func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {
 		return loadAgent(workers)
 	case "scan_split":
 		return loadScanSplit(workers)
+	case "hash":
+		return loadHash(workers)
 	default:
 		return nil, ErrInvalidConfig(fmt.Sprintf("unknown policy %q", policy))
 	}
@@ -172,6 +174,45 @@ func loadScanSplit(workers int) (*ebpfPolicy, error) {
 	return &ebpfPolicy{
 		name:    "scan_split",
 		program: objs.SplitUdpSelector,
+		close:   objs.Close,
+	}, nil
+}
+
+func loadHash(workers int) (*ebpfPolicy, error) {
+	if err := ensureRlimit(); err != nil {
+		return nil, err
+	}
+	pinDir := pinDirectory()
+	if err := ensurePinDirectory(pinDir); err != nil {
+		return nil, fmt.Errorf("ensure pin directory: %w", err)
+	}
+	var objs ebpfutil.HashSelectorObjects
+	opts := &ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{PinPath: pinDir},
+	}
+	if err := ebpfutil.LoadHashSelectorObjects(&objs, opts); err != nil {
+		return nil, fmt.Errorf("load hash selector objects: %w", err)
+	}
+
+	if workers < 0 {
+		objs.Close()
+		return nil, ErrInvalidConfig("workers must be non-negative")
+	}
+
+	var key uint32 = 0
+	state := ebpfutil.HashSelectorHashState{
+		Active: uint32(workers),
+	}
+	if objs.PebbleHashState != nil {
+		if err := objs.PebbleHashState.Update(&key, &state, ebpf.UpdateAny); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("configure hash state: %w", err)
+		}
+	}
+
+	return &ebpfPolicy{
+		name:    "hash",
+		program: objs.HashUdpSelector,
 		close:   objs.Close,
 	}, nil
 }
