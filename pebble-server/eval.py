@@ -32,6 +32,10 @@ BUILD_SCRIPT = SCRIPTS_DIR / "build_ebpf.sh"
 RUN_EXP_SCRIPT = REPO_ROOT / "run_exp.py"
 DISPATCH_SCRIPT = SCRIPTS_DIR / "dispatch_docker_experiments.py"
 SERVER_LOG_RELATIVE = Path("logs") / "server" / "server.log"
+SERVER_LOG_RELATIVE_CANDIDATES: Tuple[Path, ...] = (
+    SERVER_LOG_RELATIVE,
+    Path("logs") / "server.log",
+)
 
 SUMMARY_PATTERN = re.compile(r"Wrote experiment summary:\s*(.+)")
 
@@ -195,8 +199,8 @@ def _safe_read_text(path: Path) -> Optional[str]:
 
 def _check_load_success(run_dir: Path) -> bool:
     """Inspect the server log for a successful agent policy start."""
-    log_path = run_dir / SERVER_LOG_RELATIVE
-    if not log_path.exists():
+    log_path = _locate_server_log(run_dir)
+    if log_path is None:
         return False
 
     try:
@@ -211,6 +215,25 @@ def _check_load_success(run_dir: Path) -> bool:
         if "initialise server" in line.lower() or "load agent objects" in line.lower():
             return False
     return started
+
+
+def _relative_path_string(path: Path, root: Optional[Path]) -> str:
+    """Return a display name for a path relative to a root when possible."""
+    if root:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            pass
+    return str(path)
+
+
+def _locate_server_log(run_dir: Path) -> Optional[Path]:
+    """Find the best-effort server log path inside a run directory."""
+    for relative in SERVER_LOG_RELATIVE_CANDIDATES:
+        candidate = run_dir / relative
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 RATE_SCALE = 10000.0
@@ -304,6 +327,8 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
         _persist_failure_result(result, candidate_source)
         return result
 
+    experiment_dir = summary_path.parent
+
     try:
         subprocess.run(
             (
@@ -312,7 +337,7 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
                 "chown",
                 "-R",
                 f"{os.getuid()}:{os.getgid()}",
-                str(summary_path.parent),
+                str(experiment_dir),
             ),
             check=False,
             cwd=str(REPO_ROOT),
@@ -388,8 +413,9 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
                 artifacts[f"server_log_rate_{rate}"] = log_text
             break
 
-        curve.append((float(rate), float(p99)))
-        std_curve.append((float(rate), float(p99_stddev)))
+        rate_value = float(rate)
+        curve.append((rate_value, float(p99)))
+        std_curve.append((rate_value, float(p99_stddev)))
 
     metrics["load_p99_curve"] = sorted(curve, key=lambda item: item[0])
     metrics["load_p99_stddev_curve"] = sorted(std_curve, key=lambda item: item[0])
@@ -415,6 +441,10 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     metrics["load"] = 1.0
     metrics["run_success"] = 1.0
     metrics["combined_score"] = _compute_negative_auc(metrics["load_p99_curve"])
+
+    if summary_path:
+        artifacts["logs"] = {"summary-json": _relative_path_string(summary_path, experiment_dir)}
+
     result = EvaluationResult(metrics=metrics, artifacts=artifacts)
 
 

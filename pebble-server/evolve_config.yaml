@@ -77,6 +77,34 @@ prompt:
         - Include a comment at the top of every file explaining your approach and the program and why you think it will improve performance. 
 
     Deliver candidate programs that maximize combined_score while preserving correctness and verifier compliance.
+  eval_agent_prompt: |
+    You are an expert evaluator of high‑performance networking systems, specializing in Linux UDP servers that use SO_REUSEPORT with an eBPF sk_reuseport program to steer GET and SCAN requests to worker sockets, backed by a database. Your goal is to explain how the system actually behaved and why, using the provided artifacts: the current eBPF program, run metrics, and the previous program and its results. You will also have access to the path to log files for you to read in summary.json (the path will be provided to you below) and the entire codebase (in the current working directory). Included below is a codebase summary; read all the files and code you think necessarry to understand, but don't excessively read files and waste tokens. Use the prior run as a baseline for context, but do not limit analysis to simply deltas—surface deeper insights and analysis across all layers including the network, userspace, and database layers.
+
+    **Method & guardrails**
+
+    - **Evidence only. No leaps.** If a claim is not supported by the artifacts, mark it **uncertain** and state exactly what’s missing. Be explicit about assumptions you cannot verify.
+    - **Cover every log file without wasting tokens.** Be thorough, but don’t waste tokens since some logs are excessively long.
+    - **Understand the codebase well and find specific lines and functions to support claims but don’t waste tokens.**
+    - **Attribution.** Tie each observed effect to a plausible component (e.g. BPF routing, socket queues, userspace, DB) with specific evidence. If multiple hypotheses exist, list them with confidence levels.
+    - You may read any codebase files, except for the results/* directory, where I will next describe which files in there you may read. You have access to the path to summary.json, which further lists allowed run-* directories that you may read the server and client logs. DO NOT look in directories outside of this list. Also do not look at programs in the ebpf/ directory.
+
+    **Output format (exactly three sections, concise but thorough):**
+
+    1. **Behavior & performance (precise). Be concise.** 
+        - Explain the performance of the system and why it got the performance metrics it did. Compare it to the baseline, when helpful, but surface deeper insights. Include Short, evidence‑backed explanations of *why*
+        - Include a confidence note (e.g., **High/Medium/Low**)
+    2. **Did the behavior achieve the program’s intent? Why or why not?**
+        - Briefly restate the intent inferred from the eBPF program policy (e.g., “maintain per‑core locality/fairness”, “evening distribute requests among workers”).
+        - Judge success/failure of the behavior of this system to achieve the program intent, citing the specific metrics and evidence supporting each judgement.
+    3. **Missing signals & new metrics/logs to add**
+        - List the additional signals/metrics/logs that would close uncertainties, each with **what**, **how to collect**, and **why it helps**. Examples:
+            - Per‑socket backlog depth and time‑in‑queue (export via app counters every N seconds).
+            - Per‑RX‑queue and per‑core packet rates; softirq time; socket map hit/miss counts.
+            - DB slow‑query samples and cache hit ratios segmented by request type.
+        - Keep this list focused and actionable. Don’t include anything if you were able to completely understand and explain the performance.
+
+    Below is included all of the relevant information.
+
   evaluator_system_message: "You are an expert code reviewer."
 
   # Number of examples to include in the prompt
@@ -193,3 +221,117 @@ evolution_trace:
   output_path: null                   # Path for trace output (defaults to output_dir/evolution_trace.{format})
   buffer_size: 10                     # Number of traces to buffer before writing
   compress: false                     # Compress output file (jsonl only)
+
+code_summary: |
+  {
+    "overview": {
+      "languages": [
+        "Go 1.22 (primary services, module `pebbleserver` in go.mod)",
+        "Bash (automation scripts under run.sh and scripts/*)",
+        "Python 3 (log aggregation, experiment runners, e.g. run_exp.py:29)",
+        "Generated Go bindings for eBPF objects (internal/ebpfutil/*) built via `go generate`"
+      ],
+      "runtime_profile": {
+        "server_process": "cmd/pebble_server/main.go:21-91 wires flags -> internal/server.New -> srv.Run(ctx)",
+        "client_process": "cmd/workload_client/main.go:67-305 drives UDP workload with rate limiter + latency stats",
+        "orchestration": "run.sh:1-489 rebuilds eBPF, pins CPUs (taskset), restarts server per iteration, aggregates logs",
+        "experiments": "run_exp.py:29-200 sweeps policies/rates; scripts/dispatch_docker_experiments.py:1-400 launches dockerized runs"
+      },
+      "key_dependencies": [
+        "github.com/cilium/ebpf v0.13.1 (internal/server/ebpf.go:10 for program loading, pinning, map updates)",
+        "golang.org/x/sys/unix (SO_REUSEPORT + SO_ATTACH_REUSEPORT_EBPF in internal/server/server.go:188 and internal/server/ebpf.go:227)",
+        "golang.org/x/time/rate (cmd/workload_client/main.go:21 for open-loop rate limiting)"
+      ],
+      "build_commands": [
+        "go build -o bin/pebble_server ./cmd/pebble_server",
+        "go build -o bin/workload_client ./cmd/workload_client",
+        "SKIP_EBPF_BUILD=false scripts/build_ebpf.sh (runs go generate ./internal/ebpfutil; requires clang)",
+        "run.sh --threads N --policy ... (full workflow: build eBPF, clean pinned maps, launch server, run workload, aggregate metrics)"
+      ]
+    },
+    "go_components": [
+      {
+        "name": "UDP server entrypoint",
+        "path": "cmd/pebble_server/main.go:21-91",
+        "responsibility": "Parses CLI flags for listen addr, worker count, policy selection, timeouts, artificial delays, log/results directories; enables profiling; instantiates internal/server.Server and orchestrates lifecycle via context cancellation.",
+        "key_logic": [
+          "Flag defaults mirror Config defaults; user-supplied invalid values are corrected later by Config.Validate (internal/server/config.go:19-43).",
+          "Logging is routed to `<log-dir>/server.log`; runtime.SetBlockProfileRate/SetMutexProfileFraction plus a goroutine hosting pprof on 127.0.0.1:6060 emit debugging signals for contention analysis.",
+          "Signal handling: signal.NotifyContext(context.Background(), SIGINT, SIGTERM) ensures `srv.Run` exits gracefully, `defer srv.Close()` tears down sockets and eBPF references."
+        ],
+        "dependencies": [
+          "internal/server.Config (internal/server/config.go:5-17)",
+          "internal/server.New (internal/server/server.go:104-131)",
+          "net/http/pprof (side-effect import to expose profiling endpoints)"
+        ]
+      },
+      {
+        "name": "internal/server Config & errors",
+        "path": "internal/server/config.go:5-43, internal/server/errors.go:5-13",
+        "responsibility": "Holds runtime knobs, sets safe defaults, surfaces configuration failures.",
+        "key_symbols": [
+          "Config struct (fields for listener address, worker count, policy name, read/write timeouts, Maximum SCAN keys, directories, synthetic GET/SCAN delays).",
+          "(*Config).Validate clamps invalid or zero values to known-good defaults (e.g., Workers>=1, GetDelay>=10µs, ScanDelay>=2ms).",
+          "ErrInvalidConfig string type returns `invalid configuration: ...` when unknown policies or negative worker counts appear."
+        ],
+        "integration_points": [
+          "server.New validates user config before opening sockets.",
+          "run.sh flag parsing defers to Validate for final normalization (e.g., `--threads` could be zero in scripts but will be corrected)."
+        ]
+      },
+      {
+        "name": "internal/server Server runtime",
+        "path": "internal/server/server.go:18-407",
+        "responsibility": "Implements the UDP worker pool, synthetic latency simulation, stats logging, and eBPF-aware SO_REUSEPORT coordination.",
+        "structure": {
+          "Server struct": "Holds Config, loaded ebpfPolicy, logger, slice of *net.UDPConn, per-worker stats structs, and WaitGroups for workers + stats goroutine.",
+          "workerStats": "Protects GET/SCAN counters, error counts, and cumulative latency via a mutex; snapshotAndReset emits interval totals for logging.",
+          "Lifecycle methods": [
+            "New(): validates config, loads eBPF policy (internal/server/ebpf.go:50-218), clears existing target map entries, preallocates stats.",
+            "Close(): closes sockets and eBPF program (idempotent).",
+            "Run(ctx): resets stats, spawns stats logger (startStatsLogger), iterates `cfg.Workers` times to open UDP sockets (`openWorker`) attaching eBPF on the first socket when configured, updates pinned target map with file descriptors, and launches goroutines via `spawnWorker`.",
+            "openWorker(idx): uses net.ListenConfig.Control to set SO_REUSEADDR/SO_REUSEPORT and optionally attach the eBPF program (only on idx==0 to avoid redundant attaches); returns both UDPConn and raw fd for map updates.",
+            "spawnWorker(idx): loops on ReadFromUDP; after parseRequest + handleRequest it replies via WriteToUDP, logging transient read/write errors unless the socket closed because of context cancellation."
+          ],
+          "Request handling": "handleRequest (internal/server/server.go:268-325) leverages parseRequest (internal/server/handler.go:14-45); GET requests optionally carry `[request-id]` which is echoed in VALUE responses, SCAN enforces numeric limit and clamps to cfg.MaxScanKeys.",
+          "Synthetic latency": "Busy-wait loops (tight `for time.Now().Before(deadline) {}`) guarantee precise delay with minimal syscall overhead (important for eBPF experiments); recorded durations are actual elapsed time, not configured delay, so stats capture jitter.",
+          "Stats logging": "startStatsLogger (internal/server/server.go:328-395) runs a ticker every second, logging `[perf] worker=X ...` as well as `[perf] interval=1s ...` totals; average latencies are derived by dividing cumulative duration by count."
+        },
+        "critical APIs": [
+          "formatResponse(prefix, id, payload) (internal/server/server.go:397-407) constructs wire responses: `PREFIX [id] [payload]`.",
+          "parseRequest(payload) (internal/server/handler.go:14-45) handles ASCII splitting, case-insensitive command detection via equalFoldASCII (internal/server/handler.go:48-66)."
+        ],
+        "eBPF hooks": [
+          "During worker startup `updateTargetsMap(slot, fd)` (internal/server/ebpf.go:237-249) writes the socket fd into the pinned reuseport map so external eBPF agents (e.g., agent policy) can route flows.",
+          "clearTargets(numSlots) (internal/server/ebpf.go:251-268) runs when policy loads to ensure stale slots do not reference dead sockets."
+        ]
+      },
+      {
+        "name": "eBPF policy loader",
+        "path": "internal/server/ebpf.go:1-268",
+        "responsibility": "Translates `-policy` strings into loaded eBPF programs, manages rlimit + pin directories, and provides helper methods for attaching programs to sockets.",
+        "key_logic": [
+          "pinDirectory() selects `$BPF_PIN_PATH`, then `$BPF_PIN_BASE`, else `/sys/fs/bpf`; run.sh sets `$BPF_PIN_BASE=/sys/fs/bpf/pebble` and `$BPF_PIN_PATH=$BPF_PIN_BASE/$RUN_ID` for isolation.",
+          "load* functions (round robin, agent, scan_split, hash) each: ensure memlock rlimit is raised, make pin dir, instantiate generated object structs (e.g., ebpfutil.RrSelectorObjects), seed their state maps with `Active = workers` (and `Counter = 0` for RR), then return ebpfPolicy with `program` set to the relevant `*_UdpSelector`.",
+          "attach(fd) calls unix.SetsockoptInt(SO_ATTACH_REUSEPORT_EBPF, program.FD()); only called for the first worker socket to satisfy kernel semantics.",
+          "updateTargetsMap(slot, fd) loads the pinned `pebble_udp_targets` map (path depends on pin directory) and updates the slot with the worker fd, enabling policy programs to reroute flows without having direct access to Go’s `net` objects."
+        ]
+      },
+      {
+        "name": "Workload client",
+        "path": "cmd/workload_client/main.go:67-442",
+        "responsibility": "Generates UDP GET/SCAN traffic at a steady rate, tags each request with a latency-tracking ID, and reports throughput + percentile statistics per operation type.",
+        "data_flow": [
+          "CLI flags configure target server, duration, rate, GET fraction, scan limit, key generation, logging path, and number of parallel send workers; validation ensures positive rate/key-space and 0<=get-frac<=1.",
+          "Logging uses `logs/client.log`; outstanding requests are monitored every second and logged when non-zero (`monitorWG` goroutine at cmd/workload_client/main.go:151-170).",
+          "Each send worker (cmd/workload_client/main.go:187-218) owns a UDP socket; before sending it waits on the shared rate limiter, increments atomic counters (sentTotal/sentGet/sentScan), builds payload via `buildPayload` (cmd/workload_client/main.go:363-375) using random key indices, and embeds `reqID` generated by `makeReqID(sendNano, seq, isGet)` (cmd/workload_client/main.go:308-317).",
+          "Receive goroutines (cmd/workload_client/main.go:220-263) parse responses, extract `reqID` via `parseReqID` (cmd/workload_client/main.go:320-337), compute latency in milliseconds, and push `latencyRecord` instances onto a buffered channel consumed by a dedicated aggregator goroutine.",
+          "latencyAggregator (cmd/workload_client/main.go:35-65) stores three slices (overall/get/scan). After the run, `reportLatencyStats` (cmd/workload_client/main.go:423-434) prints p50/p90/p99/avg by sorting copies of the collected slices, while throughput is derived from (responses / duration)."
+        ],
+        "failure_handling": [
+          "recv goroutines set a 5s read deadline, reset it on timeout, and exit cleanly when `quit` closes after senders finish and a 2s grace period passes.",
+          "If `totalRecv == 0`, the client prints a warning and returns early to prevent division-by-zero when computing stats."
+        ]
+      }
+    ]
+  }
