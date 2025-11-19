@@ -36,15 +36,17 @@ SERVER_LOG_RELATIVE_CANDIDATES: Tuple[Path, ...] = (
     SERVER_LOG_RELATIVE,
     Path("logs") / "server.log",
 )
+CLIENT_LOG_RELATIVE = Path("logs") / "client.log"
 
 SUMMARY_PATTERN = re.compile(r"Wrote experiment summary:\s*(.+)")
 
 DEFAULT_POLICY = "agent"
-DEFAULT_RATES: Tuple[int, ...] = (40000, 50000, 60000, 70000, 80000)
+DEFAULT_RATES: Tuple[int, ...] = (50000, 60000, 80000, 100000, 140000)
+
 DEFAULT_THREADS = 6
 DEFAULT_SEND_WORKERS = 7
-DEFAULT_ITERATIONS = 2
-DEFAULT_DURATION = 7
+DEFAULT_ITERATIONS = 1
+DEFAULT_DURATION = 10
 
 # Flip this flag to run experiments via the Docker dispatcher instead of python run_exp.py.
 RUN_EXPERIMENT_VIA_DISPATCH = False
@@ -217,16 +219,6 @@ def _check_load_success(run_dir: Path) -> bool:
     return started
 
 
-def _relative_path_string(path: Path, root: Optional[Path]) -> str:
-    """Return a display name for a path relative to a root when possible."""
-    if root:
-        try:
-            return str(path.relative_to(root))
-        except ValueError:
-            pass
-    return str(path)
-
-
 def _locate_server_log(run_dir: Path) -> Optional[Path]:
     """Find the best-effort server log path inside a run directory."""
     for relative in SERVER_LOG_RELATIVE_CANDIDATES:
@@ -234,6 +226,33 @@ def _locate_server_log(run_dir: Path) -> Optional[Path]:
         if candidate.is_file():
             return candidate
     return None
+
+
+def _collect_run_logs(policy: str, rate: object, run_dir: Path) -> Dict[str, str]:
+    """Return log contents for a given policy/rate run directory."""
+    if isinstance(rate, (int, float)):
+        rate_str = str(int(rate)) if float(rate).is_integer() else str(rate)
+    else:
+        rate_str = str(rate)
+    name = f"{policy}-{rate_str}"
+
+    server_log_path = _locate_server_log(run_dir)
+    if server_log_path is None:
+        server_log_path = run_dir / SERVER_LOG_RELATIVE
+    server_log = _safe_read_text(server_log_path)
+    if server_log is None:
+        server_log = f"[missing server log at {server_log_path}]"
+
+    client_log_path = run_dir / CLIENT_LOG_RELATIVE
+    client_log = _safe_read_text(client_log_path)
+    if client_log is None:
+        client_log = f"[missing client log at {client_log_path}]"
+
+    return {
+        "name": name,
+        "server_log": server_log,
+        "client_log": client_log,
+    }
 
 
 RATE_SCALE = 10000.0
@@ -345,6 +364,9 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     except Exception:
         pass
 
+    debug_path = str(summary_path.parent.resolve())
+    artifacts["debug_path"] = debug_path
+
     summary_raw = _safe_read_text(summary_path)
     if summary_raw is None:
         metrics["error"] = "Failed to read experiment summary."
@@ -354,11 +376,14 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
         _persist_failure_result(result, candidate_source)
         return result
 
+    artifacts["summary"] = summary_raw
+    artifacts.setdefault("runs", [])
+
     try:
         summary_payload = json.loads(summary_raw)
     except json.JSONDecodeError as exc:
         metrics["error"] = f"Invalid JSON in experiment summary: {exc}"
-        artifacts["experiment_summary"] = summary_raw
+        artifacts["summary"] = summary_raw
         if run_exp_output:
             artifacts.setdefault("run_exp_output", run_exp_output)
         result = EvaluationResult(metrics=metrics, artifacts=artifacts)
@@ -369,7 +394,8 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     agent_records = [record for record in records if record.get("policy") == DEFAULT_POLICY]
     if not agent_records:
         metrics["error"] = "Experiment summary missing agent policy records."
-        artifacts["experiment_summary"] = summary_raw
+        artifacts["summary"] = summary_raw
+        artifacts["runs"] = []
         if run_exp_output:
             artifacts.setdefault("run_exp_output", run_exp_output)
         result = EvaluationResult(metrics=metrics, artifacts=artifacts)
@@ -380,6 +406,7 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     std_curve: List[Tuple[float, float]] = []
     load_ok = True
     error_reason: Optional[str] = None
+    run_artifacts: List[Dict[str, str]] = []
 
     for record in agent_records:
         rate = record.get("rate")
@@ -404,6 +431,9 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
             error_reason = f"Incomplete record data for rate {rate}."
             break
 
+        policy_name = record.get("policy", DEFAULT_POLICY)
+        run_artifacts.append(_collect_run_logs(policy_name, rate, run_dir_path))
+
         if not _check_load_success(run_dir_path):
             load_ok = False
             error_reason = f"Agent policy failed to load at rate {rate}."
@@ -417,6 +447,8 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
         curve.append((rate_value, float(p99)))
         std_curve.append((rate_value, float(p99_stddev)))
 
+    artifacts["runs"] = run_artifacts
+
     metrics["load_p99_curve"] = sorted(curve, key=lambda item: item[0])
     metrics["load_p99_stddev_curve"] = sorted(std_curve, key=lambda item: item[0])
 
@@ -427,7 +459,7 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
             error_reason = "No latency data collected."
         if error_reason:
             metrics["error"] = error_reason
-        artifacts["experiment_summary"] = summary_raw
+        artifacts["summary"] = summary_raw
         if run_exp_stdout:
             artifacts.setdefault("run_exp_stdout", run_exp_stdout)
         if run_exp_stderr:
@@ -441,9 +473,6 @@ def evaluate(program_path: Optional[str] = None) -> EvaluationResult:
     metrics["load"] = 1.0
     metrics["run_success"] = 1.0
     metrics["combined_score"] = _compute_negative_auc(metrics["load_p99_curve"])
-
-    if summary_path:
-        artifacts["logs"] = {"summary-json": _relative_path_string(summary_path, experiment_dir)}
 
     result = EvaluationResult(metrics=metrics, artifacts=artifacts)
 

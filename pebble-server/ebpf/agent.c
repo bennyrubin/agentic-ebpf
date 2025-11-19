@@ -1,4 +1,20 @@
-//go:build ignore
+/*
+ Pebble agent UDP reuseport selector (jittered, single-call, low-latency)
+
+ What changed and why:
+ - Prior “length split” never triggered: both GET and SCAN payloads are <50 B,
+   so steering by reuse->len > 64 selected the same sockets and caused skew.
+ - We instead spray packets uniformly by xoring reuse->hash with
+   bpf_get_prandom_u32(), eliminating flow pinning when client flow count is
+   small and keeping all workers busy.
+ - Keep exactly one selection call and a cheap range reduction (pow2 mask or
+   32x32->64 mul-high) to minimize instructions and tail latency.
+
+ Verifier/compat notes:
+ - No unbounded loops or stack use; only sk_reuseport_md/map helpers.
+ - Map names/types unchanged; GPL license retained.
+*/
+ //go:build ignore
 
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -24,29 +40,38 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } pebble_agent_state SEC(".maps");
 
-// EVOLVE-BLOCK-START
-
+/* EVOLVE-BLOCK-START
+   Jittered, single-call selector:
+   - h = reuse->hash ^ bpf_get_prandom_u32()
+   - Fast range reduction (pow2 mask else mul-high).
+   - Exactly one bpf_sk_select_reuseport; clamp active to [1,128].
+*/
 SEC("sk_reuseport/selector")
 enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
 {
     __u32 key = 0;
-    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);
-    if (!state || state->active == 0)
+    struct agent_state *st = bpf_map_lookup_elem(&pebble_agent_state, &key);
+    if (!st)
         return SK_PASS;
 
-    /* direct selection for a single active socket to avoid expensive loops */
-    __u32 active = state->active;
-    if (active == 1) {
-        __u32 slot = 0;
-        bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0);
+    __u32 active = st->active;
+    if (active == 0)
         return SK_PASS;
+    if (active > 128)
+        active = 128;
+    if (active <= 1)
+        return SK_PASS;
+
+    __u32 h = reuse->hash ^ bpf_get_prandom_u32();
+
+    __u32 slot;
+    if ((active & (active - 1)) == 0) {
+        slot = h & (active - 1);
+    } else {
+        __u64 prod = (__u64)h * active;
+        slot = (__u32)(prod >> 32);
     }
-    /* prefer hardware RSS hash for flow locality, fallback to PRNG */
-    __u32 h = reuse->hash;
-    if (h == 0)
-        h = bpf_get_prandom_u32();
-    __u64 prod = (__u64)h * active;
-    __u32 slot = prod >> 32;
+
     bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0);
     return SK_PASS;
 }
