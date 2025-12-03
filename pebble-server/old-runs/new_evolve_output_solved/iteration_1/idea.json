@@ -1,0 +1,367 @@
+{
+  "id": "6ceb58ceba6a4616bb0522b678306473",
+  "idea_payload": {
+    "status": "finish",
+    "design_doc": {
+      "goals": [
+        "Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker vs. 64 server workers).",
+        "Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.",
+        "Keep the eBPF selector self-contained and simple: no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.",
+        "Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load balancing (no flow affinity) to fully exploit worker parallelism.",
+        "Provide a clean foundation for future refinements (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary complexity."
+      ],
+      "evidence": [
+        "The existing agent selector uses `slot = reuse->hash % active` with Active set once at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again; there is no dynamic load-aware behavior.",
+        "Client default `-send-workers` is 1, so experiments typically use a single UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64, max 128).",
+        "Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple modulo on `state->active`.",
+        "The Go server\u2019s workers are strictly stateless per packet: `spawnWorker` reads a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state is stored keyed by client address, so packets from the same client do not need to hit the same worker.",
+        "The only field in `pebble_agent_state` that Go writes is `Active`; it constructs `AgentSelectorAgentState{Active: uint32(workers)}` and updates key 0 once in `loadAgent`. No other fields are touched or assumed in Go, so extending the C struct with additional fields is safe from the userspace perspective.",
+        "Experiment logs show that in each run only 3\u20135 of the 6 workers (in that configuration) receive any traffic, and which indices are active changes between runs, consistent with deterministic flow hashing from a small number of client flows onto a larger worker set.",
+        "Throughput saturates and p99 latency explodes once the offered rate exceeds the aggregate capacity of the subset of workers that happened to receive flows; the fact that a run at 100k req/s can outperform 80k req/s is explained by luckier hash distribution (more workers used) rather than any adaptive behavior."
+      ],
+      "architecture": [
+        "Extend `struct agent_state` in the BPF program to include a `__u32 rr_counter` field alongside `Active`. This counter will live in the existing `pebble_agent_state` ARRAY[1] map and be automatically zero-initialized; Go will continue to write only `Active`, leaving `rr_counter` untouched but valid.",
+        "On each packet in `agent_udp_selector`, look up `pebble_agent_state[0]` as today; if `state == NULL` or `state->Active == 0`, immediately return `SK_PASS` to fall back to the kernel\u2019s default reuseport behavior.",
+        "If `Active > 0`, atomically fetch-and-increment `state->rr_counter` using BPF-supported atomic operations (e.g., a `__sync_fetch_and_add`-style intrinsic on `rr_counter`). Use the returned pre-increment value as a monotonically increasing sequence number per packet.",
+        "Compute the target slot as `slot = seq % state->Active`, where `seq` is the fetched counter value and `Active` is the worker count configured at startup. The modulo will uniformly distribute packets across `[0, Active-1]`, ensuring even usage of all configured workers regardless of the number of client flows.",
+        "Invoke `bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0)` once per packet. If it succeeds, simply return `SK_PASS` (letting the kernel deliver to the selected socket). If it fails (e.g., due to a race with userspace removing a socket), just return `SK_PASS` without retries, relying on kernel fallback behavior\u2014no additional loops or probes to keep the program simple.",
+        "Do not inspect `reuse->hash` or any packet payload fields; GET and SCAN requests are treated identically by the selector. Because SCANs are rare (\u22480.5%) and the selector is uniform, they will naturally be dispersed across all workers instead of concentrating on a single socket.",
+        "Rely on the existing userspace behavior to insert valid worker FDs into `pebble_udp_targets[0..Active-1]` at startup and to keep `Active` fixed for the life of the server, as currently implemented. With `Active \u2264 128` guaranteed by config normalization, the modulo operation and map indexing remain within bounds."
+      ],
+      "risks": [
+        "Changing `struct agent_state` in C to add `rr_counter` changes the struct size, but Go only initializes the `Active` field (`AgentSelectorAgentState{Active: ...}`) and never inspects the struct layout; bpf2go will regenerate a matching Go struct, so this is low risk but still requires recompiling eBPF assets.",
+        "The new design intentionally abandons flow affinity: packets from a single client flow will be sprayed across all workers. While the current server and client are fully compatible with this (stateless per request, UDP, reqID-based matching), any future features that assume per-flow stickiness would need to be vetted against this behavior.",
+        "The global `rr_counter` in a single ARRAY map element introduces a shared atomic hotspot. At the current experimental load (\u2264 180k req/s) and modest server core counts, this is unlikely to be a bottleneck, but if the system scales to very high packet rates on many cores, contention on this atomic increment could add measurable overhead.",
+        "Because we no longer probe multiple slots when `bpf_sk_select_reuseport` fails, a transient inconsistency between `Active` and actually installed FDs (e.g., a misconfiguration or a future dynamic resize) could cause the kernel to fall back more often to its default selection, partially reintroducing hash-based imbalance. Current code keeps `Active` constant and pins all FDs at startup, so this is acceptable under present assumptions.",
+        "Packet-level round-robin may slightly increase perceived jitter or reordering for any hypothetical client that implicitly relied on server-side ordering from a single worker. The current workload uses reqIDs and unordered UDP semantics, so this is not an issue now but is worth documenting."
+      ]
+    },
+    "questions": [],
+    "implementation_snippets": [
+      {
+        "path": "internal/server/ebpf.go",
+        "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+      },
+      {
+        "path": "internal/server/server.go",
+        "snippet": "func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {\n\t...\n\t\tfor {\n\t\t\tn, addr, err := conn.ReadFromUDP(buf)\n\t\t\tif err != nil {\n\t\t\t\t...\n\t\t\t}\n\n\t\t\tresponse := s.handleRequest(idx, buf[:n])\n\t\t\tif response == nil {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tif _, err := conn.WriteToUDP(response, addr); err != nil {\n\t\t\t\t...\n\t\t\t}\n\t\t}\n\t}() \n}"
+      },
+      {
+        "path": "internal/server/ebpf.go",
+        "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.AgentSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load agent objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+      },
+      {
+        "path": "cmd/pebble_server/main.go",
+        "snippet": "var (\n\t\tlisten       = flag.String(\"listen\", \"127.0.0.1:9000\", \"UDP listen address\")\n\t\tworkers      = flag.Int(\"workers\", 4, \"number of reuseport workers\")\n\t\tpolicy       = flag.String(\"policy\", \"default\", \"load-balancing policy: default|round_robin|agent|scan_split|hash\")\n\t\tmaxScan      = flag.Int(\"max-scan\", 100000, \"maximum keys returned for SCAN\")\n\t\tlogDir       = flag.String(\"log-dir\", \"logs/server\", \"directory for server logs\")\n\t\tresultsDir   = flag.String(\"results-dir\", \"results\", \"directory to store experiment artefacts\")\n\t\treadTimeout  = flag.Duration(\"read-timeout\", 2*time.Second, \"per-request read deadline\")\n\t\twriteTimeout = flag.Duration(\"write-timeout\", 2*time.Second, \"per-request write deadline\")\n\t\tgetDelay     = flag.Duration(\"get-delay\", 10*time.Microsecond, \"simulated GET latency\")\n\t\tscanDelay    = flag.Duration(\"scan-delay\", 2*time.Millisecond, \"simulated SCAN latency\")\n\t)\n\tflag.Parse()\n"
+      },
+      {
+        "path": "cmd/workload_client/main.go",
+        "snippet": "var (\n\t\t...\n\t\tsendWorkers = flag.Int(\"send-workers\", 1, \"number of concurrent send workers\")\n\t)\n\tflag.Parse()\n\n\tworkers := *sendWorkers\n\tif workers <= 0 {\n\t\tworkers = 1\n\t}"
+      },
+      {
+        "path": "cmd/workload_client/main.go",
+        "snippet": "for i := 0; i < workers; i++ {\n\t\tconn, err := net.DialUDP(\"udp\", nil, udpAddr)\n\t\tif err != nil {\n\t\t\tlogger.Fatalf(\"dial udp worker=%d: %v\", i, err)\n\t\t}\n\t\tdefer conn.Close()\n\t\t...\n\t}\n"
+      },
+      {
+        "path": "internal/server/config.go",
+        "snippet": "const (\n\tdefaultWorkers = 64\n\tmaxWorkers     = 128\n)\n\nfunc (c *Config) normalize() {\n\tif c.Workers <= 0 {\n\t\tc.Workers = defaultWorkers\n\t}\n\tif c.Workers > maxWorkers {\n\t\tc.Workers = maxWorkers\n\t}\n}"
+      },
+      {
+        "path": "internal/server/server.go",
+        "snippet": "type Server struct {\n\tcfg    Config\n\tpolicy *ebpfPolicy\n\tlogger *log.Logger\n\n\tconns   []*net.UDPConn\n\tstats   []workerStats\n\twg      sync.WaitGroup\n\tstatsWG sync.WaitGroup\n}\n\n// workers are allocated according to cfg.Workers, which has already\n// been normalized (default 64, maximum 128)."
+      }
+    ]
+  },
+  "idea_summary": "{\"status\": \"finish\", \"design_doc\": {\"goals\": [\"Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker vs. 64 server workers).\", \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.\", \"Keep the eBPF selector self-contained and simple: no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.\", \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load balancing (no flow affinity) to fully exploit worker parallelism.\", \"Provide a clean foundation for future refinements (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary complexity.\"], \"evidence\": [\"The existing agent selector uses `slot = reuse->hash % active` with Active set once at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again; there is no dynamic load-aware behavior.\", \"Client default `-send-workers` is 1, so experiments typically use a single UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64, max 128).\", \"Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple modulo on `state->active`.\", \"The Go server\\u2019s workers are strictly stateless per packet: `spawnWorker` reads a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state is stored keyed by client address, so packets from the same client do not need to hit the same worker.\", \"The only",
+  "parent_id": "18f802b0133a45f5b4b368221b18af9f",
+  "eval_summary": null,
+  "eval_hypothesis": null,
+  "eval_score": null,
+  "eval_output_path": null,
+  "programs": [
+    "f4b3ddc9ae8749c287739f1d3e9729c7",
+    "1ddca730434541518aaf7d3fef46c48b",
+    "f0b242c511bd444d9c17269e2849f82a"
+  ],
+  "best_program_id": "f0b242c511bd444d9c17269e2849f82a",
+  "best_score": -2396.55,
+  "artifacts_dir": "agentic-ebpf/pebble-server/new_evolve_output/iteration_1",
+  "idea_iterations": [
+    {
+      "iteration": 0,
+      "idea_payload": {
+        "status": "continue",
+        "design_doc": {
+          "goals": [
+            "Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small.",
+            "Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.",
+            "Keep the eBPF selector self-contained and simple: no new maps, no userspace configuration beyond the existing Active field, and minimal extra logic per packet.",
+            "Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID), accepting per-packet load balancing (no flow affinity) to maximize throughput and parallelism.",
+            "Lay groundwork for future refinements (e.g., lightweight differentiation between GET/SCAN) while first solving the primary imbalance problem with the simplest effective mechanism."
+          ],
+          "evidence": [
+            "The current agent selector uses a static mapping `slot = reuse->hash % active` with Active=6, so each client flow hashes deterministically to a single worker for the lifetime of the flow.",
+            "The workload uses a small number of client UDPConns (one per send worker), so there are fewer flows than server workers; in logs only 3\u20135 of 6 workers report any traffic in a given second.",
+            "Which worker indices are used changes between runs, depending on hash placement, confirming that the subset of active workers is effectively random from run to run.",
+            "Each worker processes requests strictly sequentially with busy-wait delays (~10 \u00b5s for GET, 2 ms for SCAN), so overall capacity is bounded by the number of workers that actually receive traffic, not by the configured worker count.",
+            "When offered load exceeds the aggregate capacity of the few workers that hashed as active, per-socket UDP queues grow, packets are dropped, client sees many 'responses missing', and client-observed p99 latency balloons into the multi-second range.",
+            "At around 100k req/s, one run happens to get a relatively even spread over 5 workers, giving lower p99 and higher throughput; at 80k and \u2265140k, worse hash-based concentration on fewer workers causes more queuing and worse tail latency despite similar or even lower offered load."
+          ],
+          "architecture": [
+            "Replace flow-hash-based selection with packet-level round-robin across all `state->active` workers, stored in the existing `pebble_agent_state` ARRAY[1] value: extend `struct agent_state` with a global atomic counter used as a sequence number.",
+            "On each packet, the selector looks up `pebble_agent_state[0]`, atomically increments the global counter, computes `slot = counter % active`, and calls `bpf_sk_select_reuseport` with that slot, ignoring `reuse->hash` entirely so that a small number of client flows are striped evenly across all workers.",
+            "Treat GET and SCAN identically in the selector for now (no payload parsing in eBPF), relying on the uniform per-packet distribution to naturally spread the rare, heavier SCAN requests across workers and prevent them from concentrating on a single busy loop.",
+            "Keep all state in the single existing `pebble_agent_state` map (no new maps), avoid any userspace-driven tuning except the already-present Active field, and use only basic atomic operations and integer arithmetic to minimize verifier complexity and per-packet overhead."
+          ],
+          "risks": [
+            "The Go side\u2019s representation of `pebble_agent_state` (generated from the C struct) may currently only include `Active`; extending the struct in C is expected to be safe but needs confirmation that Go only writes/reads `Active` and does not rely on the previous struct size/layout elsewhere.",
+            "The server code might implicitly assume that all packets from a given client 4-tuple are handled by the same worker (e.g., for per-connection statistics or state caching); packet-level round-robin would break such an assumption if it exists, although the current description suggests the server is fully stateless per request.",
+            "Atomic increments on a single global counter in `pebble_agent_state` will serialize at that memory location; at the observed traffic rates (\u2264 ~200k req/s) this should be inexpensive, but we should confirm there is no unusually high server CPU parallelism or other contention hotspots that would make this problematic.",
+            "The server may, now or in future, change `Active` dynamically (e.g., shrinking the worker set); the round-robin design assumes that `Active` is set once at startup and remains constant during normal operation, so any dynamic changes must be rare or coordinated.",
+            "We assume there are no unused or stale entries in `pebble_udp_targets[0..Active-1]` and that `Active` never exceeds the number of valid worker FDs inserted by userspace; otherwise round-robin might occasionally pick an empty slot and rely on implicit fallback behavior."
+          ]
+        },
+        "questions": [
+          "In internal/server/ebpf.go, for the 'agent' policy, how is the Go handle for the pebble_agent_state map used: which fields of its value struct are written (e.g., only Active or more), and is that struct referenced anywhere else in Go by size or layout?",
+          "Does any code in internal/server/server.go (especially in spawnWorker and handleRequest) maintain per-client or per-flow state keyed by the client address (net.UDPAddr) that would rely on all packets from a given client being handled by the same worker?",
+          "In internal/server/ebpf.go, is the pebble_agent_state.Active field ever updated after server startup, or is it effectively constant once the workers and eBPF program are attached?",
+          "In cmd/workload_client/main.go, what is the default value for the '-send-workers' flag, i.e., how many UDPConns (and thus client source ports/flows) are typically used in the experiments?",
+          "In internal/server/config.go and server.go, what is the default worker count and any enforced upper limit, so we can be certain that the current BPF map size (max_entries=128) and a simple modulo on state->active are always sufficient for production configurations?"
+        ]
+      },
+      "rag_answers": [
+        {
+          "question": "In internal/server/ebpf.go, for the 'agent' policy, how is the Go handle for the pebble_agent_state map used: which fields of its value struct are written (e.g., only Active or more), and is that struct referenced anywhere else in Go by size or layout?",
+          "answer": {
+            "answer": "For the 'agent' policy, the Go handle for the pebble_agent_state map is accessed via objs.PebbleAgentState in loadAgent. A value of type ebpfutil.AgentSelectorAgentState is created and only its Active field is written:\n\n- workers is validated to be non\u2011negative.\n- A local variable `state := ebpfutil.AgentSelectorAgentState{ Active: uint32(workers) }` is constructed; no other fields are set.\n- If objs.PebbleAgentState is non\u2011nil, the code performs `objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny)` with key 0 to store that struct instance in the map.\n\nThere are no other references in the provided Go code that depend on the size or layout of ebpfutil.AgentSelectorAgentState, nor any other uses of that struct in this file. Its only use here is as the value type for that single Update call where Active is populated.",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "Does any code in internal/server/server.go (especially in spawnWorker and handleRequest) maintain per-client or per-flow state keyed by the client address (net.UDPAddr) that would rely on all packets from a given client being handled by the same worker?",
+          "answer": {
+            "answer": "No. The worker function in internal/server/server.go reads each UDP packet, immediately passes only the packet bytes (buf[:n]) and the worker index to handleRequest, and then writes the returned response back to the source address for that single packet. The client address (net.UDPAddr) is only used as the destination for WriteToUDP and is not stored or used as a key for any state. There is no per-client or per-flow state keyed by net.UDPAddr in spawnWorker, nor is any such state passed into or out of handleRequest, so packet affinity to a particular worker is not required by this code.",
+            "code_snippets": [
+              {
+                "path": "internal/server/server.go",
+                "snippet": "func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {\n\t...\n\t\tfor {\n\t\t\tn, addr, err := conn.ReadFromUDP(buf)\n\t\t\tif err != nil {\n\t\t\t\t...\n\t\t\t}\n\n\t\t\tresponse := s.handleRequest(idx, buf[:n])\n\t\t\tif response == nil {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tif _, err := conn.WriteToUDP(response, addr); err != nil {\n\t\t\t\t...\n\t\t\t}\n\t\t}\n\t}() \n}"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In internal/server/ebpf.go, is the pebble_agent_state.Active field ever updated after server startup, or is it effectively constant once the workers and eBPF program are attached?",
+          "answer": {
+            "answer": "The `pebble_agent_state.Active` field is only written once during `loadAgent` and is not updated again after server startup. In `internal/server/ebpf.go`, `loadAgent` computes `state := ebpfutil.AgentSelectorAgentState{ Active: uint32(workers) }` and then performs a single `Update` on `objs.PebbleAgentState` before returning the `ebpfPolicy`. There is no subsequent code shown that mutates this map entry or re-runs `loadAgent`, so the `Active` value is effectively constant for the lifetime of that eBPF attachment unless the process is restarted or `loadAgent` is called again with a different `workers` value.",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.AgentSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load agent objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "cmd/pebble_server/main.go",
+                "snippet": "var (\n\t\tlisten       = flag.String(\"listen\", \"127.0.0.1:9000\", \"UDP listen address\")\n\t\tworkers      = flag.Int(\"workers\", 4, \"number of reuseport workers\")\n\t\tpolicy       = flag.String(\"policy\", \"default\", \"load-balancing policy: default|round_robin|agent|scan_split|hash\")\n\t\tmaxScan      = flag.Int(\"max-scan\", 100000, \"maximum keys returned for SCAN\")\n\t\tlogDir       = flag.String(\"log-dir\", \"logs/server\", \"directory for server logs\")\n\t\tresultsDir   = flag.String(\"results-dir\", \"results\", \"directory to store experiment artefacts\")\n\t\treadTimeout  = flag.Duration(\"read-timeout\", 2*time.Second, \"per-request read deadline\")\n\t\twriteTimeout = flag.Duration(\"write-timeout\", 2*time.Second, \"per-request write deadline\")\n\t\tgetDelay     = flag.Duration(\"get-delay\", 10*time.Microsecond, \"simulated GET latency\")\n\t\tscanDelay    = flag.Duration(\"scan-delay\", 2*time.Millisecond, \"simulated SCAN latency\")\n\t)\n\tflag.Parse()\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In cmd/workload_client/main.go, what is the default value for the '-send-workers' flag, i.e., how many UDPConns (and thus client source ports/flows) are typically used in the experiments?",
+          "answer": {
+            "answer": "The '-send-workers' flag defaults to 1, so experiments typically use a single UDPConn (one client source port/flow) unless overridden.",
+            "code_snippets": [
+              {
+                "path": "cmd/workload_client/main.go",
+                "snippet": "var (\n\t\t...\n\t\tsendWorkers = flag.Int(\"send-workers\", 1, \"number of concurrent send workers\")\n\t)\n\tflag.Parse()\n\n\tworkers := *sendWorkers\n\tif workers <= 0 {\n\t\tworkers = 1\n\t}"
+              },
+              {
+                "path": "cmd/workload_client/main.go",
+                "snippet": "for i := 0; i < workers; i++ {\n\t\tconn, err := net.DialUDP(\"udp\", nil, udpAddr)\n\t\tif err != nil {\n\t\t\tlogger.Fatalf(\"dial udp worker=%d: %v\", i, err)\n\t\t}\n\t\tdefer conn.Close()\n\t\t...\n\t}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In internal/server/config.go and server.go, what is the default worker count and any enforced upper limit, so we can be certain that the current BPF map size (max_entries=128) and a simple modulo on state->active are always sufficient for production configurations?",
+          "answer": {
+            "answer": "The default worker count is 64, and it is capped at a maximum of 128 workers. This ensures that the number of workers never exceeds the current BPF map size of 128 entries, so using a simple modulo on state->active is safe for all production configurations.",
+            "code_snippets": [
+              {
+                "path": "internal/server/config.go",
+                "snippet": "const (\n\tdefaultWorkers = 64\n\tmaxWorkers     = 128\n)\n\nfunc (c *Config) normalize() {\n\tif c.Workers <= 0 {\n\t\tc.Workers = defaultWorkers\n\t}\n\tif c.Workers > maxWorkers {\n\t\tc.Workers = maxWorkers\n\t}\n}"
+              },
+              {
+                "path": "internal/server/server.go",
+                "snippet": "type Server struct {\n\tcfg    Config\n\tpolicy *ebpfPolicy\n\tlogger *log.Logger\n\n\tconns   []*net.UDPConn\n\tstats   []workerStats\n\twg      sync.WaitGroup\n\tstatsWG sync.WaitGroup\n}\n\n// workers are allocated according to cfg.Workers, which has already\n// been normalized (default 64, maximum 128)."
+              }
+            ]
+          }
+        }
+      ],
+      "assistant_content_raw": "{\n  \"status\": \"continue\",\n  \"design_doc\": {\n    \"goals\": [\n      \"Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small.\",\n      \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.\",\n      \"Keep the eBPF selector self-contained and simple: no new maps, no userspace configuration beyond the existing Active field, and minimal extra logic per packet.\",\n      \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID), accepting per-packet load balancing (no flow affinity) to maximize throughput and parallelism.\",\n      \"Lay groundwork for future refinements (e.g., lightweight differentiation between GET/SCAN) while first solving the primary imbalance problem with the simplest effective mechanism.\"\n    ],\n    \"evidence\": [\n      \"The current agent selector uses a static mapping `slot = reuse->hash % active` with Active=6, so each client flow hashes deterministically to a single worker for the lifetime of the flow.\",\n      \"The workload uses a small number of client UDPConns (one per send worker), so there are fewer flows than server workers; in logs only 3\u20135 of 6 workers report any traffic in a given second.\",\n      \"Which worker indices are used changes between runs, depending on hash placement, confirming that the subset of active workers is effectively random from run to run.\",\n      \"Each worker processes requests strictly sequentially with busy-wait delays (~10 \u00b5s for GET, 2 ms for SCAN), so overall capacity is bounded by the number of workers that actually receive traffic, not by the configured worker count.\",\n      \"When offered load exceeds the aggregate capacity of the few workers that hashed as active, per-socket UDP queues grow, packets are dropped, client sees many 'responses missing', and client-observed p99 latency balloons into the multi-second range.\",\n      \"At around 100k req/s, one run happens to get a relatively even spread over 5 workers, giving lower p99 and higher throughput; at 80k and \u2265140k, worse hash-based concentration on fewer workers causes more queuing and worse tail latency despite similar or even lower offered load.\"\n    ],\n    \"architecture\": [\n      \"Replace flow-hash-based selection with packet-level round-robin across all `state->active` workers, stored in the existing `pebble_agent_state` ARRAY[1] value: extend `struct agent_state` with a global atomic counter used as a sequence number.\",\n      \"On each packet, the selector looks up `pebble_agent_state[0]`, atomically increments the global counter, computes `slot = counter % active`, and calls `bpf_sk_select_reuseport` with that slot, ignoring `reuse->hash` entirely so that a small number of client flows are striped evenly across all workers.\",\n      \"Treat GET and SCAN identically in the selector for now (no payload parsing in eBPF), relying on the uniform per-packet distribution to naturally spread the rare, heavier SCAN requests across workers and prevent them from concentrating on a single busy loop.\",\n      \"Keep all state in the single existing `pebble_agent_state` map (no new maps), avoid any userspace-driven tuning except the already-present Active field, and use only basic atomic operations and integer arithmetic to minimize verifier complexity and per-packet overhead.\"\n    ],\n    \"risks\": [\n      \"The Go side\u2019s representation of `pebble_agent_state` (generated from the C struct) may currently only include `Active`; extending the struct in C is expected to be safe but needs confirmation that Go only writes/reads `Active` and does not rely on the previous struct size/layout elsewhere.\",\n      \"The server code might implicitly assume that all packets from a given client 4-tuple are handled by the same worker (e.g., for per-connection statistics or state caching); packet-level round-robin would break such an assumption if it exists, although the current description suggests the server is fully stateless per request.\",\n      \"Atomic increments on a single global counter in `pebble_agent_state` will serialize at that memory location; at the observed traffic rates (\u2264 ~200k req/s) this should be inexpensive, but we should confirm there is no unusually high server CPU parallelism or other contention hotspots that would make this problematic.\",\n      \"The server may, now or in future, change `Active` dynamically (e.g., shrinking the worker set); the round-robin design assumes that `Active` is set once at startup and remains constant during normal operation, so any dynamic changes must be rare or coordinated.\",\n      \"We assume there are no unused or stale entries in `pebble_udp_targets[0..Active-1]` and that `Active` never exceeds the number of valid worker FDs inserted by userspace; otherwise round-robin might occasionally pick an empty slot and rely on implicit fallback behavior.\"\n    ]\n  },\n  \"questions\": [\n    \"In internal/server/ebpf.go, for the 'agent' policy, how is the Go handle for the pebble_agent_state map used: which fields of its value struct are written (e.g., only Active or more), and is that struct referenced anywhere else in Go by size or layout?\",\n    \"Does any code in internal/server/server.go (especially in spawnWorker and handleRequest) maintain per-client or per-flow state keyed by the client address (net.UDPAddr) that would rely on all packets from a given client being handled by the same worker?\",\n    \"In internal/server/ebpf.go, is the pebble_agent_state.Active field ever updated after server startup, or is it effectively constant once the workers and eBPF program are attached?\",\n    \"In cmd/workload_client/main.go, what is the default value for the '-send-workers' flag, i.e., how many UDPConns (and thus client source ports/flows) are typically used in the experiments?\",\n    \"In internal/server/config.go and server.go, what is the default worker count and any enforced upper limit, so we can be certain that the current BPF map size (max_entries=128) and a simple modulo on state->active are always sufficient for production configurations?\"\n  ]\n}",
+      "assistant_role": "assistant",
+      "full_response": {
+        "id": "chatcmpl-Cii2uaLiCvy4WjqzemKtp9RcorUfh",
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": null,
+            "message": {
+              "content": "{\n  \"status\": \"continue\",\n  \"design_doc\": {\n    \"goals\": [\n      \"Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small.\",\n      \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.\",\n      \"Keep the eBPF selector self-contained and simple: no new maps, no userspace configuration beyond the existing Active field, and minimal extra logic per packet.\",\n      \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID), accepting per-packet load balancing (no flow affinity) to maximize throughput and parallelism.\",\n      \"Lay groundwork for future refinements (e.g., lightweight differentiation between GET/SCAN) while first solving the primary imbalance problem with the simplest effective mechanism.\"\n    ],\n    \"evidence\": [\n      \"The current agent selector uses a static mapping `slot = reuse->hash % active` with Active=6, so each client flow hashes deterministically to a single worker for the lifetime of the flow.\",\n      \"The workload uses a small number of client UDPConns (one per send worker), so there are fewer flows than server workers; in logs only 3\u20135 of 6 workers report any traffic in a given second.\",\n      \"Which worker indices are used changes between runs, depending on hash placement, confirming that the subset of active workers is effectively random from run to run.\",\n      \"Each worker processes requests strictly sequentially with busy-wait delays (~10 \u00b5s for GET, 2 ms for SCAN), so overall capacity is bounded by the number of workers that actually receive traffic, not by the configured worker count.\",\n      \"When offered load exceeds the aggregate capacity of the few workers that hashed as active, per-socket UDP queues grow, packets are dropped, client sees many 'responses missing', and client-observed p99 latency balloons into the multi-second range.\",\n      \"At around 100k req/s, one run happens to get a relatively even spread over 5 workers, giving lower p99 and higher throughput; at 80k and \u2265140k, worse hash-based concentration on fewer workers causes more queuing and worse tail latency despite similar or even lower offered load.\"\n    ],\n    \"architecture\": [\n      \"Replace flow-hash-based selection with packet-level round-robin across all `state->active` workers, stored in the existing `pebble_agent_state` ARRAY[1] value: extend `struct agent_state` with a global atomic counter used as a sequence number.\",\n      \"On each packet, the selector looks up `pebble_agent_state[0]`, atomically increments the global counter, computes `slot = counter % active`, and calls `bpf_sk_select_reuseport` with that slot, ignoring `reuse->hash` entirely so that a small number of client flows are striped evenly across all workers.\",\n      \"Treat GET and SCAN identically in the selector for now (no payload parsing in eBPF), relying on the uniform per-packet distribution to naturally spread the rare, heavier SCAN requests across workers and prevent them from concentrating on a single busy loop.\",\n      \"Keep all state in the single existing `pebble_agent_state` map (no new maps), avoid any userspace-driven tuning except the already-present Active field, and use only basic atomic operations and integer arithmetic to minimize verifier complexity and per-packet overhead.\"\n    ],\n    \"risks\": [\n      \"The Go side\u2019s representation of `pebble_agent_state` (generated from the C struct) may currently only include `Active`; extending the struct in C is expected to be safe but needs confirmation that Go only writes/reads `Active` and does not rely on the previous struct size/layout elsewhere.\",\n      \"The server code might implicitly assume that all packets from a given client 4-tuple are handled by the same worker (e.g., for per-connection statistics or state caching); packet-level round-robin would break such an assumption if it exists, although the current description suggests the server is fully stateless per request.\",\n      \"Atomic increments on a single global counter in `pebble_agent_state` will serialize at that memory location; at the observed traffic rates (\u2264 ~200k req/s) this should be inexpensive, but we should confirm there is no unusually high server CPU parallelism or other contention hotspots that would make this problematic.\",\n      \"The server may, now or in future, change `Active` dynamically (e.g., shrinking the worker set); the round-robin design assumes that `Active` is set once at startup and remains constant during normal operation, so any dynamic changes must be rare or coordinated.\",\n      \"We assume there are no unused or stale entries in `pebble_udp_targets[0..Active-1]` and that `Active` never exceeds the number of valid worker FDs inserted by userspace; otherwise round-robin might occasionally pick an empty slot and rely on implicit fallback behavior.\"\n    ]\n  },\n  \"questions\": [\n    \"In internal/server/ebpf.go, for the 'agent' policy, how is the Go handle for the pebble_agent_state map used: which fields of its value struct are written (e.g., only Active or more), and is that struct referenced anywhere else in Go by size or layout?\",\n    \"Does any code in internal/server/server.go (especially in spawnWorker and handleRequest) maintain per-client or per-flow state keyed by the client address (net.UDPAddr) that would rely on all packets from a given client being handled by the same worker?\",\n    \"In internal/server/ebpf.go, is the pebble_agent_state.Active field ever updated after server startup, or is it effectively constant once the workers and eBPF program are attached?\",\n    \"In cmd/workload_client/main.go, what is the default value for the '-send-workers' flag, i.e., how many UDPConns (and thus client source ports/flows) are typically used in the experiments?\",\n    \"In internal/server/config.go and server.go, what is the default worker count and any enforced upper limit, so we can be certain that the current BPF map size (max_entries=128) and a simple modulo on state->active are always sufficient for production configurations?\"\n  ]\n}",
+              "refusal": null,
+              "role": "assistant",
+              "annotations": [],
+              "audio": null,
+              "function_call": null,
+              "tool_calls": null
+            }
+          }
+        ],
+        "created": 1764771780,
+        "model": "gpt-5.1-2025-11-13",
+        "object": "chat.completion",
+        "service_tier": "default",
+        "system_fingerprint": null,
+        "usage": {
+          "completion_tokens": 6689,
+          "prompt_tokens": 7232,
+          "total_tokens": 13921,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": 0,
+            "audio_tokens": 0,
+            "reasoning_tokens": 5357,
+            "rejected_prediction_tokens": 0
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": 0,
+            "cached_tokens": 0
+          }
+        }
+      }
+    },
+    {
+      "iteration": 1,
+      "idea_payload": {
+        "status": "finish",
+        "design_doc": {
+          "goals": [
+            "Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker vs. 64 server workers).",
+            "Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.",
+            "Keep the eBPF selector self-contained and simple: no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.",
+            "Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load balancing (no flow affinity) to fully exploit worker parallelism.",
+            "Provide a clean foundation for future refinements (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary complexity."
+          ],
+          "evidence": [
+            "The existing agent selector uses `slot = reuse->hash % active` with Active set once at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again; there is no dynamic load-aware behavior.",
+            "Client default `-send-workers` is 1, so experiments typically use a single UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64, max 128).",
+            "Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple modulo on `state->active`.",
+            "The Go server\u2019s workers are strictly stateless per packet: `spawnWorker` reads a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state is stored keyed by client address, so packets from the same client do not need to hit the same worker.",
+            "The only field in `pebble_agent_state` that Go writes is `Active`; it constructs `AgentSelectorAgentState{Active: uint32(workers)}` and updates key 0 once in `loadAgent`. No other fields are touched or assumed in Go, so extending the C struct with additional fields is safe from the userspace perspective.",
+            "Experiment logs show that in each run only 3\u20135 of the 6 workers (in that configuration) receive any traffic, and which indices are active changes between runs, consistent with deterministic flow hashing from a small number of client flows onto a larger worker set.",
+            "Throughput saturates and p99 latency explodes once the offered rate exceeds the aggregate capacity of the subset of workers that happened to receive flows; the fact that a run at 100k req/s can outperform 80k req/s is explained by luckier hash distribution (more workers used) rather than any adaptive behavior."
+          ],
+          "architecture": [
+            "Extend `struct agent_state` in the BPF program to include a `__u32 rr_counter` field alongside `Active`. This counter will live in the existing `pebble_agent_state` ARRAY[1] map and be automatically zero-initialized; Go will continue to write only `Active`, leaving `rr_counter` untouched but valid.",
+            "On each packet in `agent_udp_selector`, look up `pebble_agent_state[0]` as today; if `state == NULL` or `state->Active == 0`, immediately return `SK_PASS` to fall back to the kernel\u2019s default reuseport behavior.",
+            "If `Active > 0`, atomically fetch-and-increment `state->rr_counter` using BPF-supported atomic operations (e.g., a `__sync_fetch_and_add`-style intrinsic on `rr_counter`). Use the returned pre-increment value as a monotonically increasing sequence number per packet.",
+            "Compute the target slot as `slot = seq % state->Active`, where `seq` is the fetched counter value and `Active` is the worker count configured at startup. The modulo will uniformly distribute packets across `[0, Active-1]`, ensuring even usage of all configured workers regardless of the number of client flows.",
+            "Invoke `bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0)` once per packet. If it succeeds, simply return `SK_PASS` (letting the kernel deliver to the selected socket). If it fails (e.g., due to a race with userspace removing a socket), just return `SK_PASS` without retries, relying on kernel fallback behavior\u2014no additional loops or probes to keep the program simple.",
+            "Do not inspect `reuse->hash` or any packet payload fields; GET and SCAN requests are treated identically by the selector. Because SCANs are rare (\u22480.5%) and the selector is uniform, they will naturally be dispersed across all workers instead of concentrating on a single socket.",
+            "Rely on the existing userspace behavior to insert valid worker FDs into `pebble_udp_targets[0..Active-1]` at startup and to keep `Active` fixed for the life of the server, as currently implemented. With `Active \u2264 128` guaranteed by config normalization, the modulo operation and map indexing remain within bounds."
+          ],
+          "risks": [
+            "Changing `struct agent_state` in C to add `rr_counter` changes the struct size, but Go only initializes the `Active` field (`AgentSelectorAgentState{Active: ...}`) and never inspects the struct layout; bpf2go will regenerate a matching Go struct, so this is low risk but still requires recompiling eBPF assets.",
+            "The new design intentionally abandons flow affinity: packets from a single client flow will be sprayed across all workers. While the current server and client are fully compatible with this (stateless per request, UDP, reqID-based matching), any future features that assume per-flow stickiness would need to be vetted against this behavior.",
+            "The global `rr_counter` in a single ARRAY map element introduces a shared atomic hotspot. At the current experimental load (\u2264 180k req/s) and modest server core counts, this is unlikely to be a bottleneck, but if the system scales to very high packet rates on many cores, contention on this atomic increment could add measurable overhead.",
+            "Because we no longer probe multiple slots when `bpf_sk_select_reuseport` fails, a transient inconsistency between `Active` and actually installed FDs (e.g., a misconfiguration or a future dynamic resize) could cause the kernel to fall back more often to its default selection, partially reintroducing hash-based imbalance. Current code keeps `Active` constant and pins all FDs at startup, so this is acceptable under present assumptions.",
+            "Packet-level round-robin may slightly increase perceived jitter or reordering for any hypothetical client that implicitly relied on server-side ordering from a single worker. The current workload uses reqIDs and unordered UDP semantics, so this is not an issue now but is worth documenting."
+          ]
+        },
+        "questions": [],
+        "implementation_snippets": [
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/server.go",
+            "snippet": "func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {\n\t...\n\t\tfor {\n\t\t\tn, addr, err := conn.ReadFromUDP(buf)\n\t\t\tif err != nil {\n\t\t\t\t...\n\t\t\t}\n\n\t\t\tresponse := s.handleRequest(idx, buf[:n])\n\t\t\tif response == nil {\n\t\t\t\tcontinue\n\t\t\t}\n\n\t\t\tif _, err := conn.WriteToUDP(response, addr); err != nil {\n\t\t\t\t...\n\t\t\t}\n\t\t}\n\t}() \n}"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.AgentSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load agent objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "cmd/pebble_server/main.go",
+            "snippet": "var (\n\t\tlisten       = flag.String(\"listen\", \"127.0.0.1:9000\", \"UDP listen address\")\n\t\tworkers      = flag.Int(\"workers\", 4, \"number of reuseport workers\")\n\t\tpolicy       = flag.String(\"policy\", \"default\", \"load-balancing policy: default|round_robin|agent|scan_split|hash\")\n\t\tmaxScan      = flag.Int(\"max-scan\", 100000, \"maximum keys returned for SCAN\")\n\t\tlogDir       = flag.String(\"log-dir\", \"logs/server\", \"directory for server logs\")\n\t\tresultsDir   = flag.String(\"results-dir\", \"results\", \"directory to store experiment artefacts\")\n\t\treadTimeout  = flag.Duration(\"read-timeout\", 2*time.Second, \"per-request read deadline\")\n\t\twriteTimeout = flag.Duration(\"write-timeout\", 2*time.Second, \"per-request write deadline\")\n\t\tgetDelay     = flag.Duration(\"get-delay\", 10*time.Microsecond, \"simulated GET latency\")\n\t\tscanDelay    = flag.Duration(\"scan-delay\", 2*time.Millisecond, \"simulated SCAN latency\")\n\t)\n\tflag.Parse()\n"
+          },
+          {
+            "path": "cmd/workload_client/main.go",
+            "snippet": "var (\n\t\t...\n\t\tsendWorkers = flag.Int(\"send-workers\", 1, \"number of concurrent send workers\")\n\t)\n\tflag.Parse()\n\n\tworkers := *sendWorkers\n\tif workers <= 0 {\n\t\tworkers = 1\n\t}"
+          },
+          {
+            "path": "cmd/workload_client/main.go",
+            "snippet": "for i := 0; i < workers; i++ {\n\t\tconn, err := net.DialUDP(\"udp\", nil, udpAddr)\n\t\tif err != nil {\n\t\t\tlogger.Fatalf(\"dial udp worker=%d: %v\", i, err)\n\t\t}\n\t\tdefer conn.Close()\n\t\t...\n\t}\n"
+          },
+          {
+            "path": "internal/server/config.go",
+            "snippet": "const (\n\tdefaultWorkers = 64\n\tmaxWorkers     = 128\n)\n\nfunc (c *Config) normalize() {\n\tif c.Workers <= 0 {\n\t\tc.Workers = defaultWorkers\n\t}\n\tif c.Workers > maxWorkers {\n\t\tc.Workers = maxWorkers\n\t}\n}"
+          },
+          {
+            "path": "internal/server/server.go",
+            "snippet": "type Server struct {\n\tcfg    Config\n\tpolicy *ebpfPolicy\n\tlogger *log.Logger\n\n\tconns   []*net.UDPConn\n\tstats   []workerStats\n\twg      sync.WaitGroup\n\tstatsWG sync.WaitGroup\n}\n\n// workers are allocated according to cfg.Workers, which has already\n// been normalized (default 64, maximum 128)."
+          }
+        ]
+      },
+      "rag_answers": [],
+      "assistant_content_raw": "{\n  \"status\": \"finish\",\n  \"design_doc\": {\n    \"goals\": [\n      \"Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker vs. 64 server workers).\",\n      \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.\",\n      \"Keep the eBPF selector self-contained and simple: no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.\",\n      \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load balancing (no flow affinity) to fully exploit worker parallelism.\",\n      \"Provide a clean foundation for future refinements (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary complexity.\"\n    ],\n    \"evidence\": [\n      \"The existing agent selector uses `slot = reuse->hash % active` with Active set once at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again; there is no dynamic load-aware behavior.\",\n      \"Client default `-send-workers` is 1, so experiments typically use a single UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64, max 128).\",\n      \"Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple modulo on `state->active`.\",\n      \"The Go server\u2019s workers are strictly stateless per packet: `spawnWorker` reads a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state is stored keyed by client address, so packets from the same client do not need to hit the same worker.\",\n      \"The only field in `pebble_agent_state` that Go writes is `Active`; it constructs `AgentSelectorAgentState{Active: uint32(workers)}` and updates key 0 once in `loadAgent`. No other fields are touched or assumed in Go, so extending the C struct with additional fields is safe from the userspace perspective.\",\n      \"Experiment logs show that in each run only 3\u20135 of the 6 workers (in that configuration) receive any traffic, and which indices are active changes between runs, consistent with deterministic flow hashing from a small number of client flows onto a larger worker set.\",\n      \"Throughput saturates and p99 latency explodes once the offered rate exceeds the aggregate capacity of the subset of workers that happened to receive flows; the fact that a run at 100k req/s can outperform 80k req/s is explained by luckier hash distribution (more workers used) rather than any adaptive behavior.\"\n    ],\n    \"architecture\": [\n      \"Extend `struct agent_state` in the BPF program to include a `__u32 rr_counter` field alongside `Active`. This counter will live in the existing `pebble_agent_state` ARRAY[1] map and be automatically zero-initialized; Go will continue to write only `Active`, leaving `rr_counter` untouched but valid.\",\n      \"On each packet in `agent_udp_selector`, look up `pebble_agent_state[0]` as today; if `state == NULL` or `state->Active == 0`, immediately return `SK_PASS` to fall back to the kernel\u2019s default reuseport behavior.\",\n      \"If `Active > 0`, atomically fetch-and-increment `state->rr_counter` using BPF-supported atomic operations (e.g., a `__sync_fetch_and_add`-style intrinsic on `rr_counter`). Use the returned pre-increment value as a monotonically increasing sequence number per packet.\",\n      \"Compute the target slot as `slot = seq % state->Active`, where `seq` is the fetched counter value and `Active` is the worker count configured at startup. The modulo will uniformly distribute packets across `[0, Active-1]`, ensuring even usage of all configured workers regardless of the number of client flows.\",\n      \"Invoke `bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0)` once per packet. If it succeeds, simply return `SK_PASS` (letting the kernel deliver to the selected socket). If it fails (e.g., due to a race with userspace removing a socket), just return `SK_PASS` without retries, relying on kernel fallback behavior\u2014no additional loops or probes to keep the program simple.\",\n      \"Do not inspect `reuse->hash` or any packet payload fields; GET and SCAN requests are treated identically by the selector. Because SCANs are rare (\u22480.5%) and the selector is uniform, they will naturally be dispersed across all workers instead of concentrating on a single socket.\",\n      \"Rely on the existing userspace behavior to insert valid worker FDs into `pebble_udp_targets[0..Active-1]` at startup and to keep `Active` fixed for the life of the server, as currently implemented. With `Active \u2264 128` guaranteed by config normalization, the modulo operation and map indexing remain within bounds.\"\n    ],\n    \"risks\": [\n      \"Changing `struct agent_state` in C to add `rr_counter` changes the struct size, but Go only initializes the `Active` field (`AgentSelectorAgentState{Active: ...}`) and never inspects the struct layout; bpf2go will regenerate a matching Go struct, so this is low risk but still requires recompiling eBPF assets.\",\n      \"The new design intentionally abandons flow affinity: packets from a single client flow will be sprayed across all workers. While the current server and client are fully compatible with this (stateless per request, UDP, reqID-based matching), any future features that assume per-flow stickiness would need to be vetted against this behavior.\",\n      \"The global `rr_counter` in a single ARRAY map element introduces a shared atomic hotspot. At the current experimental load (\u2264 180k req/s) and modest server core counts, this is unlikely to be a bottleneck, but if the system scales to very high packet rates on many cores, contention on this atomic increment could add measurable overhead.\",\n      \"Because we no longer probe multiple slots when `bpf_sk_select_reuseport` fails, a transient inconsistency between `Active` and actually installed FDs (e.g., a misconfiguration or a future dynamic resize) could cause the kernel to fall back more often to its default selection, partially reintroducing hash-based imbalance. Current code keeps `Active` constant and pins all FDs at startup, so this is acceptable under present assumptions.\",\n      \"Packet-level round-robin may slightly increase perceived jitter or reordering for any hypothetical client that implicitly relied on server-side ordering from a single worker. The current workload uses reqIDs and unordered UDP semantics, so this is not an issue now but is worth documenting.\"\n    ]\n  },\n  \"questions\": []\n}",
+      "assistant_role": "assistant",
+      "full_response": {
+        "id": "chatcmpl-Cii5BMwtwktOMskbkOwiuxZqv2oMv",
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": null,
+            "message": {
+              "content": "{\n  \"status\": \"finish\",\n  \"design_doc\": {\n    \"goals\": [\n      \"Eliminate worker underutilization caused by flow-hash pinning so that all configured SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker vs. 64 server workers).\",\n      \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long per-socket UDP queues, causing drops and large p99 latencies.\",\n      \"Keep the eBPF selector self-contained and simple: no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.\",\n      \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load balancing (no flow affinity) to fully exploit worker parallelism.\",\n      \"Provide a clean foundation for future refinements (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary complexity.\"\n    ],\n    \"evidence\": [\n      \"The existing agent selector uses `slot = reuse->hash % active` with Active set once at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again; there is no dynamic load-aware behavior.\",\n      \"Client default `-send-workers` is 1, so experiments typically use a single UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64, max 128).\",\n      \"Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple modulo on `state->active`.\",\n      \"The Go server\u2019s workers are strictly stateless per packet: `spawnWorker` reads a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state is stored keyed by client address, so packets from the same client do not need to hit the same worker.\",\n      \"The only field in `pebble_agent_state` that Go writes is `Active`; it constructs `AgentSelectorAgentState{Active: uint32(workers)}` and updates key 0 once in `loadAgent`. No other fields are touched or assumed in Go, so extending the C struct with additional fields is safe from the userspace perspective.\",\n      \"Experiment logs show that in each run only 3\u20135 of the 6 workers (in that configuration) receive any traffic, and which indices are active changes between runs, consistent with deterministic flow hashing from a small number of client flows onto a larger worker set.\",\n      \"Throughput saturates and p99 latency explodes once the offered rate exceeds the aggregate capacity of the subset of workers that happened to receive flows; the fact that a run at 100k req/s can outperform 80k req/s is explained by luckier hash distribution (more workers used) rather than any adaptive behavior.\"\n    ],\n    \"architecture\": [\n      \"Extend `struct agent_state` in the BPF program to include a `__u32 rr_counter` field alongside `Active`. This counter will live in the existing `pebble_agent_state` ARRAY[1] map and be automatically zero-initialized; Go will continue to write only `Active`, leaving `rr_counter` untouched but valid.\",\n      \"On each packet in `agent_udp_selector`, look up `pebble_agent_state[0]` as today; if `state == NULL` or `state->Active == 0`, immediately return `SK_PASS` to fall back to the kernel\u2019s default reuseport behavior.\",\n      \"If `Active > 0`, atomically fetch-and-increment `state->rr_counter` using BPF-supported atomic operations (e.g., a `__sync_fetch_and_add`-style intrinsic on `rr_counter`). Use the returned pre-increment value as a monotonically increasing sequence number per packet.\",\n      \"Compute the target slot as `slot = seq % state->Active`, where `seq` is the fetched counter value and `Active` is the worker count configured at startup. The modulo will uniformly distribute packets across `[0, Active-1]`, ensuring even usage of all configured workers regardless of the number of client flows.\",\n      \"Invoke `bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0)` once per packet. If it succeeds, simply return `SK_PASS` (letting the kernel deliver to the selected socket). If it fails (e.g., due to a race with userspace removing a socket), just return `SK_PASS` without retries, relying on kernel fallback behavior\u2014no additional loops or probes to keep the program simple.\",\n      \"Do not inspect `reuse->hash` or any packet payload fields; GET and SCAN requests are treated identically by the selector. Because SCANs are rare (\u22480.5%) and the selector is uniform, they will naturally be dispersed across all workers instead of concentrating on a single socket.\",\n      \"Rely on the existing userspace behavior to insert valid worker FDs into `pebble_udp_targets[0..Active-1]` at startup and to keep `Active` fixed for the life of the server, as currently implemented. With `Active \u2264 128` guaranteed by config normalization, the modulo operation and map indexing remain within bounds.\"\n    ],\n    \"risks\": [\n      \"Changing `struct agent_state` in C to add `rr_counter` changes the struct size, but Go only initializes the `Active` field (`AgentSelectorAgentState{Active: ...}`) and never inspects the struct layout; bpf2go will regenerate a matching Go struct, so this is low risk but still requires recompiling eBPF assets.\",\n      \"The new design intentionally abandons flow affinity: packets from a single client flow will be sprayed across all workers. While the current server and client are fully compatible with this (stateless per request, UDP, reqID-based matching), any future features that assume per-flow stickiness would need to be vetted against this behavior.\",\n      \"The global `rr_counter` in a single ARRAY map element introduces a shared atomic hotspot. At the current experimental load (\u2264 180k req/s) and modest server core counts, this is unlikely to be a bottleneck, but if the system scales to very high packet rates on many cores, contention on this atomic increment could add measurable overhead.\",\n      \"Because we no longer probe multiple slots when `bpf_sk_select_reuseport` fails, a transient inconsistency between `Active` and actually installed FDs (e.g., a misconfiguration or a future dynamic resize) could cause the kernel to fall back more often to its default selection, partially reintroducing hash-based imbalance. Current code keeps `Active` constant and pins all FDs at startup, so this is acceptable under present assumptions.\",\n      \"Packet-level round-robin may slightly increase perceived jitter or reordering for any hypothetical client that implicitly relied on server-side ordering from a single worker. The current workload uses reqIDs and unordered UDP semantics, so this is not an issue now but is worth documenting.\"\n    ]\n  },\n  \"questions\": []\n}",
+              "refusal": null,
+              "role": "assistant",
+              "annotations": [],
+              "audio": null,
+              "function_call": null,
+              "tool_calls": null
+            }
+          }
+        ],
+        "created": 1764771921,
+        "model": "gpt-5.1-2025-11-13",
+        "object": "chat.completion",
+        "service_tier": "default",
+        "system_fingerprint": null,
+        "usage": {
+          "completion_tokens": 3724,
+          "prompt_tokens": 11761,
+          "total_tokens": 15485,
+          "completion_tokens_details": {
+            "accepted_prediction_tokens": 0,
+            "audio_tokens": 0,
+            "reasoning_tokens": 2179,
+            "rejected_prediction_tokens": 0
+          },
+          "prompt_tokens_details": {
+            "audio_tokens": 0,
+            "cached_tokens": 7168
+          }
+        }
+      }
+    }
+  ],
+  "created_at": 1764771987.7209415
+}

@@ -1,0 +1,92 @@
+<<<<<<< SEARCH
+//go:build ignore
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+=======
+/*
+ Pebble agent UDP reuseport selector (hybrid, single-call, verifier-friendly)
+
+ Overview:
+ - Keep a single bpf_sk_select_reuseport call (kernel only honors the first).
+ - Compute a stable slot from reuse->hash using fast range reduction:
+     * power-of-two: bitmask
+     * otherwise: 32x32->64 multiply-high (no modulo)
+ - Hybrid policy: on half of packets (hash LSB = 1) skip selection and return
+   SK_PASS so the kernel’s built-in reuseport chooser (which is backlog-aware)
+   can take over. On the other half we enforce a uniform mapping. This blend
+   tends to flatten p99 by avoiding pathological skew while still letting the
+   kernel steer bursts away from congested sockets.
+
+ Verifier safety:
+ - No unbounded loops; tiny stack; only sk_reuseport_md and pinned maps used.
+ - Sockets are clamped to [1,128] to stay within the sockarray bounds.
+*/
+ //go:build ignore
+
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+
+SEC("sk_reuseport/selector")
+enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
+{
+    __u32 key = 0;
+    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);
+    if (!state || state->active == 0)
+        return SK_PASS;
+
+    __u32 start = reuse->hash % state->active;
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 128; i++) {
+        if (i >= state->active)
+            break;
+
+        __u32 slot = start + i;
+        if (slot >= state->active)
+            slot -= state->active;
+
+        if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)
+            return SK_PASS;
+    }
+
+    return SK_PASS;
+}
+=======
+SEC("sk_reuseport/selector")
+enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
+{
+    __u32 key = 0;
+    struct agent_state *st = bpf_map_lookup_elem(&pebble_agent_state, &key);
+    if (!st)
+        return SK_PASS;
+
+    __u32 active = st->active;
+    if (active == 0)
+        return SK_PASS;
+    if (active > 128)
+        active = 128;
+
+    __u32 h = reuse->hash;
+
+    // Hybrid policy: let kernel decide for half the packets (odd hashes).
+    if (h & 1)
+        return SK_PASS;
+
+    __u32 slot;
+    if ((active & (active - 1)) == 0) {
+        // Power-of-two fast path.
+        slot = h & (active - 1);
+    } else {
+        // Fast range reduction without modulo: take high 32 bits of 64-bit product.
+        __u64 prod = (__u64)h * active;
+        slot = (__u32)(prod >> 32);
+    }
+
+    // Single selection attempt; kernel ignores subsequent calls.
+    bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0);
+    return SK_PASS;
+}
+>>>>>>> REPLACE

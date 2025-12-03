@@ -1,0 +1,16 @@
+**Behavior & Performance**  
+- Low load improved as expected: p99 dropped to 3.0 ms@50 kpps and 4.4 ms@60 kpps (vs 5.1 ms and 18.8 ms in the parent) because the new `agent_udp_selector` hashes once and avoids the giant 128-iteration loop, shrinking I-cache pressure while still updating the same reuseport state (`internal/server/ebpf.go:124-135`).  
+- From 80 kpps up, throughput collapsed because most workers never saw traffic. During the 80 kpps run, the server log only reports workers 0/2/3 handling requests (~61 k gets+scans/s total) while workers 1,4,5 stay idle (`results/run-20251113-173854/server.log`), so the 80 kpps client stream immediately builds a 134 k response deficit and ends with p99 = 4.85 s plus a “134881 responses missing” warning (`results/run-20251113-173854/client.log`).  
+- At 100 kpps, five workers were used, giving ~94 k gets/s before saturating; outstanding requests still climbed to 36 k (client log), leaving p99 stuck at 680 ms despite being slightly better than the parent’s 750 ms because fewer workers starved in that run (`results/run-20251113-173914/{server,client}.log`).  
+- The 140 kpps run regressed worst: only workers 1/3/4 processed traffic (~72 k gets/s total) while the client accumulated 559 k missing replies, pushing p99 to 7.78 s (`results/run-20251113-173933/{server,client}.log`).  
+- Root cause is visible across logs: `cmd/workload_client` opens only `send_workers=7` UDP flows (`cmd/workload_client/main.go:175-218`), and the new selector deterministically maps each flow to a single slot with at most two adjacent fallbacks. Once a handful of hashes land on the same sockets, no mechanism rebalances to idle sockets, so aggregate capacity is capped by those few busy workers even though the reuseport map still advertises six active FDs.  
+Confidence: Medium (behavior is clear from logs, but the exact hash-to-socket mapping inside the kernel can’t be inspected directly here).
+
+**Intent Alignment**  
+- Inferred intent: keep the prior policy’s “hash -> worker” steering but make the eBPF program tiny while still spreading load across all active sockets for fairness/locality.  
+- Success at light load: uniformity was “good enough” so latency improved due to the smaller hot path.  
+- Failure at higher load: repeated runs show only 3–5 of the 6 workers ever receive packets, so long GET/SCAN queues build on those sockets while the rest are idle, contradicting the intent to keep distribution even; the severe p99 blow-ups at 80 kpps and 140 kpps (4.85 s and 7.78 s vs the parent’s 11.7 ms and 3.97 s) demonstrate that the policy no longer meets its goal once offered load exceeds what those few workers can deliver.  
+
+**Uncertainties**  
+- No direct visibility into the reuseport hash values or the `pebble_agent_state` map at runtime; the analysis assumes they stayed at the configured worker count based on `internal/server/ebpf.go:124-135`.  
+- The provided instructions state `bpf_sk_select_reuseport` never fails, so if helper back-pressure actually occurs in practice we cannot confirm it from the supplied artifacts.

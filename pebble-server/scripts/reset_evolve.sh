@@ -8,7 +8,7 @@ cp ebpf/agent_backup.c ebpf/agent.c
 rm -rf results/*
 
 # Remove all contents inside openevolve_output (if it exists)
-rm -rf openevolve_output/*
+rm -rf new_evolve_output/*
 
 # Kill any python3 process running openevolve-run.py, regardless of intermediate path, using SIGKILL (-9)
 pkill -9 -f 'python3.*openevolve-run\.py' || true

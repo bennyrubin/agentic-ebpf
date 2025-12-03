@@ -1,0 +1,9 @@
+[client] 2025/12/01 20:53:57.765989 starting workload server=127.0.0.1:9000 duration=7s rate=140000.00 get_frac=0.99
+[client] 2025/12/01 20:53:58.766489 outstanding=10032 sent=139194 recv=129162
+[client] 2025/12/01 20:53:59.767282 outstanding=21568 sent=276947 recv=255379
+[client] 2025/12/01 20:54:00.766483 outstanding=30301 sent=412675 recv=382374
+[client] 2025/12/01 20:54:01.766484 outstanding=45816 sent=552198 recv=506382
+[client] 2025/12/01 20:54:02.766500 outstanding=55837 sent=688879 recv=633042
+[client] 2025/12/01 20:54:03.766484 outstanding=66499 sent=827102 recv=760603
+[client] 2025/12/01 20:54:04.766492 outstanding=79835 sent=966738 recv=886903
+[client] 2025/12/01 20:54:07.767628 sent=966738 recv=966738

@@ -1,0 +1,195 @@
+{
+  "iterations": [
+    {
+      "iteration": 0,
+      "idea_payload": {
+        "status": "continue",
+        "design_doc": {
+          "goals": [
+            "Eliminate hot-spotting caused by static per-flow hashing so that small numbers of client flows do not collapse onto a subset of reuseport workers.",
+            "Drive all configured reuseport workers toward similar load to better utilize available CPU capacity and increase sustainable throughput near the CPU limit.",
+            "Reduce tail latency under overload by distributing backlog more evenly across workers, without attempting to exceed the underlying CPU-bound service capacity.",
+            "Keep the selector implementation simple and self-contained inside the AgentUDPSelector program, using only existing maps (pebble_udp_targets and pebble_agent_state) and without any new user-space configuration."
+          ],
+          "evidence": [
+            "Per the logs, as offered load increases, only a subset of the 6 workers show non-zero traffic in a given second (e.g., all 6 at 50k, ~3\u20134 at 80\u2013140k), consistent with a few client flows being pinned to a few worker indices by hash % active.",
+            "The current agent_udp_selector is static: it computes start = reuse->hash % state->active and passes that single slot into bpf_sk_select_reuseport, so each 4\u2011tuple is effectively stuck on one worker for the whole run.",
+            "Server throughput plateaus around 75\u201385k req/s for 100k and 140k offered load, while avg_get and avg_scan stay near the synthetic delays, indicating CPU-bound service with significant queuing but no per-request slowdown.",
+            "Client-side p99 latency explodes (to seconds) and many responses go missing at 100k/140k, behavior expected from an open-loop overload with growing per-socket queues on hot workers and idle capacity on cold workers.",
+            "Workload composition (~99\u201399.5% short GETs, ~0.5\u20131% long SCANs) yields an average CPU cost of roughly tens of microseconds per request, so the main lever for eBPF is balancing that work across workers, not reducing per-request cost."
+          ],
+          "architecture": [
+            "Replace the per-flow hash-based sharding with a simple global per-packet round-robin across all active reuseport slots: store an atomic counter in pebble_agent_state, increment it on each packet, and select slot = counter % state->active.",
+            "Use pebble_udp_targets only as the backing sockarray for bpf_sk_select_reuseport; call the helper once with the chosen round-robin slot and fall back to SK_PASS if it fails, leaving all dynamic behavior inside AgentUDPSelector.",
+            "For this first iteration, do not attempt to classify GET vs SCAN or observe queue depth; all packets are balanced identically, focusing solely on eliminating 4\u2011tuple pinning and equalizing load across workers with minimal logic."
+          ],
+          "risks": [
+            "Assumes that updating a shared counter inside pebble_agent_state (likely via an atomic XADD on a map value) is allowed and performant in sk_reuseport programs on the target kernel; if not, a different stateless balancing scheme (e.g., time-based jitter) will be required.",
+            "Assumes user space only relies on the existing 'active' field in pebble_agent_state and will tolerate extending the struct to include a counter (and possibly padding), so that Go bindings and BPF stay in sync.",
+            "Assumes the number of client send workers (and thus distinct 4\u2011tuples) is relatively small compared to the number of server workers, so per-packet balancing provides a clear benefit over per-flow hashing; if there are already many flows, gains may be modest.",
+            "Assumes that the application semantics do not require flow affinity or in-order processing per 4\u2011tuple; with UDP request/response and no connection-specific state, striping packets from the same client flow across workers should be safe but needs to be double-checked.",
+            "Assumes the additional per-packet map lookup and atomic increment overhead inside eBPF is negligible compared to user-space busy-wait costs; if it proves significant, we may need to optimize further (e.g., per-CPU state or reduced helper usage)."
+          ]
+        },
+        "questions": [
+          "In the scripts that invoke cmd/workload_client (run.sh and/or workload/run_client.sh), what value is passed for the send-workers flag (e.g., -w) in the agent-* experiments, i.e., how many UDPConns / client flows are actually used?",
+          "In internal/server/ebpf.go, specifically in loadAgent and any related setup code, how is the pebble_agent_state map initialized from Go (which fields are written, and with what struct type)? Please show the relevant code.",
+          "Is there an existing round-robin-style eBPF selector program in the repository (e.g., an rr policy under ebpf/)? If so, please provide its C source file so we can reuse its patterns for safe counters and helper usage.",
+          "Do any of the existing eBPF selector programs in ebpf/ (such as scan_split or hash variants) read the UDP payload via sk_reuseport_md->data / data_end? If yes, please show a representative code snippet demonstrating this access pattern.",
+          "What is the generated Go definition (in internal/ebpfutil/*agentselector*_bpf.go or similar) for the value type of the pebble_agent_state map (field names and types), so we can understand current struct layout and compatibility constraints when extending it?"
+        ]
+      },
+      "rag_answers": [
+        {
+          "question": "In the scripts that invoke cmd/workload_client (run.sh and/or workload/run_client.sh), what value is passed for the send-workers flag (e.g., -w) in the agent-* experiments, i.e., how many UDPConns / client flows are actually used?",
+          "answer": {
+            "answer": "In workload/run_client.sh the default value for the send-workers flag (-w) is 1, so the agent-* experiments use a single send worker, meaning only one UDPConn / client flow is actually used unless -w is explicitly overridden on the command line.",
+            "code_snippets": [
+              {
+                "path": "workload/run_client.sh",
+                "snippet": "SEND_WORKERS=1\n\nusage() {\n  cat <<USAGE\nUsage: $0 [options]\n  ...\n  -w <workers>    concurrent send workers (default: $SEND_WORKERS)\nUSAGE\n}\n\nwhile getopts \":s:t:r:g:m:k:N:l:w:\" opt; do\n  case \"$opt\" in\n    ...\n    w) SEND_WORKERS=\"$OPTARG\" ;;\n  esac\ndone"
+              },
+              {
+                "path": "cmd/workload_client/main.go",
+                "snippet": "var (\n\t\t...\n\t\tsendWorkers = flag.Int(\"send-workers\", 1, \"number of concurrent send workers\")\n\t)\n\tflag.Parse()\n\n\tworkers := *sendWorkers\n\tif workers <= 0 {\n\t\tworkers = 1\n\t}\n\t...\n\tconn, err := net.DialUDP(\"udp\", nil, udpAddr)\n\t\t...\n\t\tgo func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\n\t\t\tdefer sendWG.Done()\n\t\t\tbuf := make([]byte, 0, 256)\n\t\t\tfor {\n\t\t\t\tif err := limiter.Wait(ctx); err != nil {\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\t...\n\t\t\t\tif _, err := conn.Write(payload); err != nil {\n\t\t\t\t\t...\n\t\t\t\t}\n\t\t\t\t...\n\t\t\t}\n\t\t}(workerID, conn, rng)"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In internal/server/ebpf.go, specifically in loadAgent and any related setup code, how is the pebble_agent_state map initialized from Go (which fields are written, and with what struct type)? Please show the relevant code.",
+          "answer": {
+            "answer": "The `pebble_agent_state` map is initialized in Go by writing a single entry (key 0) of type `ebpfutil.AgentSelectorAgentState`. Only the `Active` field of that struct is set, and it is set to the configured number of workers (cast to `uint32`). The struct value is then written into the `PebbleAgentState` map using `Update` with `ebpf.UpdateAny`:\n\n- A `uint32` key is created and set to 0.\n- An `ebpfutil.AgentSelectorAgentState` value is created with its `Active` field set to `uint32(workers)`.\n- If `objs.PebbleAgentState` is non-nil, `Update(&key, &state, ebpf.UpdateAny)` is called to store this struct in the map.\n\nRelevant code (including the surrounding setup):",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.AgentSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load agent objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "type ebpfPolicy struct {\n\tname    string\n\tprogram *ebpf.Program\n\tclose   func() error\n}\n\nconst defaultPinBase = \"/sys/fs/bpf\"\n\nfunc pinDirectory() string {\n\tif path := os.Getenv(\"BPF_PIN_PATH\"); path != \"\" {\n\t\treturn path\n\t}\n\tif base := os.Getenv(\"BPF_PIN_BASE\"); base != \"\" {\n\t\treturn base\n\t}\n\treturn defaultPinBase\n}\n\nfunc ensurePinDirectory(path string) error {\n\treturn os.MkdirAll(path, 0o755)\n}\n\nfunc ensureRlimit() error {\n\tif err := rlimit.RemoveMemlock(); err != nil {\n\t\treturn fmt.Errorf(\"adjust memlock: %w\", err)\n\t}\n\treturn nil\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "Is there an existing round-robin-style eBPF selector program in the repository (e.g., an rr policy under ebpf/)? If so, please provide its C source file so we can reuse its patterns for safe counters and helper usage.",
+          "answer": {
+            "answer": "Yes, there is an existing round-robin-style eBPF selector in the repository. The server code loads it via the `ebpfutil.RrSelectorObjects` collection and uses the `RrUdpSelector` program together with the `PebbleRrState` map to manage a round\u2011robin state (including a counter and active worker count). The Go loader for this policy is implemented in the `loadRoundRobin` function, which configures the state map and attaches the round\u2011robin eBPF program. However, the snippet provided only shows the Go-side loader and does not include the C source file for the eBPF program itself. To reuse its patterns for safe counters and helper usage, you would need to locate the C file that corresponds to the `RrSelectorObjects`/`RrUdpSelector` (typically generated into `internal/ebpfutil` from a `.c` source under an eBPF directory in the repo).",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadRoundRobin(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.RrSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadRrSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load round robin objects: %w\", err)\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.RrSelectorRrState{}\n\tif err := objs.PebbleRrState.Lookup(&key, &state); err != nil {\n\t\tstate.Active = uint32(workers)\n\t\tstate.Counter = 0\n\t} else {\n\t\tstate.Active = uint32(workers)\n\t}\n\tif err := objs.PebbleRrState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure round robin state: %w\", err)\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"round_robin\",\n\t\tprogram: objs.RrUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {\n\tswitch policy {\n\tcase \"default\", \"\":\n\t\treturn &ebpfPolicy{name: \"default\"}, nil\n\tcase \"round_robin\":\n\t\treturn loadRoundRobin(workers)\n\tcase \"agent\":\n\t\treturn loadAgent(workers)\n\tcase \"scan_split\":\n\t\treturn loadScanSplit(workers)\n\tcase \"hash\":\n\t\treturn loadHash(workers)\n\tdefault:\n\t\treturn nil, ErrInvalidConfig(fmt.Sprintf(\"unknown policy %q\", policy))\n\t}\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "Do any of the existing eBPF selector programs in ebpf/ (such as scan_split or hash variants) read the UDP payload via sk_reuseport_md->data / data_end? If yes, please show a representative code snippet demonstrating this access pattern.",
+          "answer": {
+            "answer": "Yes. The existing selector programs for both the scan_split and hash variants read from the UDP payload using the sk_reuseport_md data/data_end pointers. They first compute the payload start from the socket metadata, then perform bounds checks before reading fields from the payload. A representative pattern is:\n\n- Cast `ctx->data` / `ctx->data_end` to `void *` pointers\n- Compute the payload start/end (e.g., skipping headers or directly using them as-is)\n- Check `(void *)(payload + sizeof(struct your_hdr)) <= data_end`\n- Safely read the payload bytes used for selection.\n\nA simplified representative snippet from an eBPF selector program looks like this:\n\n```c\nSEC(\"sk_reuseport/udp_selector\")\nint selector_prog(struct sk_reuseport_md *ctx) {\n    void *data     = (void *)(long)ctx->data;\n    void *data_end = (void *)(long)ctx->data_end;\n\n    // Example: ensure we can read a fixed-size header from the UDP payload\n    struct req_hdr *hdr = data;\n    if ((void *)(hdr + 1) > data_end) {\n        // Payload too short, fall back to default\n        return SK_DROP; // or SK_PASS / SK_REUSEPORT_SELECT_OR_STAY, etc.\n    }\n\n    // Safely use fields from the UDP payload\n    __u8 req_type = hdr->type;   // e.g., GET vs SCAN\n    __u64 req_id  = hdr->id;\n\n    // Use payload-derived fields to choose a worker index\n    __u32 worker = req_id % MAX_WORKERS;\n\n    return worker;\n}\n```\n\nBoth the hash-based selector and the scan_split selector follow this same pattern of reading request metadata directly from the UDP payload via `ctx->data`/`ctx->data_end` with explicit bounds checks before dereferencing.",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadScanSplit(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar objs ebpfutil.ScanSplitSelectorObjects\n\t...\n\treturn &ebpfPolicy{\n\t\tname:    \"scan_split\",\n\t\tprogram: objs.SplitUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadHash(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar objs ebpfutil.HashSelectorObjects\n\t...\n\treturn &ebpfPolicy{\n\t\tname:    \"hash\",\n\t\tprogram: objs.HashUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "What is the generated Go definition (in internal/ebpfutil/*agentselector*_bpf.go or similar) for the value type of the pebble_agent_state map (field names and types), so we can understand current struct layout and compatibility constraints when extending it?",
+          "answer": {
+            "answer": "The value type for the `pebble_agent_state` map is the Go struct `ebpfutil.AgentSelectorAgentState`. From its usage when updating the map, this struct currently has a single field:\n\n- `Active uint32`\n\nThis is shown where a value is prepared for `PebbleAgentState.Update`:\n\n```go\nstate := ebpfutil.AgentSelectorAgentState{\n    Active: uint32(workers),\n}\n```\n\nSince only this field is set and passed directly as the map value, the current layout of the `pebble_agent_state` map value is a struct containing one 32\u2011bit unsigned integer field named `Active`. Any extension of this struct in the BPF side must remain compatible with this existing layout (i.e., keep `Active` as the first `uint32` field).",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "var key uint32 = 0\nstate := ebpfutil.AgentSelectorAgentState{\n\tActive: uint32(workers),\n}\nif objs.PebbleAgentState != nil {\n\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t}\n}"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "iteration": 1,
+      "idea_payload": {
+        "status": "finish",
+        "design_doc": {
+          "goals": [
+            "Remove dependence on kernel per-flow hashing so that even a very small number of client flows (down to a single UDPConn) are spread across all reuseport workers, avoiding hot-spotting.",
+            "Achieve roughly even per-worker request rates so aggregate CPU capacity is utilized up to the true service ceiling (~80k req/s in the current setup).",
+            "Reduce queueing and tail latency under overload by equalizing backlog across workers, without introducing user-space coordination or configuration beyond the existing Active field.",
+            "Keep the AgentUDPSelector program simple and self-contained, using only pebble_udp_targets and pebble_agent_state, with minimal additional state (one global counter) and no new maps."
+          ],
+          "evidence": [
+            "The current AgentUDPSelector uses reuse->hash % state->active to pick a single slot, and bpf_sk_select_reuseport is only called for that slot; thus each 4\u2011tuple is pinned to a worker for the entire run.",
+            "The client workload uses a very small number of flows; workload/run_client.sh defaults to one send worker (-w 1), so in the absence of overrides, only one UDPConn / 4\u2011tuple is active. Even if -w is occasionally increased, the number of flows remains small relative to 6 server workers.",
+            "Server logs show that only a subset of workers receive traffic at higher loads (e.g., fewer than 6 workers active per second in many intervals), which matches expectations for static hashing of a small flow set onto 6 buckets.",
+            "Throughput plateaus at ~75\u201385k req/s while avg_get and avg_scan match the synthetic delays, indicating CPU-bound service; the main inefficiency is uneven distribution of that load across workers, not per-request cost.",
+            "Client-side p99 latency grows to seconds and many requests time out or are dropped at 100k/140k req/s, consistent with long per-socket queues on a few hot workers while other workers remain underutilized."
+          ],
+          "architecture": [
+            "Extend the pebble_agent_state value to hold both Active (existing uint32) and a 32\u2011bit global counter; keep Active as the first field so Go\u2019s AgentSelectorAgentState remains compatible and only needs a regenerated definition.",
+            "On each packet, AgentUDPSelector looks up key 0 in pebble_agent_state, atomically increments the counter, and selects slot = counter % Active; it then calls bpf_sk_select_reuseport once with that slot and falls back to SK_PASS if the helper fails.",
+            "This implements simple per-packet round-robin across the Active worker range, eliminating 4\u2011tuple pinning while relying solely on existing maps and a single shared counter, with no payload parsing or additional heuristics."
+          ],
+          "risks": [
+            "Atomic updates on a map value from an sk_reuseport program must be verifier- and kernel-compatible; the existing round_robin policy (RrUdpSelector + PebbleRrState) strongly suggests this is feasible, but the exact atomic pattern used there will need to be mirrored in AgentUDPSelector at implementation time.",
+            "Regenerating eBPF assets will change the Go definition of AgentSelectorAgentState from a single-field struct (Active uint32) to a multi-field struct; existing Go code only sets Active, so the new counter field will rely on zero-initialization, which should be safe but must be confirmed after regeneration.",
+            "Per-packet round-robin breaks any implicit per-flow ordering guarantees: responses for a single client flow may now be served by different workers and arrive out of order; the current UDP + reqID design appears tolerant of this, but other potential consumers of this selector might not be.",
+            "The small amount of added work per packet (one extra map value field and an atomic increment) is expected to be negligible compared to the 10\u00b5s/2ms busy-wait in user space, but on very fast real backends this overhead could become non-trivial and may then need optimization (e.g., weaker consistency or per-CPU patterns).",
+            "If future workloads use very many independent flows, plain per-packet round-robin might not outperform a good per-flow hash (which can have better cache locality and fewer cross-worker effects); however, for the current benchmark with few flows, the design directly targets the dominant imbalance."
+          ]
+        },
+        "questions": [],
+        "implementation_snippets": [
+          {
+            "path": "workload/run_client.sh",
+            "snippet": "SEND_WORKERS=1\n\nusage() {\n  cat <<USAGE\nUsage: $0 [options]\n  ...\n  -w <workers>    concurrent send workers (default: $SEND_WORKERS)\nUSAGE\n}\n\nwhile getopts \":s:t:r:g:m:k:N:l:w:\" opt; do\n  case \"$opt\" in\n    ...\n    w) SEND_WORKERS=\"$OPTARG\" ;;\n  esac\ndone"
+          },
+          {
+            "path": "cmd/workload_client/main.go",
+            "snippet": "var (\n\t\t...\n\t\tsendWorkers = flag.Int(\"send-workers\", 1, \"number of concurrent send workers\")\n\t)\n\tflag.Parse()\n\n\tworkers := *sendWorkers\n\tif workers <= 0 {\n\t\tworkers = 1\n\t}\n\t...\n\tconn, err := net.DialUDP(\"udp\", nil, udpAddr)\n\t\t...\n\t\tgo func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\n\t\t\tdefer sendWG.Done()\n\t\t\tbuf := make([]byte, 0, 256)\n\t\t\tfor {\n\t\t\t\tif err := limiter.Wait(ctx); err != nil {\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t\t...\n\t\t\t\tif _, err := conn.Write(payload); err != nil {\n\t\t\t\t\t...\n\t\t\t\t}\n\t\t\t\t...\n\t\t\t}\n\t\t}(workerID, conn, rng)"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.AgentSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load agent objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "type ebpfPolicy struct {\n\tname    string\n\tprogram *ebpf.Program\n\tclose   func() error\n}\n\nconst defaultPinBase = \"/sys/fs/bpf\"\n\nfunc pinDirectory() string {\n\tif path := os.Getenv(\"BPF_PIN_PATH\"); path != \"\" {\n\t\treturn path\n\t}\n\tif base := os.Getenv(\"BPF_PIN_BASE\"); base != \"\" {\n\t\treturn base\n\t}\n\treturn defaultPinBase\n}\n\nfunc ensurePinDirectory(path string) error {\n\treturn os.MkdirAll(path, 0o755)\n}\n\nfunc ensureRlimit() error {\n\tif err := rlimit.RemoveMemlock(); err != nil {\n\t\treturn fmt.Errorf(\"adjust memlock: %w\", err)\n\t}\n\treturn nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadRoundRobin(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.RrSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadRrSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load round robin objects: %w\", err)\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.RrSelectorRrState{}\n\tif err := objs.PebbleRrState.Lookup(&key, &state); err != nil {\n\t\tstate.Active = uint32(workers)\n\t\tstate.Counter = 0\n\t} else {\n\t\tstate.Active = uint32(workers)\n\t}\n\tif err := objs.PebbleRrState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure round robin state: %w\", err)\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"round_robin\",\n\t\tprogram: objs.RrUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {\n\tswitch policy {\n\tcase \"default\", \"\":\n\t\treturn &ebpfPolicy{name: \"default\"}, nil\n\tcase \"round_robin\":\n\t\treturn loadRoundRobin(workers)\n\tcase \"agent\":\n\t\treturn loadAgent(workers)\n\tcase \"scan_split\":\n\t\treturn loadScanSplit(workers)\n\tcase \"hash\":\n\t\treturn loadHash(workers)\n\tdefault:\n\t\treturn nil, ErrInvalidConfig(fmt.Sprintf(\"unknown policy %q\", policy))\n\t}\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadScanSplit(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar objs ebpfutil.ScanSplitSelectorObjects\n\t...\n\treturn &ebpfPolicy{\n\t\tname:    \"scan_split\",\n\t\tprogram: objs.SplitUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadHash(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar objs ebpfutil.HashSelectorObjects\n\t...\n\treturn &ebpfPolicy{\n\t\tname:    \"hash\",\n\t\tprogram: objs.HashUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "var key uint32 = 0\nstate := ebpfutil.AgentSelectorAgentState{\n\tActive: uint32(workers),\n}\nif objs.PebbleAgentState != nil {\n\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t}\n}"
+          }
+        ]
+      },
+      "rag_answers": []
+    }
+  ]
+}

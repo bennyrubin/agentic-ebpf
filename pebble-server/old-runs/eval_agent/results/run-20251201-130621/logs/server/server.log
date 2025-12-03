@@ -1,0 +1,4 @@
+2025/12/01 13:06:22.044991 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10µs scan_delay=2ms pprof=127.0.0.1:6060
+2025/12/01 13:06:24.043660 server stopped
+2025/12/01 13:06:24.198819 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10µs scan_delay=2ms pprof=127.0.0.1:6060
+2025/12/01 13:06:26.238383 server stopped

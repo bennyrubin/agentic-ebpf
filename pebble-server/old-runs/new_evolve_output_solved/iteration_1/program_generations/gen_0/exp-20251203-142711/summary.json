@@ -1,0 +1,130 @@
+{
+  "metadata": {
+    "experiment_id": "exp-20251203-142711",
+    "created_at": "2025-12-03T14:27:11.519339",
+    "threads": 6,
+    "iterations_per_run": 1,
+    "policies": [
+      "agent"
+    ],
+    "rates": [
+      80000,
+      100000,
+      140000,
+      160000,
+      180000
+    ],
+    "duration": 7,
+    "send_workers": 7,
+    "server_cores": 6,
+    "client_cores": 7,
+    "get_delay": null,
+    "scan_delay": null,
+    "plots": {
+      "overall_p99_vs_rate": "overall_p99_vs_rate.png",
+      "get_scan_p99_vs_rate": "get_scan_p99_vs_rate.png"
+    }
+  },
+  "records": [
+    {
+      "policy": "agent",
+      "rate": 80000,
+      "overall_latency_p99_avg_ms": 3.605,
+      "overall_latency_p99_stddev_ms": 0.0,
+      "overall_latency_p99_iterations_ms": [
+        3.605
+      ],
+      "get_latency_p99_avg_ms": 3.567,
+      "get_latency_p99_stddev_ms": 0.0,
+      "get_latency_p99_iterations_ms": [
+        3.567
+      ],
+      "scan_latency_p99_avg_ms": 5.448,
+      "scan_latency_p99_stddev_ms": 0.0,
+      "scan_latency_p99_iterations_ms": [
+        5.448
+      ],
+      "run_dir": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/results/run-20251203-142711"
+    },
+    {
+      "policy": "agent",
+      "rate": 100000,
+      "overall_latency_p99_avg_ms": 4.271,
+      "overall_latency_p99_stddev_ms": 0.0,
+      "overall_latency_p99_iterations_ms": [
+        4.271
+      ],
+      "get_latency_p99_avg_ms": 4.24,
+      "get_latency_p99_stddev_ms": 0.0,
+      "get_latency_p99_iterations_ms": [
+        4.24
+      ],
+      "scan_latency_p99_avg_ms": 6.252,
+      "scan_latency_p99_stddev_ms": 0.0,
+      "scan_latency_p99_iterations_ms": [
+        6.252
+      ],
+      "run_dir": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/results/run-20251203-142726"
+    },
+    {
+      "policy": "agent",
+      "rate": 140000,
+      "overall_latency_p99_avg_ms": 14.558,
+      "overall_latency_p99_stddev_ms": 0.0,
+      "overall_latency_p99_iterations_ms": [
+        14.558
+      ],
+      "get_latency_p99_avg_ms": 14.546,
+      "get_latency_p99_stddev_ms": 0.0,
+      "get_latency_p99_iterations_ms": [
+        14.546
+      ],
+      "scan_latency_p99_avg_ms": 16.114,
+      "scan_latency_p99_stddev_ms": 0.0,
+      "scan_latency_p99_iterations_ms": [
+        16.114
+      ],
+      "run_dir": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/results/run-20251203-142741"
+    },
+    {
+      "policy": "agent",
+      "rate": 160000,
+      "overall_latency_p99_avg_ms": 547.513,
+      "overall_latency_p99_stddev_ms": 0.0,
+      "overall_latency_p99_iterations_ms": [
+        547.513
+      ],
+      "get_latency_p99_avg_ms": 547.516,
+      "get_latency_p99_stddev_ms": 0.0,
+      "get_latency_p99_iterations_ms": [
+        547.516
+      ],
+      "scan_latency_p99_avg_ms": 542.297,
+      "scan_latency_p99_stddev_ms": 0.0,
+      "scan_latency_p99_iterations_ms": [
+        542.297
+      ],
+      "run_dir": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/results/run-20251203-142756"
+    },
+    {
+      "policy": "agent",
+      "rate": 180000,
+      "overall_latency_p99_avg_ms": 1511.972,
+      "overall_latency_p99_stddev_ms": 0.0,
+      "overall_latency_p99_iterations_ms": [
+        1511.972
+      ],
+      "get_latency_p99_avg_ms": 1511.95,
+      "get_latency_p99_stddev_ms": 0.0,
+      "get_latency_p99_iterations_ms": [
+        1511.95
+      ],
+      "scan_latency_p99_avg_ms": 1519.011,
+      "scan_latency_p99_stddev_ms": 0.0,
+      "scan_latency_p99_iterations_ms": [
+        1519.011
+      ],
+      "run_dir": "/home/benny/evolve_agent/agentic-ebpf/pebble-server/results/run-20251203-142811"
+    }
+  ]
+}

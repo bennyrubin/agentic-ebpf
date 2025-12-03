@@ -41,12 +41,13 @@ CLIENT_LOG_RELATIVE = Path("logs") / "client.log"
 SUMMARY_PATTERN = re.compile(r"Wrote experiment summary:\s*(.+)")
 
 DEFAULT_POLICY = "agent"
-DEFAULT_RATES: Tuple[int, ...] = (50000, 60000, 80000, 100000, 140000)
+DEFAULT_RATES: Tuple[int, ...] = (80000, 100000, 140000, 160000, 180000)
+#DEFAULT_RATES: Tuple[int, ...] = (50000, 60000)
 
 DEFAULT_THREADS = 6
 DEFAULT_SEND_WORKERS = 7
 DEFAULT_ITERATIONS = 1
-DEFAULT_DURATION = 10
+DEFAULT_DURATION = 7
 
 # Flip this flag to run experiments via the Docker dispatcher instead of python run_exp.py.
 RUN_EXPERIMENT_VIA_DISPATCH = False

@@ -1,0 +1,20 @@
+**Behavior & Performance**
+- Overall p99 matches the synthetic service curve through 100 k rps (2.33 ms → 4.37 ms) because GET and SCAN tails remain at their configured 10 µs/2 ms costs; once the client drives 140 k rps, GET p99 jumps to 20.1 ms and SCAN to 21.7 ms, meaning requests are queueing well beyond their service time (`results/experiments/exp-20251113-174959/summary.json:1`).
+- Client logs show exactly where that queueing appears: outstanding requests spike to 331 even at 80 k rps and exceed 1.1 k at 140 k, so the 20 ms tail comes from user-space backlog growth rather than uneven steering (`results/run-20251113-175040/logs/client.log:7`, `results/run-20251113-175119/logs/client.log:7`).
+- The eBPF change (drop fmix, keep prandom XOR and single select) didn’t improve latency headroom; compared to the previous jitter+fmix selector, the new program is similar up to 100 k but regresses at 140 k (20.1 ms vs 15.2 ms), so the instruction savings did not translate into better tails (`results/experiments/exp-20251113-174959/summary.json:1`, `results/experiments/exp-20251113-174558/summary.json:1`).
+- `[perf]` snapshots at 140 k show all six workers handling ~22–23 k GETs/s with ~10.2 µs service, confirming the selector continues to spray packets evenly and that the bottleneck is shared userspace processing rather than a reuseport hotspot (`results/run-20251113-175119/logs/server/server.log:11`, `results/run-20251113-175119/logs/server/server.log:16`).
+- Aggregate throughput caps out once those workers saturate, so outstanding counts and p99 rise sharply even though the theoretical service time would allow more headroom; nothing in the logs suggests packet loss or kernel-side contention.
+- Confidence: **High**.
+
+**Program Intent**
+- Intent (per the EVOLVE block) was to keep the jittered selector that prevents flow pinning while removing the extra fmix work so a single prandom-mixed hash and one `bpf_sk_select_reuseport` call would preserve fairness with lower instruction cost (`ebpf/agent.c:34`).
+- Fairness/locality goals were met: all workers stayed busy with identical latency and error-free processing (`results/run-20251113-175119/logs/server/server.log:11`, `results/run-20251113-175119/logs/server/server.log:16`).
+- However, the anticipated latency improvement from “minimal-cost” randomness didn’t materialize; the highest-rate run now has worse tail latency than the fmix version, so the change failed to achieve its stated performance intent even though the distribution policy behaved correctly (`results/experiments/exp-20251113-174959/summary.json:1`, `results/experiments/exp-20251113-174558/summary.json:1`).
+
+**Evidence**
+- Current run metrics: `results/experiments/exp-20251113-174959/summary.json:1`
+- Previous-program metrics: `results/experiments/exp-20251113-174558/summary.json:1`
+- 80 k client backlog spike: `results/run-20251113-175040/logs/client.log:7`
+- 140 k client backlog spike: `results/run-20251113-175119/logs/client.log:7`
+- Worker utilization at 140 k (even steering): `results/run-20251113-175119/logs/server/server.log:11`, `results/run-20251113-175119/logs/server/server.log:16`
+- eBPF policy text: `ebpf/agent.c:34`

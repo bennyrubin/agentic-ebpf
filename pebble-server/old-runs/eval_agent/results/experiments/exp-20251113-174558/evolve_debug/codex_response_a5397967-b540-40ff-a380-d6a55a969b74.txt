@@ -1,0 +1,18 @@
+**Behavior & Performance (precise)**  
+- P99 latency now tracks the synthetic service time: 2.2 ms at 50 k rps → 4.6 ms at 100 k, rising to 15 ms only once the workers are nearly saturated at 140 k; the parent policy was already in multi‑second territory from 60 k upward (results/experiments/exp-20251113-174558/summary.json:1, results/experiments/exp-20251113-165305/summary.json:1).  
+- Per‑worker stats show ≈8.1–8.4 k gets/s at 50 k and ≈22–23 k gets/s at 140 k for every socket, proving the jittered hash actually sprayed traffic uniformly and eliminated the low-index bias that previously left two workers idle (results/run-20251113-174558/logs/server/server.log:4, results/run-20251113-174718/logs/server/server.log:4).  
+- Client logs confirm queues stayed shallow (≤23 outstanding at 50–100 k) and only grew into the hundreds once the offered load neared the 6-worker capacity, so the p99 blow-up at 140 k is attributable to service-time queueing rather than routing hotspots (results/run-20251113-174558/logs/client.log:2, results/run-20251113-174718/logs/client.log:2).  
+- Compared to the parent, the new program removes the catastrophic backlog (hundreds of thousands outstanding, missing replies) and delivers two to three orders of magnitude better tail latency at ≥80 k rps, solely by ensuring every worker receives work each burst.  
+- Confidence: **High** — both metrics and detailed worker/client logs consistently support the explanation.
+
+**Did the behavior achieve the program’s intent? Why or why not?**  
+- Intent: mix `reuse->hash` with per-packet randomness, whiten it, and pick exactly one slot so that all active reuseport sockets share work even when only a few UDP flows are present (ebpf/agent.c:34).  
+- Outcome: yes. Every run shows all six sockets receiving comparable request counts and zero errors, which is exactly what the jittered fmix selector set out to enforce; the remaining latency growth at 140 k stems from server-side queueing once aggregate throughput nears its compute limit, not from uneven steering (results/run-20251113-174718/logs/server/server.log:4).  
+- Relative to the parent—which still pinned traffic to four workers and collapsed at ≥80 k—the new behavior clearly fulfills the fairness/per-core locality goals and thereby restores expected throughput and latency envelopes (results/experiments/exp-20251113-165305/summary.json:1).
+
+**Evidence**  
+- Current load/p99 curve: `results/experiments/exp-20251113-174558/summary.json:1`.  
+- Parent load/p99 curve: `results/experiments/exp-20251113-165305/summary.json:1`.  
+- Worker utilization snapshots (even spread): `results/run-20251113-174558/logs/server/server.log:4`, `results/run-20251113-174718/logs/server/server.log:4`.  
+- Client outstanding/backlog data: `results/run-20251113-174558/logs/client.log:2`, `results/run-20251113-174718/logs/client.log:2`.  
+- eBPF policy wording and jittered fmix implementation: `ebpf/agent.c:34`.

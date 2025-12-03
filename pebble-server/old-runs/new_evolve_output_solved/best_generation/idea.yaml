@@ -1,0 +1,123 @@
+idea_summary: |-
+  {"status": "finish", "design_doc": {"goals": ["Lower GET tail latency (especially p99) under mixed GET/SCAN load by reducing the chance that a GET waits behind a 2ms SCAN on the same worker socket.", "Keep aggregate sustainable throughput in the same ballpark as the current ~145\u2013150k req/s ceiling, without changing userspace worker/socket wiring or adding new kernel maps.", "Keep the eBPF selector simple and self-contained: reuse AgentUDPSelector, only touch pebble_agent_state and pebble_udp_targets, and avoid additional state or complex per-packet logic beyond minimal payload classification."], "evidence": ["Wire format: GET requests are exactly `\"GET\" SP key SP reqID`; SCAN requests are `\"SCAN\" SP key SP scanLimit SP reqID`, with uppercase methods, single spaces, and no newline/terminator bytes. This makes cheap classification by ASCII prefix (`GET ` vs `SCAN `) straightforward in eBPF.", "pebble_agent_state.Active is written once at startup from the configured worker count and never updated again, so AgentUDPSelector can treat it as a constant number of active reuseport slots for the process lifetime.", "updateTargetsMap writes worker socket FDs into pebble_udp_targets at contiguous indices 0..N-1, where the index matches the logical worker index used elsewhere, so any index-based partitioning or bias in the selector directly corresponds to specific worker goroutines.", "Existing experiments show that the current stateless, per-packet random AgentUDPSelector distributes GET and SCAN traffic nearly perfectly evenly across all 6 workers, and each worker\u2019s average GET/SCAN service times match the synthetic delays (~10\u201312\u00b5s, ~2.0\u20132.1ms). This confirms that the selector is unbiased and that workers are symmetric.", "Despite balanced steering, client-side p99 latency explodes once offered load exceeds ~140k req/s, while server-side per-request service times stay fixed. This points to queueing delay ahead of single-threaded workers, with lon
+idea_payload:
+  status: |-
+    finish
+  design_doc:
+    goals:
+    - |-
+      Lower GET tail latency (especially p99) under mixed GET/SCAN load by reducing the chance that a GET waits behind a 2ms SCAN on the same worker socket.
+    - "Keep aggregate sustainable throughput in the same ballpark as the current ~145\u2013150k req/s ceiling, without changing\
+      \ userspace worker/socket wiring or adding new kernel maps."
+    - |-
+      Keep the eBPF selector simple and self-contained: reuse AgentUDPSelector, only touch pebble_agent_state and pebble_udp_targets, and avoid additional state or complex per-packet logic beyond minimal payload classification.
+    evidence:
+    - |-
+      Wire format: GET requests are exactly `"GET" SP key SP reqID`; SCAN requests are `"SCAN" SP key SP scanLimit SP reqID`, with uppercase methods, single spaces, and no newline/terminator bytes. This makes cheap classification by ASCII prefix (`GET ` vs `SCAN `) straightforward in eBPF.
+    - |-
+      pebble_agent_state.Active is written once at startup from the configured worker count and never updated again, so AgentUDPSelector can treat it as a constant number of active reuseport slots for the process lifetime.
+    - |-
+      updateTargetsMap writes worker socket FDs into pebble_udp_targets at contiguous indices 0..N-1, where the index matches the logical worker index used elsewhere, so any index-based partitioning or bias in the selector directly corresponds to specific worker goroutines.
+    - "Existing experiments show that the current stateless, per-packet random AgentUDPSelector distributes GET and SCAN traffic\
+      \ nearly perfectly evenly across all 6 workers, and each worker\u2019s average GET/SCAN service times match the synthetic\
+      \ delays (~10\u201312\xB5s, ~2.0\u20132.1ms). This confirms that the selector is unbiased and that workers are symmetric."
+    - |-
+      Despite balanced steering, client-side p99 latency explodes once offered load exceeds ~140k req/s, while server-side per-request service times stay fixed. This points to queueing delay ahead of single-threaded workers, with long 2ms SCANs causing head-of-line blocking for subsequent GETs on each per-socket FIFO queue.
+    - "SCANs are rare (~0.5\u20131% of requests) but ~200x more expensive than GETs, so they consume a large fraction of total\
+      \ CPU time and are the main source of long per-socket stalls when queued in front of GETs."
+    architecture:
+    - |-
+      Extend AgentUDPSelector to classify each UDP datagram as a GET or SCAN purely by inspecting the first few payload bytes in sk_reuseport_md->data, using strict bounds checks and simple ASCII comparisons (`"GET"` followed by space vs `"SCAN"` followed by space); treat anything that does not look like a SCAN prefix as a GET for steering purposes.
+    - "Continue to read the active worker count from pebble_agent_state.Active and clamp it to a safe upper bound (\u2264\
+      128, matching pebble_udp_targets capacity); if active is 0, fall back to default SK_PASS behavior as today."
+    - "For GET-classified packets, preserve the current behavior: select a reuseport slot uniformly at random across the full\
+      \ [0, active) range using the existing fast multiply\u2013shift mapping of bpf_get_prandom_u32, and call bpf_sk_select_reuseport\
+      \ once with that slot."
+    - "For SCAN-classified packets, restrict selection to a small, fixed prefix subset of the reuseport slots [0, SCAN_LANES),\
+      \ where SCAN_LANES is a compile-time constant hyperparameter (e.g., 1) and SCAN_LANES \u2264 active; within that subset,\
+      \ choose the slot uniformly at random (or trivially 0 if SCAN_LANES == 1) and pass it to bpf_sk_select_reuseport."
+    - "This \u201Coverlapping subset\u201D design makes a small number of low-index workers SCAN-preferred (they see all SCANs\
+      \ plus their fair share of GETs), while the remaining workers handle only GETs. GET traffic still leverages all active\
+      \ workers for throughput, but most GETs avoid sharing queues with SCANs, reducing the probability of GETs suffering\
+      \ 2ms head-of-line blocking on any given worker."
+    risks:
+    - "Static SCAN_LANES sizing: Choosing a fixed number of SCAN-preferred slots (e.g., 1 out of 6) is tuned to the current\
+      \ ~99\u201399.5% GET / 0.5\u20131% SCAN mix and 10\xB5s/2ms delays. If the workload mix or synthetic delays change materially,\
+      \ this static choice may either over-concentrate SCANs (causing very high SCAN latency and saturating one worker) or\
+      \ under-concentrate them (reducing the benefit to GET tail latency)."
+    - "Uneven CPU utilization: Concentrating all SCANs on a small subset of workers will drive those workers to higher utilization\
+      \ than the rest. Under high offered load, SCAN-preferred workers may saturate while others remain less loaded, potentially\
+      \ capping throughput slightly below the perfectly even distribution case. This needs empirical validation against the\
+      \ ~145\u2013150k req/s baseline."
+    - |-
+      Residual GET impact on SCAN-preferred workers: GETs are still distributed across all active workers, including the SCAN-preferred ones. Any GETs that happen to land on these workers will still experience head-of-line blocking behind queued SCANs, so GET tail latency will improve relative to the fully mixed baseline but not be completely isolated from SCAN behavior.
+    - |-
+      Payload parsing correctness: The selector must implement safe, verifier-friendly checks around reuse->data and reuse->data_end before reading any bytes. Misclassification (e.g., treating malformed or short SCAN payloads as GETs or vice versa) could either dilute the SCAN concentration benefit or further overload the SCAN-preferred workers; careful, minimal parsing logic is required.
+    - |-
+      Assumption of stable active/target mapping: The design assumes that pebble_agent_state.Active remains constant for the process lifetime and that pebble_udp_targets indices 0..(active-1) always correspond to currently valid worker sockets. If future server code changes workers dynamically or uses non-contiguous target indices, the static [0, SCAN_LANES) prefix assumption would need revisiting.
+  questions: []
+  implementation_snippets:
+  - path: |-
+      cmd/workload_client/main.go
+    snippet: "func buildPayload(rng *rand.Rand, buf []byte, reqType, reqID, prefix string, keySpace, scanLimit int) []byte\
+      \ {\n\tbuf = buf[:0]\n\tbuf = append(buf, reqType...)\n\tbuf = append(buf, ' ')\n\tkeyIdx := rng.Intn(keySpace)\n\t\
+      buf = appendKey(buf, prefix, keyIdx)\n\tif reqType == \"SCAN\" {\n\t\tbuf = append(buf, ' ')\n\t\tbuf = strconv.AppendInt(buf,\
+      \ int64(scanLimit), 10)\n\t}\n\tbuf = append(buf, ' ')\n\tbuf = append(buf, reqID...)\n\treturn buf\n}"
+  - path: |-
+      cmd/workload_client/main.go
+    snippet: "func appendKey(buf []byte, prefix string, keyIdx int) []byte {\n\tbuf = append(buf, prefix...)\n\tif keyIdx\
+      \ < 100000000 {\n\t\tstart := len(buf)\n\t\tbuf = append(buf, '0', '0', '0', '0', '0', '0', '0', '0')\n\t\tfor i :=\
+      \ 7; i >= 0; i-- {\n\t\t\tbuf[start+i] = byte('0' + keyIdx%10)\n\t\t\tkeyIdx /= 10\n\t\t}\n\t\treturn buf\n\t}\n\treturn\
+      \ strconv.AppendInt(buf, int64(keyIdx), 10)\n}"
+  - path: |-
+      internal/server/ebpf.go
+    snippet: "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\
+      \t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key,\
+      \ &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\"\
+      , err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"agent\",\n\t\tprogram: objs.AgentUdpSelector,\n\t\tclose:\
+      \   objs.Close,\n\t}, nil\n}"
+  - path: |-
+      cmd/pebble_server/main.go
+    snippet: "var (\n\t\tworkers      = flag.Int(\"workers\", 4, \"number of reuseport workers\")\n\t\tpolicy       = flag.String(\"\
+      policy\", \"default\", \"load-balancing policy: default|round_robin|agent|scan_split|hash\")\n\t\t...\n\t)\n\tflag.Parse()\n\
+      \t...\n\tlogger := log.New(f, \"\", log.LstdFlags|log.Lmicroseconds)\n"
+  - path: |-
+      internal/server/ebpf.go
+    snippet: "func updateTargetsMap(slot uint32, fd int) error {\n\tm, err := ebpf.LoadPinnedMap(targetMapPath(), nil)\n\t\
+      if err != nil {\n\t\treturn fmt.Errorf(\"load target map: %w\", err)\n\t}\n\tdefer m.Close()\n\n\tvalue := uint32(fd)\n\
+      \tif err := m.Update(&slot, &value, ebpf.UpdateAny); err != nil {\n\t\treturn fmt.Errorf(\"update target map: %w\",\
+      \ err)\n\t}\n\treturn nil\n}\n\nfunc clearTargets(numSlots int) error {\n\tm, err := ebpf.LoadPinnedMap(targetMapPath(),\
+      \ nil)\n\tif err != nil {\n\t\tif errors.Is(err, fs.ErrNotExist) {\n\t\t\treturn nil\n\t\t}\n\t\treturn err\n\t}\n\t\
+      defer m.Close()\n\n\tfor i := 0; i < numSlots; i++ {\n\t\tkey := uint32(i)\n\t\tif err := m.Delete(&key); err != nil\
+      \ && !errors.Is(err, ebpf.ErrKeyNotExist) {\n\t\t\treturn fmt.Errorf(\"clear slot %d: %w\", i, err)\n\t\t}\n\t}\n\t\
+      return nil\n}\n"
+  - path: |-
+      internal/server/ebpf.go
+    snippet: "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar objs ebpfutil.AgentSelectorObjects\n\t...\n\
+      \tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState\
+      \ != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\
+      \t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\t...\n}\n"
+  - path: |-
+      internal/server/ebpf.go
+    snippet: "func loadEBPF(policy string, workers int) (*ebpfPolicy, error) {\n\tswitch policy {\n\tcase \"default\", \"\"\
+      :\n\t\treturn &ebpfPolicy{name: \"default\"}, nil\n\tcase \"round_robin\":\n\t\treturn loadRoundRobin(workers)\n\tcase\
+      \ \"agent\":\n\t\treturn loadAgent(workers)\n\tcase \"scan_split\":\n\t\treturn loadScanSplit(workers)\n\tcase \"hash\"\
+      :\n\t\treturn loadHash(workers)\n\tdefault:\n\t\treturn nil, ErrInvalidConfig(fmt.Sprintf(\"unknown policy %q\", policy))\n\
+      \t}\n}\n"
+  - path: |-
+      internal/server/ebpf.go
+    snippet: "func loadScanSplit(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn\
+      \ nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"\
+      ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.ScanSplitSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\
+      \t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadScanSplitSelectorObjects(&objs, opts); err\
+      \ != nil {\n\t\treturn nil, fmt.Errorf(\"load scan split objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\
+      \t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.ScanSplitSelectorSplitState{\n\
+      \t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleSplitState != nil {\n\t\tif err := objs.PebbleSplitState.Update(&key,\
+      \ &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure scan split state:\
+      \ %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"scan_split\",\n\t\tprogram: objs.SplitUdpSelector,\n\
+      \t\tclose:   objs.Close,\n\t}, nil\n}\n"
+parent_id: |-
+  6ceb58ceba6a4616bb0522b678306473
+eval_summary: null
+eval_hypothesis: null
+eval_score: null

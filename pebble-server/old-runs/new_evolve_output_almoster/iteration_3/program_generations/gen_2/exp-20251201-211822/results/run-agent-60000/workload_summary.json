@@ -1,0 +1,104 @@
+{
+  "iterations": [
+    {
+      "iteration": 1,
+      "total_sent": 415977,
+      "total_sent_get": 413901,
+      "total_sent_scan": 2076,
+      "total_received": 415977,
+      "total_received_get": 413901,
+      "total_received_scan": 2076,
+      "throughput": 59425.29,
+      "overall_latency_p50": 1.256,
+      "overall_latency_p90": 4.992,
+      "overall_latency_p99": 9.485,
+      "overall_latency_avg": 1.964,
+      "get_latency_p50": 1.242,
+      "get_latency_p90": 4.979,
+      "get_latency_p99": 9.474,
+      "get_latency_avg": 1.954,
+      "scan_latency_p50": 3.248,
+      "scan_latency_p90": 6.968,
+      "scan_latency_p99": 11.188,
+      "scan_latency_avg": 3.94
+    }
+  ],
+  "summary": {
+    "get_latency_avg": {
+      "average": 1.954,
+      "stddev": 0.0
+    },
+    "get_latency_p50": {
+      "average": 1.242,
+      "stddev": 0.0
+    },
+    "get_latency_p90": {
+      "average": 4.979,
+      "stddev": 0.0
+    },
+    "get_latency_p99": {
+      "average": 9.474,
+      "stddev": 0.0
+    },
+    "overall_latency_avg": {
+      "average": 1.964,
+      "stddev": 0.0
+    },
+    "overall_latency_p50": {
+      "average": 1.256,
+      "stddev": 0.0
+    },
+    "overall_latency_p90": {
+      "average": 4.992,
+      "stddev": 0.0
+    },
+    "overall_latency_p99": {
+      "average": 9.485,
+      "stddev": 0.0
+    },
+    "scan_latency_avg": {
+      "average": 3.94,
+      "stddev": 0.0
+    },
+    "scan_latency_p50": {
+      "average": 3.248,
+      "stddev": 0.0
+    },
+    "scan_latency_p90": {
+      "average": 6.968,
+      "stddev": 0.0
+    },
+    "scan_latency_p99": {
+      "average": 11.188,
+      "stddev": 0.0
+    },
+    "throughput": {
+      "average": 59425.29,
+      "stddev": 0.0
+    },
+    "total_received": {
+      "average": 415977,
+      "stddev": 0.0
+    },
+    "total_received_get": {
+      "average": 413901,
+      "stddev": 0.0
+    },
+    "total_received_scan": {
+      "average": 2076,
+      "stddev": 0.0
+    },
+    "total_sent": {
+      "average": 415977,
+      "stddev": 0.0
+    },
+    "total_sent_get": {
+      "average": 413901,
+      "stddev": 0.0
+    },
+    "total_sent_scan": {
+      "average": 2076,
+      "stddev": 0.0
+    }
+  }
+}

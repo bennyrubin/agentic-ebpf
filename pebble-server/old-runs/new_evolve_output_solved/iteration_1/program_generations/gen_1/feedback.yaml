@@ -1,0 +1,1262 @@
+model: |-
+  gpt-5.1
+temperature: null
+reasoning_effort: |-
+  medium
+messages:
+- role: |-
+    system
+  content: |-
+    You review eBPF attempts and suggest the next fix.
+- role: |-
+    user
+  content: "ROLE:\nYou are a sharp, concise reviewer who inspects the most recent program generation attempt from an idea\
+    \ and gives feedback on the performance and suggestions on what to try next. You will also have access to the parent's\
+    \ program and its evaluation to learn from and guide your feedback about this new idea and program.\n\nGOAL:\n- Judge\
+    \ how well the current program matches the intent of the idea.\n- Summarize the observed behavior and key issues using\
+    \ metrics and logs.\n- Provide concrete guidance for the next attempt.\n\nINPUTS:\n- Idea intent: {\"status\": \"finish\"\
+    , \"design_doc\": {\"goals\": [\"Eliminate worker underutilization caused by flow-hash pinning so that all configured\
+    \ SO_REUSEPORT workers receive traffic even when the number of client flows is small (e.g., the default 1 send worker\
+    \ vs. 64 server workers).\", \"Avoid hot-spotting where multiple high-rate flows land on the same worker and build long\
+    \ per-socket UDP queues, causing drops and large p99 latencies.\", \"Keep the eBPF selector self-contained and simple:\
+    \ no new maps, no additional userspace configuration beyond the existing Active field, and minimal logic per packet.\"\
+    , \"Preserve correctness for the current UDP workload (stateless GET/SCAN with reqID) while accepting per-packet load\
+    \ balancing (no flow affinity) to fully exploit worker parallelism.\", \"Provide a clean foundation for future refinements\
+    \ (e.g., optional GET/SCAN differentiation or light feedback mechanisms) without entangling the initial fix with unnecessary\
+    \ complexity.\"], \"evidence\": [\"The existing agent selector uses `slot = reuse->hash % active` with Active set once\
+    \ at startup from the Go side (`AgentSelectorAgentState{Active: uint32(workers)}`), and never updates this map again;\
+    \ there is no dynamic load-aware behavior.\", \"Client default `-send-workers` is 1, so experiments typically use a single\
+    \ UDPConn/source port (one flow) unless explicitly overridden, which is far fewer flows than server workers (default 64,\
+    \ max 128).\", \"Server config normalizes workers to a default of 64 and a hard maximum of 128, and the BPF reuseport\
+    \ map `pebble_udp_targets` has `max_entries=128`, so up to 128 worker sockets can be installed and addressed via a simple\
+    \ modulo on `state->active`.\", \"The Go server\\u2019s workers are strictly stateless per packet: `spawnWorker` reads\
+    \ a datagram, calls `handleRequest(workerIndex, payload)` and writes the response back to the one-shot `addr`. No state\
+    \ is stored keyed by client address, so packets from the same client do not need to hit the same worker.\", \"The only\n\
+    - Parent eval summary/hypothesis/score: The agent policy\u2019s eBPF program is not doing any dynamic, load-aware steering:\
+    \ on every packet it looks up pebble_agent_state.Active (set once at load to the configured worker count, 6) and deterministically\
+    \ picks a reuseport slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The\
+    \ Go server always opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets map at indices 0\u2013\
+    5, and spawns one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP` \u2192 `handleRequest`\
+    \ \u2192 `WriteToUDP`; `handleRequest` parses the request, performs only a busy\u2011wait delay (10\u202F\xB5s for GET,\
+    \ 2\u202Fms for SCAN) plus some light parsing/formatting and stats accounting, and returns a response. There are no other\
+    \ blocking operations on the hot path, so each worker is effectively a single\u2011threaded server whose capacity is bounded\
+    \ by that synthetic delay and a small fixed per\u2011request overhead. The client runs open\u2011loop at fixed target\
+    \ rates (80k\u2013180k req/s) with a small number of UDPConns (one per send worker, each with its own source port) and\
+    \ matching per\u2011conn receive goroutines. The experiment logs show that in each run only 3\u20135 of the 6 server workers\
+    \ ever report traffic in a given second, and which indices are active changes between runs. Aggregate server throughput\
+    \ flattens between ~70k and ~105k req/s depending on the run, while the client continues to inject traffic at the configured\
+    \ rate, so outstanding requests build up and a growing fraction of responses never arrive; the client logs these as \u201C\
+    responses missing\u201D. Overall p99 latency (measured at the client over all requests) is lowest around 100k req/s and\
+    \ very high at 80k and \u2265140k, reflecting how long packets spend queued in the kernel and at the workers before they\
+    \ can be processed by the limited number of busy\u2011waiting goroutines; the server\u2019s own \u201C[perf] avg_get/avg_scan\u201D\
+    \ numbers remain fixed near the configured synthetic delays because they do not include time spent in queues. / The observed\
+    \ behavior is driven by the combination of (1) the agent eBPF selector doing a simple, static hash\u2011based choice of\
+    \ reuseport slot per packet/flow (`slot = reuse->hash % active` with `active = 6`), (2) a small number of client UDP flows\
+    \ (one per send worker / source port) so there are fewer flows than server workers, and (3) each server worker processing\
+    \ requests strictly sequentially with busy\u2011wait delays. At startup, all 6 worker sockets are inserted into the pebble_udp_targets\
+    \ map and the agent state\u2019s Active count is set to 6, but because the client only originates a handful of flows,\
+    \ those flows hash onto only 3\u20135 of the 6 slots in each run. Which specific workers are used (and how many flows\
+    \ collide on the same worker) varies randomly from run to run as source ports and hashes change. Within a run, each packet\
+    \ for a given flow is effectively pinned to its chosen worker; that worker\u2019s goroutine then handles the request synchronously\
+    \ and spends ~10\u202F\xB5s (GET) or 2\u202Fms (SCAN) in a busy\u2011wait loop for every request. This architecture means:\
+    \ (a) the system\u2019s true parallelism is limited to the number of reuseport slots that actually receive traffic, not\
+    \ the configured 6 workers; and (b) if multiple high\u2011rate client flows hash to the same worker, that worker becomes\
+    \ a hot spot and builds a long queue while other workers are underutilized. When the client target rate is near or above\
+    \ the sum of the capacities of the few workers that are actually receiving traffic, packets accumulate in the per\u2011\
+    socket UDP receive queues. Because handleRequest\u2019s measured latency only times the busy\u2011wait, the server\u2019\
+    s \u201C[perf] avg_get/avg_scan\u201D stay near 10\u202F\xB5s/2\u202Fms even as queues grow large. From the client\u2019\
+    s perspective, however, end\u2011to\u2011end latency includes this queueing, so p99 balloons into the multi\u2011second\
+    \ range at 80k and \u2265140k req/s. Once the socket receive buffers fill, new datagrams are dropped silently by the kernel,\
+    \ so the client sees increasing \u201Cresponses missing\u201D counts and outstanding request counts that never drain before\
+    \ the run ends. The non\u2011monotonicity in throughput and p99 across rates (e.g., 100k performing better than 80k) is\
+    \ explained by the random hash placement of a small number of flows onto 6 workers: in the 100k run, flows happen to be\
+    \ spread relatively evenly across 5 workers, keeping each below saturation and yielding lower queueing, while in the 80k\
+    \ and higher\u2011rate runs, more flows collide on fewer workers, reducing effective usable capacity and causing larger\
+    \ queues, more UDP drops, and worse tail latency even at a lower offered rate. / 8\n- Parent eval output (reference only\
+    \ \u2014 behavior may differ in this attempt): \n[\n  {\n    \"iterations\": [\n      {\n        \"iteration\": 0,\n \
+    \       \"assistant_role\": \"assistant\",\n        \"assistant_content_format\": \"json\",\n        \"assistant_content_raw\"\
+    : \"{\\\"status\\\":\\\"continue\\\",\\\"Summary\\\":\\\"Across five runs (policy=agent, 6 configured workers, GET delay=10\\\
+    u00b5s, SCAN delay=2ms), the client sends at 80k\\u2013180k req/s with 99% GETs. Client logs show that only the 100k run\
+    \ returns all responses; the others drop some fraction of requests and exhibit growing outstanding counts. Server perf\
+    \ logs show per-worker GET/SCAN times very close to the synthetic delays (\\u224810\\u00b5s / 2ms) and no parse errors,\
+    \ but only a subset of the 6 workers receive any traffic in each run, with the active subset changing by rate (e.g., 1\\\
+    u20135 at 80k/100k, 0/3/4/5 at 140k, 0/2/4 at 160k, mostly 1\\u20134 at 180k). Aggregate server throughput per-second\
+    \ saturates around ~70k\\u2013105k req/s even when offered load is higher, and missing responses increase with offered\
+    \ rate.\\\",\\\"hypothesis\\\":{\\\"text\\\":\\\"The agent_udp_selector program effectively pins each client UDP flow\
+    \ to a fixed reuseport slot using start = reuse->hash % state->active, so selection is per-flow rather than per-packet.\
+    \ Combined with how pebble_agent_state.active and pebble_udp_targets are configured for the agent policy, only a subset\
+    \ of the 6 logical workers actually receive packets in each run. Each active worker is single-threaded and limited by\
+    \ the 10\\u00b5s/2ms busy-wait delays to roughly ~20\\u201325k ops/s, so the total processing capacity is approximately\
+    \ (#effectively-active-workers) \\u00d7 (~20\\u201325k). At 100k offered load this matches capacity (\\u22485 active workers),\
+    \ leading to manageable queues and low p99; at lower/higher rates, the chosen active set and hashing of a small number\
+    \ of client flows onto few workers create either underutilization or overload, causing UDP receive-queue buildup and drops\
+    \ (missing responses) and higher p99 due to queueing on the overloaded workers while some workers remain idle.\\\",\\\"\
+    score\\\":6},\\\"questions\\\":[\\\"In internal/server/ebpf.go, when loading the \\\\\\\"agent\\\\\\\" policy, how is\
+    \ the pebble_agent_state.active field initialized and/or updated at runtime? Is it always set equal to Config.Workers,\
+    \ or can it be smaller or overridden by other configuration?\\\",\\\"In internal/server/ebpf.go\\u2019s updateTargetsMap\
+    \ (or equivalent for the agent policy), what is the exact mapping between pebble_udp_targets keys (slots) and server workers\\\
+    u2014does slot i always correspond to worker index i, and are all Config.Workers sockets inserted into the map?\\\",\\\
+    \"In internal/server/server.go\\u2019s Run/openWorker path for policy=agent, does the server always open and spawn workers\
+    \ for all Config.Workers, or can it decide to open/spawn only a subset based on agent-related state?\\\",\\\"In cmd/workload_client,\
+    \ how many UDPConns are created for sending by default, and do different send workers each use their own UDPConn (distinct\
+    \ local UDP ports) or share a single UDPConn/source port?\\\",\\\"In cmd/workload_client, which latency series is used\
+    \ to compute the p99 value that run.sh parses into workload_summary.json\\u2014overall requests, GET-only, or SCAN-only?\\\
+    \"]}\",\n        \"full_response\": {\n          \"id\": \"chatcmpl-Cihp7U7VHIZ80f4suYzK3RpwBUREP\",\n          \"choices\"\
+    : [\n            {\n              \"finish_reason\": \"stop\",\n              \"index\": 0,\n              \"logprobs\"\
+    : null,\n              \"message\": {\n                \"content\": \"{\\\"status\\\":\\\"continue\\\",\\\"Summary\\\"\
+    :\\\"Across five runs (policy=agent, 6 configured workers, GET delay=10\\u00b5s, SCAN delay=2ms), the client sends at\
+    \ 80k\\u2013180k req/s with 99% GETs. Client logs show that only the 100k run returns all responses; the others drop some\
+    \ fraction of requests and exhibit growing outstanding counts. Server perf logs show per-worker GET/SCAN times very close\
+    \ to the synthetic delays (\\u224810\\u00b5s / 2ms) and no parse errors, but only a subset of the 6 workers receive any\
+    \ traffic in each run, with the active subset changing by rate (e.g., 1\\u20135 at 80k/100k, 0/3/4/5 at 140k, 0/2/4 at\
+    \ 160k, mostly 1\\u20134 at 180k). Aggregate server throughput per-second saturates around ~70k\\u2013105k req/s even\
+    \ when offered load is higher, and missing responses increase with offered rate.\\\",\\\"hypothesis\\\":{\\\"text\\\"\
+    :\\\"The agent_udp_selector program effectively pins each client UDP flow to a fixed reuseport slot using start = reuse->hash\
+    \ % state->active, so selection is per-flow rather than per-packet. Combined with how pebble_agent_state.active and pebble_udp_targets\
+    \ are configured for the agent policy, only a subset of the 6 logical workers actually receive packets in each run. Each\
+    \ active worker is single-threaded and limited by the 10\\u00b5s/2ms busy-wait delays to roughly ~20\\u201325k ops/s,\
+    \ so the total processing capacity is approximately (#effectively-active-workers) \\u00d7 (~20\\u201325k). At 100k offered\
+    \ load this matches capacity (\\u22485 active workers), leading to manageable queues and low p99; at lower/higher rates,\
+    \ the chosen active set and hashing of a small number of client flows onto few workers create either underutilization\
+    \ or overload, causing UDP receive-queue buildup and drops (missing responses) and higher p99 due to queueing on the overloaded\
+    \ workers while some workers remain idle.\\\",\\\"score\\\":6},\\\"questions\\\":[\\\"In internal/server/ebpf.go, when\
+    \ loading the \\\\\\\"agent\\\\\\\" policy, how is the pebble_agent_state.active field initialized and/or updated at runtime?\
+    \ Is it always set equal to Config.Workers, or can it be smaller or overridden by other configuration?\\\",\\\"In internal/server/ebpf.go\\\
+    u2019s updateTargetsMap (or equivalent for the agent policy), what is the exact mapping between pebble_udp_targets keys\
+    \ (slots) and server workers\\u2014does slot i always correspond to worker index i, and are all Config.Workers sockets\
+    \ inserted into the map?\\\",\\\"In internal/server/server.go\\u2019s Run/openWorker path for policy=agent, does the server\
+    \ always open and spawn workers for all Config.Workers, or can it decide to open/spawn only a subset based on agent-related\
+    \ state?\\\",\\\"In cmd/workload_client, how many UDPConns are created for sending by default, and do different send workers\
+    \ each use their own UDPConn (distinct local UDP ports) or share a single UDPConn/source port?\\\",\\\"In cmd/workload_client,\
+    \ which latency series is used to compute the p99 value that run.sh parses into workload_summary.json\\u2014overall requests,\
+    \ GET-only, or SCAN-only?\\\"]}\",\n                \"refusal\": null,\n                \"role\": \"assistant\",\n   \
+    \             \"annotations\": [],\n                \"audio\": null,\n                \"function_call\": null,\n     \
+    \           \"tool_calls\": null\n              }\n            }\n          ],\n          \"created\": 1764770925,\n \
+    \         \"model\": \"gpt-5.1-2025-11-13\",\n          \"object\": \"chat.completion\",\n          \"service_tier\":\
+    \ \"default\",\n          \"system_fingerprint\": null,\n          \"usage\": {\n            \"completion_tokens\": 14607,\n\
+    \            \"prompt_tokens\": 21827,\n            \"total_tokens\": 36434,\n            \"completion_tokens_details\"\
+    : {\n              \"accepted_prediction_tokens\": 0,\n              \"audio_tokens\": 0,\n              \"reasoning_tokens\"\
+    : 13916,\n              \"rejected_prediction_tokens\": 0\n            },\n            \"prompt_tokens_details\": {\n\
+    \              \"audio_tokens\": 0,\n              \"cached_tokens\": 21760\n            }\n          }\n        },\n\
+    \        \"status\": \"continue\",\n        \"Summary\": \"Across five runs (policy=agent, 6 configured workers, GET delay=10\\\
+    u00b5s, SCAN delay=2ms), the client sends at 80k\\u2013180k req/s with 99% GETs. Client logs show that only the 100k run\
+    \ returns all responses; the others drop some fraction of requests and exhibit growing outstanding counts. Server perf\
+    \ logs show per-worker GET/SCAN times very close to the synthetic delays (\\u224810\\u00b5s / 2ms) and no parse errors,\
+    \ but only a subset of the 6 workers receive any traffic in each run, with the active subset changing by rate (e.g., 1\\\
+    u20135 at 80k/100k, 0/3/4/5 at 140k, 0/2/4 at 160k, mostly 1\\u20134 at 180k). Aggregate server throughput per-second\
+    \ saturates around ~70k\\u2013105k req/s even when offered load is higher, and missing responses increase with offered\
+    \ rate.\",\n        \"hypothesis\": {\n          \"text\": \"The agent_udp_selector program effectively pins each client\
+    \ UDP flow to a fixed reuseport slot using start = reuse->hash % state->active, so selection is per-flow rather than per-packet.\
+    \ Combined with how pebble_agent_state.active and pebble_udp_targets are configured for the agent policy, only a subset\
+    \ of the 6 logical workers actually receive packets in each run. Each active worker is single-threaded and limited by\
+    \ the 10\\u00b5s/2ms busy-wait delays to roughly ~20\\u201325k ops/s, so the total processing capacity is approximately\
+    \ (#effectively-active-workers) \\u00d7 (~20\\u201325k). At 100k offered load this matches capacity (\\u22485 active workers),\
+    \ leading to manageable queues and low p99; at lower/higher rates, the chosen active set and hashing of a small number\
+    \ of client flows onto few workers create either underutilization or overload, causing UDP receive-queue buildup and drops\
+    \ (missing responses) and higher p99 due to queueing on the overloaded workers while some workers remain idle.\",\n  \
+    \        \"score\": 6\n        },\n        \"questions\": [\n          \"In internal/server/ebpf.go, when loading the\
+    \ \\\"agent\\\" policy, how is the pebble_agent_state.active field initialized and/or updated at runtime? Is it always\
+    \ set equal to Config.Workers, or can it be smaller or overridden by other configuration?\",\n          \"In internal/server/ebpf.go\\\
+    u2019s updateTargetsMap (or equivalent for the agent policy), what is the exact mapping between pebble_udp_targets keys\
+    \ (slots) and server workers\\u2014does slot i always correspond to worker index i, and are all Config.Workers sockets\
+    \ inserted into the map?\",\n          \"In internal/server/server.go\\u2019s Run/openWorker path for policy=agent, does\
+    \ the server always open and spawn workers for all Config.Workers, or can it decide to open/spawn only a subset based\
+    \ on agent-related state?\",\n          \"In cmd/workload_client, how many UDPConns are created for sending by default,\
+    \ and do different send workers each use their own UDPConn (distinct local UDP ports) or share a single UDPConn/source\
+    \ port?\",\n          \"In cmd/workload_client, which latency series is used to compute the p99 value that run.sh parses\
+    \ into workload_summary.json\\u2014overall requests, GET-only, or SCAN-only?\"\n        ],\n        \"question_answers\"\
+    : [\n          {\n            \"question\": \"In internal/server/ebpf.go, when loading the \\\"agent\\\" policy, how is\
+    \ the pebble_agent_state.active field initialized and/or updated at runtime? Is it always set equal to Config.Workers,\
+    \ or can it be smaller or overridden by other configuration?\",\n            \"answer\": {\n              \"answer\":\
+    \ \"When the \\\"agent\\\" policy is loaded, the code constructs an `ebpfutil.AgentSelectorAgentState` with `Active` set\
+    \ directly from the `workers` parameter (converted to `uint32`), and then writes that value into the `PebbleAgentState`\
+    \ map at key 0 using `Update` with `ebpf.UpdateAny`.\\n\\nThe function enforces that `workers` must be non\\u2011negative,\
+    \ but does not apply any other logic to reduce or override it. There is no lookup of existing state, no clamping, and\
+    \ no additional configuration involved. Thus, at load time, `pebble_agent_state.active` is always set exactly to the `workers`\
+    \ argument passed into `loadAgent`, which corresponds to `Config.Workers` (assuming that value is what is passed in by\
+    \ the caller), and it is not made smaller or overridden by any other configuration within this function.\",\n        \
+    \      \"code_snippets\": [\n                {\n                  \"path\": \"internal/server/ebpf.go\",\n           \
+    \       \"snippet\": \"func loadAgent(workers int) (*ebpfPolicy, error) {\\n\\t...\\n\\tif workers < 0 {\\n\\t\\tobjs.Close()\\\
+    n\\t\\treturn nil, ErrInvalidConfig(\\\"workers must be non-negative\\\")\\n\\t}\\n\\n\\tvar key uint32 = 0\\n\\tstate\
+    \ := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive: uint32(workers),\\n\\t}\\n\\tif objs.PebbleAgentState != nil {\\\
+    n\\t\\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\\n\\t\\t\\tobjs.Close()\\n\\\
+    t\\t\\treturn nil, fmt.Errorf(\\\"configure agent state: %w\\\", err)\\n\\t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\n\\\
+    t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\n\\t\\tclose:   objs.Close,\\n\\t}, nil\\n}\\n\"\n\
+    \                }\n              ]\n            }\n          },\n          {\n            \"question\": \"In internal/server/ebpf.go\\\
+    u2019s updateTargetsMap (or equivalent for the agent policy), what is the exact mapping between pebble_udp_targets keys\
+    \ (slots) and server workers\\u2014does slot i always correspond to worker index i, and are all Config.Workers sockets\
+    \ inserted into the map?\",\n            \"answer\": {\n              \"answer\": \"Slots in the pebble_udp_targets map\
+    \ are addressed by a uint32 slot key, and updateTargetsMap simply writes a given file descriptor into the entry for that\
+    \ slot key. There is no remapping or transformation of the index: the key passed into updateTargetsMap is used directly\
+    \ as the map key, so slot i corresponds exactly to the worker index i that the caller chooses to pass.\\n\\nThe agent-related\
+    \ loader (loadAgent) configures only the agent state (Active workers count) via the PebbleAgentState map and returns the\
+    \ eBPF program handle; it does not itself populate the pebble_udp_targets map or insert socket FDs. Thus, whether all\
+    \ Config.Workers sockets are inserted\\u2014and which worker index is mapped to which slot\\u2014is determined entirely\
+    \ by the code that calls updateTargetsMap, not by updateTargetsMap or loadAgent. The provided code does not enforce or\
+    \ guarantee that every Config.Workers socket is inserted; it merely supports a 1:1 mapping from the caller\\u2019s slot\
+    \ index to the underlying worker FD.\\n\\nIn short: slot i is used as given (so it will match worker index i if the caller\
+    \ uses that convention), and these functions do not themselves ensure that all worker sockets are present in the map.\"\
+    ,\n              \"code_snippets\": [\n                {\n                  \"path\": \"internal/server/ebpf.go\",\n \
+    \                 \"snippet\": \"func updateTargetsMap(slot uint32, fd int) error {\\n\\tm, err := ebpf.LoadPinnedMap(targetMapPath(),\
+    \ nil)\\n\\tif err != nil {\\n\\t\\treturn fmt.Errorf(\\\"load target map: %w\\\", err)\\n\\t}\\n\\tdefer m.Close()\\\
+    n\\n\\tvalue := uint32(fd)\\n\\tif err := m.Update(&slot, &value, ebpf.UpdateAny); err != nil {\\n\\t\\treturn fmt.Errorf(\\\
+    \"update target map: %w\\\", err)\\n\\t}\\n\\treturn nil\\n}\"\n                },\n                {\n              \
+    \    \"path\": \"internal/server/ebpf.go\",\n                  \"snippet\": \"func clearTargets(numSlots int) error {\\\
+    n\\tm, err := ebpf.LoadPinnedMap(targetMapPath(), nil)\\n\\tif err != nil {\\n\\t\\tif errors.Is(err, fs.ErrNotExist)\
+    \ {\\n\\t\\t\\treturn nil\\n\\t\\t}\\n\\t\\treturn err\\n\\t}\\n\\tdefer m.Close()\\n\\n\\tfor i := 0; i < numSlots; i++\
+    \ {\\n\\t\\tkey := uint32(i)\\n\\t\\tif err := m.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {\\\
+    n\\t\\t\\treturn fmt.Errorf(\\\"clear slot %d: %w\\\", i, err)\\n\\t\\t}\\n\\t}\\n\\treturn nil\\n}\"\n              \
+    \  },\n                {\n                  \"path\": \"internal/server/ebpf.go\",\n                  \"snippet\": \"\
+    func loadAgent(workers int) (*ebpfPolicy, error) {\\n\\tif err := ensureRlimit(); err != nil {\\n\\t\\treturn nil, err\\\
+    n\\t}\\n\\tpinDir := pinDirectory()\\n\\tif err := ensurePinDirectory(pinDir); err != nil {\\n\\t\\treturn nil, fmt.Errorf(\\\
+    \"ensure pin directory: %w\\\", err)\\n\\t}\\n\\tvar objs ebpfutil.AgentSelectorObjects\\n\\topts := &ebpf.CollectionOptions{\\\
+    n\\t\\tMaps: ebpf.MapOptions{PinPath: pinDir},\\n\\t}\\n\\tif err := ebpfutil.LoadAgentSelectorObjects(&objs, opts); err\
+    \ != nil {\\n\\t\\treturn nil, fmt.Errorf(\\\"load agent objects: %w\\\", err)\\n\\t}\\n\\n\\tif workers < 0 {\\n\\t\\\
+    tobjs.Close()\\n\\t\\treturn nil, ErrInvalidConfig(\\\"workers must be non-negative\\\")\\n\\t}\\n\\n\\tvar key uint32\
+    \ = 0\\n\\tstate := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive: uint32(workers),\\n\\t}\\n\\tif objs.PebbleAgentState\
+    \ != nil {\\n\\t\\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\\n\\t\\t\\tobjs.Close()\\\
+    n\\t\\t\\treturn nil, fmt.Errorf(\\\"configure agent state: %w\\\", err)\\n\\t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\\
+    n\\t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\n\\t\\tclose:   objs.Close,\\n\\t}, nil\\n}\"\n\
+    \                },\n                {\n                  \"path\": \"internal/server/server.go\",\n                 \
+    \ \"snippet\": \"func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\\n\\tattachPolicy := s.policy != nil\
+    \ && s.policy.program != nil && idx == 0\\n\\tvar attachErr error\\n\\n\\tlc := net.ListenConfig{Control: func(network,\
+    \ address string, c syscall.RawConn) error {\\n\\t\\treturn c.Control(func(fd uintptr) {\\n\\t\\t\\tif err := unix.SetsockoptInt(int(fd),\
+    \ unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil && attachErr == nil {\\n\\t\\t\\t\\tattachErr = fmt.Errorf(\\\"SO_REUSEADDR:\
+    \ %w\\\", err)\\n\\t\\t\\t\\treturn\\n\\t\\t\\t}\\n\\t\\t\\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT,\
+    \ 1); err != nil && attachErr == nil {\\n\\t\\t\\t\\tattachErr = fmt.Errorf(\\\"SO_REUSEPORT: %w\\\", err)\\n\\t\\t\\\
+    t\\treturn\\n\\t\\t\\t}\\n\\t\\t\\tif attachPolicy && attachErr == nil {\\n\\t\\t\\t\\tif err := s.policy.attach(int(fd));\
+    \ err != nil {\\n\\t\\t\\t\\t\\tattachErr = err\\n\\t\\t\\t\\t}\\n\\t\\t\\t}\\n\\t\\t})\\n\\t}}\\n\\n\\tpc, err := lc.ListenPacket(context.Background(),\
+    \ \\\"udp\\\", s.cfg.ListenAddr)\\n\\tif err != nil {\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif attachErr != nil {\\\
+    n\\t\\tpc.Close()\\n\\t\\treturn nil, -1, attachErr\\n\\t}\\n\\n\\tudpConn := pc.(*net.UDPConn)\\n\\tvar fd int\\n\\traw,\
+    \ err := udpConn.SyscallConn()\\n\\tif err != nil {\\n\\t\\tudpConn.Close()\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif\
+    \ err := raw.Control(func(value uintptr) {\\n\\t\\tfd = int(value)\\n\\t}); err != nil {\\n\\t\\tudpConn.Close()\\n\\\
+    t\\treturn nil, -1, err\\n\\t}\\n\\n\\treturn udpConn, fd, nil\\n}\"\n                }\n              ]\n           \
+    \ }\n          },\n          {\n            \"question\": \"In internal/server/server.go\\u2019s Run/openWorker path for\
+    \ policy=agent, does the server always open and spawn workers for all Config.Workers, or can it decide to open/spawn only\
+    \ a subset based on agent-related state?\",\n            \"answer\": {\n              \"answer\": \"The server always\
+    \ opens and spawns workers for all cfg.Workers, even when policy=agent. In Run, it unconditionally loops from i = 0 to\
+    \ i < s.cfg.Workers, calling openWorker(i) and then spawnWorker for each index. The eBPF agent state in loadAgent is only\
+    \ used to record the number of workers (Active: uint32(workers)) and does not feed back into Run/openWorker to change\
+    \ how many workers are opened or spawned. There is no logic in Run or openWorker that consults any agent-related state\
+    \ to select a subset of workers.\",\n              \"code_snippets\": [\n                {\n                  \"path\"\
+    : \"internal/server/server.go\",\n                  \"snippet\": \"func (s *Server) Run(ctx context.Context) error {\\\
+    n\\tif len(s.stats) != s.cfg.Workers {\\n\\t\\ts.stats = make([]workerStats, s.cfg.Workers)\\n\\t}\\n\\tfor i := range\
+    \ s.stats {\\n\\t\\ts.stats[i].reset()\\n\\t}\\n\\t...\\n\\tfor i := 0; i < s.cfg.Workers; i++ {\\n\\t\\tconn, fd, err\
+    \ := s.openWorker(i)\\n\\t\\tif err != nil {\\n\\t\\t\\treturn fmt.Errorf(\\\"open worker %d: %w\\\", i, err)\\n\\t\\\
+    t}\\n\\n\\t\\tif s.policy != nil && s.policy.program != nil {\\n\\t\\t\\tif err := updateTargetsMap(uint32(i), fd); err\
+    \ != nil {\\n\\t\\t\\t\\tconn.Close()\\n\\t\\t\\t\\treturn fmt.Errorf(\\\"update reuseport map: %w\\\", err)\\n\\t\\t\\\
+    t}\\n\\t\\t}\\n\\n\\t\\ts.conns = append(s.conns, conn)\\n\\t\\ts.spawnWorker(ctx, i, conn)\\n\\t}\\n\\n\\t<-ctx.Done()\\\
+    n\\tfor _, conn := range s.conns {\\n\\t\\tconn.Close()\\n\\t}\\n\\ts.wg.Wait()\\n\\treturn nil\\n}\\n\"\n           \
+    \     },\n                {\n                  \"path\": \"internal/server/server.go\",\n                  \"snippet\"\
+    : \"func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\\n\\tattachPolicy := s.policy != nil && s.policy.program\
+    \ != nil && idx == 0\\n\\t...\\n\\tpc, err := lc.ListenPacket(context.Background(), \\\"udp\\\", s.cfg.ListenAddr)\\n\\\
+    tif err != nil {\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif attachErr != nil {\\n\\t\\tpc.Close()\\n\\t\\treturn nil,\
+    \ -1, attachErr\\n\\t}\\n\\t...\\n\\treturn udpConn, fd, nil\\n}\\n\"\n                },\n                {\n       \
+    \           \"path\": \"internal/server/ebpf.go\",\n                  \"snippet\": \"func loadAgent(workers int) (*ebpfPolicy,\
+    \ error) {\\n\\t...\\n\\tvar key uint32 = 0\\n\\tstate := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive: uint32(workers),\\\
+    n\\t}\\n\\tif objs.PebbleAgentState != nil {\\n\\t\\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny);\
+    \ err != nil {\\n\\t\\t\\tobjs.Close()\\n\\t\\t\\treturn nil, fmt.Errorf(\\\"configure agent state: %w\\\", err)\\n\\\
+    t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\n\\t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\n\\\
+    t\\tclose:   objs.Close,\\n\\t}, nil\\n}\\n\"\n                }\n              ]\n            }\n          },\n     \
+    \     {\n            \"question\": \"In cmd/workload_client, how many UDPConns are created for sending by default, and\
+    \ do different send workers each use their own UDPConn (distinct local UDP ports) or share a single UDPConn/source port?\"\
+    ,\n            \"answer\": {\n              \"answer\": \"By default, `send-workers` is set to 1, so a single `net.UDPConn`\
+    \ is created for sending. When `send-workers` is increased, each worker calls `net.DialUDP` separately and therefore gets\
+    \ its own `UDPConn` (and thus its own local UDP source port); workers do not share a single `UDPConn`.\",\n          \
+    \    \"code_snippets\": [\n                {\n                  \"path\": \"cmd/workload_client/main.go\",\n         \
+    \         \"snippet\": \"var (\\n\\t\\tserverAddr  = flag.String(\\\"server\\\", \\\"127.0.0.1:9000\\\", \\\"UDP server\
+    \ address\\\")\\n\\t\\t...\\n\\t\\tsendWorkers = flag.Int(\\\"send-workers\\\", 1, \\\"number of concurrent send workers\\\
+    \")\\n\\t)\\n\\tflag.Parse()\\n\\n\\tworkers := *sendWorkers\\n\\tif workers <= 0 {\\n\\t\\tworkers = 1\\n\\t}\\n\"\n\
+    \                },\n                {\n                  \"path\": \"cmd/workload_client/main.go\",\n               \
+    \   \"snippet\": \"conn, err := net.DialUDP(\\\"udp\\\", nil, udpAddr)\\n\\t\\tif err != nil {\\n\\t\\t\\tlogger.Fatalf(\\\
+    \"dial udp worker=%d: %v\\\", i, err)\\n\\t\\t}\\n\\t\\tdefer conn.Close()\\n\\n\\t\\tseed := time.Now().UnixNano() +\
+    \ int64(i)\\n\\t\\trng := rand.New(rand.NewSource(seed))\\n\\n\\t\\tworkerID := i\\n\\n\\t\\tsendWG.Add(1)\\n\\t\\tgo\
+    \ func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\\n\\t\\t\\tdefer sendWG.Done()\\n\\t\\t\\tbuf := make([]byte,\
+    \ 0, 256)\\n\\t\\t\\tfor {\\n\\t\\t\\t\\tif err := limiter.Wait(ctx); err != nil {\\n\\t\\t\\t\\t\\treturn\\n\\t\\t\\\
+    t\\t}\\n\\t\\t\\t\\t...\\n\\t\\t\\t\\tif _, err := conn.Write(payload); err != nil {\\n\\t\\t\\t\\t\\tlogger.Printf(\\\
+    \"write error (worker=%d): %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tbuf = payload[:0]\\n\\t\\t\\t\\t\\tcontinue\\n\\t\\\
+    t\\t\\t}\\n\\t\\t\\t\\t...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn, rng)\\n\"\n                }\n              ]\n    \
+    \        }\n          },\n          {\n            \"question\": \"In cmd/workload_client, which latency series is used\
+    \ to compute the p99 value that run.sh parses into workload_summary.json\\u2014overall requests, GET-only, or SCAN-only?\"\
+    ,\n            \"answer\": {\n              \"answer\": \"The p99 value that run.sh parses into workload_summary.json\
+    \ comes from the **Overall** latency series (all requests combined), not the GET-only or SCAN-only series.\",\n      \
+    \        \"code_snippets\": [\n                {\n                  \"path\": \"cmd/workload_client/main.go\",\n     \
+    \             \"snippet\": \"fmt.Printf(\\\"Total received: %d (GET=%d SCAN=%d)\\\\n\\\", totalRecv, len(aggregator.get),\
+    \ len(aggregator.scan))\\nfmt.Printf(\\\"Throughput: %.2f req/s\\\\n\\\", throughput)\\nreportLatencyStats(\\\"Overall\\\
+    \", aggregator.overall)\\nreportLatencyStats(\\\"GET\\\", aggregator.get)\\nreportLatencyStats(\\\"SCAN\\\", aggregator.scan)\\\
+    n\"\n                },\n                {\n                  \"path\": \"cmd/workload_client/main.go\",\n           \
+    \       \"snippet\": \"func reportLatencyStats(label string, data []float64) {\\n\\tif len(data) == 0 {\\n\\t\\tfmt.Printf(\\\
+    \"%s latency: no data\\\\n\\\", label)\\n\\t\\treturn\\n\\t}\\n\\tsorted := append([]float64(nil), data...)\\n\\tsort.Float64s(sorted)\\\
+    n\\tfmt.Printf(\\\"%s latency p50: %.3f ms\\\\n\\\", label, percentile(sorted, 50))\\n\\tfmt.Printf(\\\"%s latency p90:\
+    \ %.3f ms\\\\n\\\", label, percentile(sorted, 90))\\n\\tfmt.Printf(\\\"%s latency p99: %.3f ms\\\\n\\\", label, percentile(sorted,\
+    \ 99))\\n\\tfmt.Printf(\\\"%s latency avg: %.3f ms\\\\n\\\", label, average(sorted))\\n}\\n\"\n                }\n   \
+    \           ]\n            }\n          }\n        ],\n        \"iteration_type\": \"question\",\n        \"parsed_response\"\
+    : {\n          \"status\": \"continue\",\n          \"Summary\": \"Across five runs (policy=agent, 6 configured workers,\
+    \ GET delay=10\\u00b5s, SCAN delay=2ms), the client sends at 80k\\u2013180k req/s with 99% GETs. Client logs show that\
+    \ only the 100k run returns all responses; the others drop some fraction of requests and exhibit growing outstanding counts.\
+    \ Server perf logs show per-worker GET/SCAN times very close to the synthetic delays (\\u224810\\u00b5s / 2ms) and no\
+    \ parse errors, but only a subset of the 6 workers receive any traffic in each run, with the active subset changing by\
+    \ rate (e.g., 1\\u20135 at 80k/100k, 0/3/4/5 at 140k, 0/2/4 at 160k, mostly 1\\u20134 at 180k). Aggregate server throughput\
+    \ per-second saturates around ~70k\\u2013105k req/s even when offered load is higher, and missing responses increase with\
+    \ offered rate.\",\n          \"hypothesis\": {\n            \"text\": \"The agent_udp_selector program effectively pins\
+    \ each client UDP flow to a fixed reuseport slot using start = reuse->hash % state->active, so selection is per-flow rather\
+    \ than per-packet. Combined with how pebble_agent_state.active and pebble_udp_targets are configured for the agent policy,\
+    \ only a subset of the 6 logical workers actually receive packets in each run. Each active worker is single-threaded and\
+    \ limited by the 10\\u00b5s/2ms busy-wait delays to roughly ~20\\u201325k ops/s, so the total processing capacity is approximately\
+    \ (#effectively-active-workers) \\u00d7 (~20\\u201325k). At 100k offered load this matches capacity (\\u22485 active workers),\
+    \ leading to manageable queues and low p99; at lower/higher rates, the chosen active set and hashing of a small number\
+    \ of client flows onto few workers create either underutilization or overload, causing UDP receive-queue buildup and drops\
+    \ (missing responses) and higher p99 due to queueing on the overloaded workers while some workers remain idle.\",\n  \
+    \          \"score\": 6\n          },\n          \"questions\": [\n            \"In internal/server/ebpf.go, when loading\
+    \ the \\\"agent\\\" policy, how is the pebble_agent_state.active field initialized and/or updated at runtime? Is it always\
+    \ set equal to Config.Workers, or can it be smaller or overridden by other configuration?\",\n            \"In internal/server/ebpf.go\\\
+    u2019s updateTargetsMap (or equivalent for the agent policy), what is the exact mapping between pebble_udp_targets keys\
+    \ (slots) and server workers\\u2014does slot i always correspond to worker index i, and are all Config.Workers sockets\
+    \ inserted into the map?\",\n            \"In internal/server/server.go\\u2019s Run/openWorker path for policy=agent,\
+    \ does the server always open and spawn workers for all Config.Workers, or can it decide to open/spawn only a subset based\
+    \ on agent-related state?\",\n            \"In cmd/workload_client, how many UDPConns are created for sending by default,\
+    \ and do different send workers each use their own UDPConn (distinct local UDP ports) or share a single UDPConn/source\
+    \ port?\",\n            \"In cmd/workload_client, which latency series is used to compute the p99 value that run.sh parses\
+    \ into workload_summary.json\\u2014overall requests, GET-only, or SCAN-only?\"\n          ],\n          \"question_answers\"\
+    : [\n            {\n              \"question\": \"In internal/server/ebpf.go, when loading the \\\"agent\\\" policy, how\
+    \ is the pebble_agent_state.active field initialized and/or updated at runtime? Is it always set equal to Config.Workers,\
+    \ or can it be smaller or overridden by other configuration?\",\n              \"answer\": {\n                \"answer\"\
+    : \"When the \\\"agent\\\" policy is loaded, the code constructs an `ebpfutil.AgentSelectorAgentState` with `Active` set\
+    \ directly from the `workers` parameter (converted to `uint32`), and then writes that value into the `PebbleAgentState`\
+    \ map at key 0 using `Update` with `ebpf.UpdateAny`.\\n\\nThe function enforces that `workers` must be non\\u2011negative,\
+    \ but does not apply any other logic to reduce or override it. There is no lookup of existing state, no clamping, and\
+    \ no additional configuration involved. Thus, at load time, `pebble_agent_state.active` is always set exactly to the `workers`\
+    \ argument passed into `loadAgent`, which corresponds to `Config.Workers` (assuming that value is what is passed in by\
+    \ the caller), and it is not made smaller or overridden by any other configuration within this function.\",\n        \
+    \        \"code_snippets\": [\n                  {\n                    \"path\": \"internal/server/ebpf.go\",\n     \
+    \               \"snippet\": \"func loadAgent(workers int) (*ebpfPolicy, error) {\\n\\t...\\n\\tif workers < 0 {\\n\\\
+    t\\tobjs.Close()\\n\\t\\treturn nil, ErrInvalidConfig(\\\"workers must be non-negative\\\")\\n\\t}\\n\\n\\tvar key uint32\
+    \ = 0\\n\\tstate := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive: uint32(workers),\\n\\t}\\n\\tif objs.PebbleAgentState\
+    \ != nil {\\n\\t\\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\\n\\t\\t\\tobjs.Close()\\\
+    n\\t\\t\\treturn nil, fmt.Errorf(\\\"configure agent state: %w\\\", err)\\n\\t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\\
+    n\\t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\n\\t\\tclose:   objs.Close,\\n\\t}, nil\\n}\\\
+    n\"\n                  }\n                ]\n              }\n            },\n            {\n              \"question\"\
+    : \"In internal/server/ebpf.go\\u2019s updateTargetsMap (or equivalent for the agent policy), what is the exact mapping\
+    \ between pebble_udp_targets keys (slots) and server workers\\u2014does slot i always correspond to worker index i, and\
+    \ are all Config.Workers sockets inserted into the map?\",\n              \"answer\": {\n                \"answer\": \"\
+    Slots in the pebble_udp_targets map are addressed by a uint32 slot key, and updateTargetsMap simply writes a given file\
+    \ descriptor into the entry for that slot key. There is no remapping or transformation of the index: the key passed into\
+    \ updateTargetsMap is used directly as the map key, so slot i corresponds exactly to the worker index i that the caller\
+    \ chooses to pass.\\n\\nThe agent-related loader (loadAgent) configures only the agent state (Active workers count) via\
+    \ the PebbleAgentState map and returns the eBPF program handle; it does not itself populate the pebble_udp_targets map\
+    \ or insert socket FDs. Thus, whether all Config.Workers sockets are inserted\\u2014and which worker index is mapped to\
+    \ which slot\\u2014is determined entirely by the code that calls updateTargetsMap, not by updateTargetsMap or loadAgent.\
+    \ The provided code does not enforce or guarantee that every Config.Workers socket is inserted; it merely supports a 1:1\
+    \ mapping from the caller\\u2019s slot index to the underlying worker FD.\\n\\nIn short: slot i is used as given (so it\
+    \ will match worker index i if the caller uses that convention), and these functions do not themselves ensure that all\
+    \ worker sockets are present in the map.\",\n                \"code_snippets\": [\n                  {\n             \
+    \       \"path\": \"internal/server/ebpf.go\",\n                    \"snippet\": \"func updateTargetsMap(slot uint32,\
+    \ fd int) error {\\n\\tm, err := ebpf.LoadPinnedMap(targetMapPath(), nil)\\n\\tif err != nil {\\n\\t\\treturn fmt.Errorf(\\\
+    \"load target map: %w\\\", err)\\n\\t}\\n\\tdefer m.Close()\\n\\n\\tvalue := uint32(fd)\\n\\tif err := m.Update(&slot,\
+    \ &value, ebpf.UpdateAny); err != nil {\\n\\t\\treturn fmt.Errorf(\\\"update target map: %w\\\", err)\\n\\t}\\n\\treturn\
+    \ nil\\n}\"\n                  },\n                  {\n                    \"path\": \"internal/server/ebpf.go\",\n \
+    \                   \"snippet\": \"func clearTargets(numSlots int) error {\\n\\tm, err := ebpf.LoadPinnedMap(targetMapPath(),\
+    \ nil)\\n\\tif err != nil {\\n\\t\\tif errors.Is(err, fs.ErrNotExist) {\\n\\t\\t\\treturn nil\\n\\t\\t}\\n\\t\\treturn\
+    \ err\\n\\t}\\n\\tdefer m.Close()\\n\\n\\tfor i := 0; i < numSlots; i++ {\\n\\t\\tkey := uint32(i)\\n\\t\\tif err := m.Delete(&key);\
+    \ err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {\\n\\t\\t\\treturn fmt.Errorf(\\\"clear slot %d: %w\\\", i, err)\\\
+    n\\t\\t}\\n\\t}\\n\\treturn nil\\n}\"\n                  },\n                  {\n                    \"path\": \"internal/server/ebpf.go\"\
+    ,\n                    \"snippet\": \"func loadAgent(workers int) (*ebpfPolicy, error) {\\n\\tif err := ensureRlimit();\
+    \ err != nil {\\n\\t\\treturn nil, err\\n\\t}\\n\\tpinDir := pinDirectory()\\n\\tif err := ensurePinDirectory(pinDir);\
+    \ err != nil {\\n\\t\\treturn nil, fmt.Errorf(\\\"ensure pin directory: %w\\\", err)\\n\\t}\\n\\tvar objs ebpfutil.AgentSelectorObjects\\\
+    n\\topts := &ebpf.CollectionOptions{\\n\\t\\tMaps: ebpf.MapOptions{PinPath: pinDir},\\n\\t}\\n\\tif err := ebpfutil.LoadAgentSelectorObjects(&objs,\
+    \ opts); err != nil {\\n\\t\\treturn nil, fmt.Errorf(\\\"load agent objects: %w\\\", err)\\n\\t}\\n\\n\\tif workers <\
+    \ 0 {\\n\\t\\tobjs.Close()\\n\\t\\treturn nil, ErrInvalidConfig(\\\"workers must be non-negative\\\")\\n\\t}\\n\\n\\tvar\
+    \ key uint32 = 0\\n\\tstate := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive: uint32(workers),\\n\\t}\\n\\tif objs.PebbleAgentState\
+    \ != nil {\\n\\t\\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\\n\\t\\t\\tobjs.Close()\\\
+    n\\t\\t\\treturn nil, fmt.Errorf(\\\"configure agent state: %w\\\", err)\\n\\t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\\
+    n\\t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\n\\t\\tclose:   objs.Close,\\n\\t}, nil\\n}\"\n\
+    \                  },\n                  {\n                    \"path\": \"internal/server/server.go\",\n           \
+    \         \"snippet\": \"func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\\n\\tattachPolicy := s.policy\
+    \ != nil && s.policy.program != nil && idx == 0\\n\\tvar attachErr error\\n\\n\\tlc := net.ListenConfig{Control: func(network,\
+    \ address string, c syscall.RawConn) error {\\n\\t\\treturn c.Control(func(fd uintptr) {\\n\\t\\t\\tif err := unix.SetsockoptInt(int(fd),\
+    \ unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil && attachErr == nil {\\n\\t\\t\\t\\tattachErr = fmt.Errorf(\\\"SO_REUSEADDR:\
+    \ %w\\\", err)\\n\\t\\t\\t\\treturn\\n\\t\\t\\t}\\n\\t\\t\\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT,\
+    \ 1); err != nil && attachErr == nil {\\n\\t\\t\\t\\tattachErr = fmt.Errorf(\\\"SO_REUSEPORT: %w\\\", err)\\n\\t\\t\\\
+    t\\treturn\\n\\t\\t\\t}\\n\\t\\t\\tif attachPolicy && attachErr == nil {\\n\\t\\t\\t\\tif err := s.policy.attach(int(fd));\
+    \ err != nil {\\n\\t\\t\\t\\t\\tattachErr = err\\n\\t\\t\\t\\t}\\n\\t\\t\\t}\\n\\t\\t})\\n\\t}}\\n\\n\\tpc, err := lc.ListenPacket(context.Background(),\
+    \ \\\"udp\\\", s.cfg.ListenAddr)\\n\\tif err != nil {\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif attachErr != nil {\\\
+    n\\t\\tpc.Close()\\n\\t\\treturn nil, -1, attachErr\\n\\t}\\n\\n\\tudpConn := pc.(*net.UDPConn)\\n\\tvar fd int\\n\\traw,\
+    \ err := udpConn.SyscallConn()\\n\\tif err != nil {\\n\\t\\tudpConn.Close()\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif\
+    \ err := raw.Control(func(value uintptr) {\\n\\t\\tfd = int(value)\\n\\t}); err != nil {\\n\\t\\tudpConn.Close()\\n\\\
+    t\\treturn nil, -1, err\\n\\t}\\n\\n\\treturn udpConn, fd, nil\\n}\"\n                  }\n                ]\n       \
+    \       }\n            },\n            {\n              \"question\": \"In internal/server/server.go\\u2019s Run/openWorker\
+    \ path for policy=agent, does the server always open and spawn workers for all Config.Workers, or can it decide to open/spawn\
+    \ only a subset based on agent-related state?\",\n              \"answer\": {\n                \"answer\": \"The server\
+    \ always opens and spawns workers for all cfg.Workers, even when policy=agent. In Run, it unconditionally loops from i\
+    \ = 0 to i < s.cfg.Workers, calling openWorker(i) and then spawnWorker for each index. The eBPF agent state in loadAgent\
+    \ is only used to record the number of workers (Active: uint32(workers)) and does not feed back into Run/openWorker to\
+    \ change how many workers are opened or spawned. There is no logic in Run or openWorker that consults any agent-related\
+    \ state to select a subset of workers.\",\n                \"code_snippets\": [\n                  {\n               \
+    \     \"path\": \"internal/server/server.go\",\n                    \"snippet\": \"func (s *Server) Run(ctx context.Context)\
+    \ error {\\n\\tif len(s.stats) != s.cfg.Workers {\\n\\t\\ts.stats = make([]workerStats, s.cfg.Workers)\\n\\t}\\n\\tfor\
+    \ i := range s.stats {\\n\\t\\ts.stats[i].reset()\\n\\t}\\n\\t...\\n\\tfor i := 0; i < s.cfg.Workers; i++ {\\n\\t\\tconn,\
+    \ fd, err := s.openWorker(i)\\n\\t\\tif err != nil {\\n\\t\\t\\treturn fmt.Errorf(\\\"open worker %d: %w\\\", i, err)\\\
+    n\\t\\t}\\n\\n\\t\\tif s.policy != nil && s.policy.program != nil {\\n\\t\\t\\tif err := updateTargetsMap(uint32(i), fd);\
+    \ err != nil {\\n\\t\\t\\t\\tconn.Close()\\n\\t\\t\\t\\treturn fmt.Errorf(\\\"update reuseport map: %w\\\", err)\\n\\\
+    t\\t\\t}\\n\\t\\t}\\n\\n\\t\\ts.conns = append(s.conns, conn)\\n\\t\\ts.spawnWorker(ctx, i, conn)\\n\\t}\\n\\n\\t<-ctx.Done()\\\
+    n\\tfor _, conn := range s.conns {\\n\\t\\tconn.Close()\\n\\t}\\n\\ts.wg.Wait()\\n\\treturn nil\\n}\\n\"\n           \
+    \       },\n                  {\n                    \"path\": \"internal/server/server.go\",\n                    \"\
+    snippet\": \"func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\\n\\tattachPolicy := s.policy != nil &&\
+    \ s.policy.program != nil && idx == 0\\n\\t...\\n\\tpc, err := lc.ListenPacket(context.Background(), \\\"udp\\\", s.cfg.ListenAddr)\\\
+    n\\tif err != nil {\\n\\t\\treturn nil, -1, err\\n\\t}\\n\\tif attachErr != nil {\\n\\t\\tpc.Close()\\n\\t\\treturn nil,\
+    \ -1, attachErr\\n\\t}\\n\\t...\\n\\treturn udpConn, fd, nil\\n}\\n\"\n                  },\n                  {\n   \
+    \                 \"path\": \"internal/server/ebpf.go\",\n                    \"snippet\": \"func loadAgent(workers int)\
+    \ (*ebpfPolicy, error) {\\n\\t...\\n\\tvar key uint32 = 0\\n\\tstate := ebpfutil.AgentSelectorAgentState{\\n\\t\\tActive:\
+    \ uint32(workers),\\n\\t}\\n\\tif objs.PebbleAgentState != nil {\\n\\t\\tif err := objs.PebbleAgentState.Update(&key,\
+    \ &state, ebpf.UpdateAny); err != nil {\\n\\t\\t\\tobjs.Close()\\n\\t\\t\\treturn nil, fmt.Errorf(\\\"configure agent\
+    \ state: %w\\\", err)\\n\\t\\t}\\n\\t}\\n\\n\\treturn &ebpfPolicy{\\n\\t\\tname:    \\\"agent\\\",\\n\\t\\tprogram: objs.AgentUdpSelector,\\\
+    n\\t\\tclose:   objs.Close,\\n\\t}, nil\\n}\\n\"\n                  }\n                ]\n              }\n          \
+    \  },\n            {\n              \"question\": \"In cmd/workload_client, how many UDPConns are created for sending\
+    \ by default, and do different send workers each use their own UDPConn (distinct local UDP ports) or share a single UDPConn/source\
+    \ port?\",\n              \"answer\": {\n                \"answer\": \"By default, `send-workers` is set to 1, so a single\
+    \ `net.UDPConn` is created for sending. When `send-workers` is increased, each worker calls `net.DialUDP` separately and\
+    \ therefore gets its own `UDPConn` (and thus its own local UDP source port); workers do not share a single `UDPConn`.\"\
+    ,\n                \"code_snippets\": [\n                  {\n                    \"path\": \"cmd/workload_client/main.go\"\
+    ,\n                    \"snippet\": \"var (\\n\\t\\tserverAddr  = flag.String(\\\"server\\\", \\\"127.0.0.1:9000\\\",\
+    \ \\\"UDP server address\\\")\\n\\t\\t...\\n\\t\\tsendWorkers = flag.Int(\\\"send-workers\\\", 1, \\\"number of concurrent\
+    \ send workers\\\")\\n\\t)\\n\\tflag.Parse()\\n\\n\\tworkers := *sendWorkers\\n\\tif workers <= 0 {\\n\\t\\tworkers =\
+    \ 1\\n\\t}\\n\"\n                  },\n                  {\n                    \"path\": \"cmd/workload_client/main.go\"\
+    ,\n                    \"snippet\": \"conn, err := net.DialUDP(\\\"udp\\\", nil, udpAddr)\\n\\t\\tif err != nil {\\n\\\
+    t\\t\\tlogger.Fatalf(\\\"dial udp worker=%d: %v\\\", i, err)\\n\\t\\t}\\n\\t\\tdefer conn.Close()\\n\\n\\t\\tseed := time.Now().UnixNano()\
+    \ + int64(i)\\n\\t\\trng := rand.New(rand.NewSource(seed))\\n\\n\\t\\tworkerID := i\\n\\n\\t\\tsendWG.Add(1)\\n\\t\\tgo\
+    \ func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\\n\\t\\t\\tdefer sendWG.Done()\\n\\t\\t\\tbuf := make([]byte,\
+    \ 0, 256)\\n\\t\\t\\tfor {\\n\\t\\t\\t\\tif err := limiter.Wait(ctx); err != nil {\\n\\t\\t\\t\\t\\treturn\\n\\t\\t\\\
+    t\\t}\\n\\t\\t\\t\\t...\\n\\t\\t\\t\\tif _, err := conn.Write(payload); err != nil {\\n\\t\\t\\t\\t\\tlogger.Printf(\\\
+    \"write error (worker=%d): %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tbuf = payload[:0]\\n\\t\\t\\t\\t\\tcontinue\\n\\t\\\
+    t\\t\\t}\\n\\t\\t\\t\\t...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn, rng)\\n\"\n                  }\n                ]\n\
+    \              }\n            },\n            {\n              \"question\": \"In cmd/workload_client, which latency series\
+    \ is used to compute the p99 value that run.sh parses into workload_summary.json\\u2014overall requests, GET-only, or\
+    \ SCAN-only?\",\n              \"answer\": {\n                \"answer\": \"The p99 value that run.sh parses into workload_summary.json\
+    \ comes from the **Overall** latency series (all requests combined), not the GET-only or SCAN-only series.\",\n      \
+    \          \"code_snippets\": [\n                  {\n                    \"path\": \"cmd/workload_client/main.go\",\n\
+    \                    \"snippet\": \"fmt.Printf(\\\"Total received: %d (GET=%d SCAN=%d)\\\\n\\\", totalRecv, len(aggregator.get),\
+    \ len(aggregator.scan))\\nfmt.Printf(\\\"Throughput: %.2f req/s\\\\n\\\", throughput)\\nreportLatencyStats(\\\"Overall\\\
+    \", aggregator.overall)\\nreportLatencyStats(\\\"GET\\\", aggregator.get)\\nreportLatencyStats(\\\"SCAN\\\", aggregator.scan)\\\
+    n\"\n                  },\n                  {\n                    \"path\": \"cmd/workload_client/main.go\",\n     \
+    \               \"snippet\": \"func reportLatencyStats(label string, data []float64) {\\n\\tif len(data) == 0 {\\n\\t\\\
+    tfmt.Printf(\\\"%s latency: no data\\\\n\\\", label)\\n\\t\\treturn\\n\\t}\\n\\tsorted := append([]float64(nil), data...)\\\
+    n\\tsort.Float64s(sorted)\\n\\tfmt.Printf(\\\"%s latency p50: %.3f ms\\\\n\\\", label, percentile(sorted, 50))\\n\\tfmt.Printf(\\\
+    \"%s latency p90: %.3f ms\\\\n\\\", label, percentile(sorted, 90))\\n\\tfmt.Printf(\\\"%s latency p99: %.3f ms\\\\n\\\"\
+    , label, percentile(sorted, 99))\\n\\tfmt.Printf(\\\"%s latency avg: %.3f ms\\\\n\\\", label, average(sorted))\\n}\\n\"\
+    \n                  }\n                ]\n              }\n            }\n          ]\n        }\n      },\n      {\n\
+    \        \"iteration\": 1,\n        \"assistant_role\": \"assistant\",\n        \"assistant_content_format\": \"json\"\
+    ,\n        \"assistant_content_raw\": \"{\\\"status\\\":\\\"continue\\\",\\\"Summary\\\":\\\"RAG confirms that for policy=agent\
+    \ the server always spawns all Config.Workers, sets pebble_agent_state.Active exactly equal to the worker count, and inserts\
+    \ every worker FD into pebble_udp_targets at slot i for worker i. The eBPF selector computes start = reuse->hash % Active\
+    \ and uses bpf_sk_select_reuseport once per packet, so each 4\\u2011tuple (UDP flow) is pinned to a single worker slot.\
+    \ Client code uses one UDPConn per send worker (distinct source ports), and p99 latency is computed over all requests.\
+    \ Logs show that in each run only a subset of workers report any traffic, and aggregate server throughput plateaus around\
+    \ ~75\\u2013105k req/s while offered load rises to 180k; missing responses and outstanding counts grow substantially at\
+    \ higher rates.\\\",\\\"hypothesis\\\":{\\\"text\\\":\\\"Because agent_udp_selector hashes on reuse->hash and uses that\
+    \ to choose exactly one reuseport slot per flow, each client UDP flow (one per send worker / source port) is pinned to\
+    \ a single server worker. The experiment is running with only a small number of client send workers, so their flows hash\
+    \ into only 3\\u20135 of the 6 reuseport slots; workers with no flow assignment never see traffic and therefore never\
+    \ appear in the perf logs. Each active worker processes requests sequentially and spends most of its time in busy\\u2011wait\
+    \ delays (10\\u00b5s GET, 2ms SCAN), capping per\\u2011worker throughput around 20\\u201325k req/s. The system\\u2019s\
+    \ effective capacity is thus roughly (#hash-occupied slots) \\u00d7 (~20\\u201325k). At 80k\\u2013100k offered load, about\
+    \ 5 workers are occupied, and the system can nearly keep up (yielding ~95k req/s at 100k and moderate queueing). At higher\
+    \ loads, random hashing assigns only 3\\u20134 slots, so total capacity drops to ~75\\u2013100k while offered load is\
+    \ 140\\u2013180k. Packets to those few hot workers queue up in the UDP receive queues, causing long wait times before\
+    \ handleRequest runs and ultimately packet drops once queues overflow, which explains the very high overall p99 latencies\
+    \ and the large number of missing responses while some workers remain idle.\\\",\\\"score\\\":7},\\\"questions\\\":[\\\
+    \"In run.sh, when invoking cmd/workload_client in the run_client function, what value is passed to the -send-workers flag\
+    \ (and is it derived from any server-side workers setting or fixed)?\\\",\\\"In internal/server/server.go\\u2019s startStatsLogger\
+    \ implementation, does it iterate over all s.stats entries every second and only emit a \\\\\\\"[perf] worker=...\\\\\\\
+    \" line when that worker\\u2019s gets+scans count for the interval is > 0?\\\",\\\"In internal/server/server.go\\u2019s\
+    \ spawnWorker function, for each packet read from the UDP socket, is handleRequest executed synchronously in the same\
+    \ goroutine (one request at a time per worker), or is the request handed off to a separate goroutine or pool?\\\",\\\"\
+    Looking at the full handleRequest implementation in internal/server/server.go, aside from the busy-wait delay and a single\
+    \ conn.Write to send the response, are there any other potentially blocking operations (e.g., channel sends, mutexes,\
+    \ heavy logging) on the hot path for each request?\\\",\\\"In cmd/workload_client, how many receive goroutines are created\
+    \ relative to the number of send workers and UDPConns, and do they each call ReadFromUDP on their own conn or share a\
+    \ single receiving socket?\\\"]}\",\n        \"full_response\": {\n          \"id\": \"chatcmpl-Cihu9g33Tg8n0NvR3W0Ny0Q4PDupZ\"\
+    ,\n          \"choices\": [\n            {\n              \"finish_reason\": \"stop\",\n              \"index\": 0,\n\
+    \              \"logprobs\": null,\n              \"message\": {\n                \"content\": \"{\\\"status\\\":\\\"\
+    continue\\\",\\\"Summary\\\":\\\"RAG confirms that for policy=agent the server always spawns all Config.Workers, sets\
+    \ pebble_agent_state.Active exactly equal to the worker count, and inserts every worker FD into pebble_udp_targets at\
+    \ slot i for worker i. The eBPF selector computes start = reuse->hash % Active and uses bpf_sk_select_reuseport once per\
+    \ packet, so each 4\\u2011tuple (UDP flow) is pinned to a single worker slot. Client code uses one UDPConn per send worker\
+    \ (distinct source ports), and p99 latency is computed over all requests. Logs show that in each run only a subset of\
+    \ workers report any traffic, and aggregate server throughput plateaus around ~75\\u2013105k req/s while offered load\
+    \ rises to 180k; missing responses and outstanding counts grow substantially at higher rates.\\\",\\\"hypothesis\\\":{\\\
+    \"text\\\":\\\"Because agent_udp_selector hashes on reuse->hash and uses that to choose exactly one reuseport slot per\
+    \ flow, each client UDP flow (one per send worker / source port) is pinned to a single server worker. The experiment is\
+    \ running with only a small number of client send workers, so their flows hash into only 3\\u20135 of the 6 reuseport\
+    \ slots; workers with no flow assignment never see traffic and therefore never appear in the perf logs. Each active worker\
+    \ processes requests sequentially and spends most of its time in busy\\u2011wait delays (10\\u00b5s GET, 2ms SCAN), capping\
+    \ per\\u2011worker throughput around 20\\u201325k req/s. The system\\u2019s effective capacity is thus roughly (#hash-occupied\
+    \ slots) \\u00d7 (~20\\u201325k). At 80k\\u2013100k offered load, about 5 workers are occupied, and the system can nearly\
+    \ keep up (yielding ~95k req/s at 100k and moderate queueing). At higher loads, random hashing assigns only 3\\u20134\
+    \ slots, so total capacity drops to ~75\\u2013100k while offered load is 140\\u2013180k. Packets to those few hot workers\
+    \ queue up in the UDP receive queues, causing long wait times before handleRequest runs and ultimately packet drops once\
+    \ queues overflow, which explains the very high overall p99 latencies and the large number of missing responses while\
+    \ some workers remain idle.\\\",\\\"score\\\":7},\\\"questions\\\":[\\\"In run.sh, when invoking cmd/workload_client in\
+    \ the run_client function, what value is passed to the -send-workers flag (and is it derived from any server-side workers\
+    \ setting or fixed)?\\\",\\\"In internal/server/server.go\\u2019s startStatsLogger implementation, does it iterate over\
+    \ all s.stats entries every second and only emit a \\\\\\\"[perf] worker=...\\\\\\\" line when that worker\\u2019s gets+scans\
+    \ count for the interval is > 0?\\\",\\\"In internal/server/server.go\\u2019s spawnWorker function, for each packet read\
+    \ from the UDP socket, is handleRequest executed synchronously in the same goroutine (one request at a time per worker),\
+    \ or is the request handed off to a separate goroutine or pool?\\\",\\\"Looking at the full handleRequest implementation\
+    \ in internal/server/server.go, aside from the busy-wait delay and a single conn.Write to send the response, are there\
+    \ any other potentially blocking operations (e.g., channel sends, mutexes, heavy logging) on the hot path for each request?\\\
+    \",\\\"In cmd/workload_client, how many receive goroutines are created relative to the number of send workers and UDPConns,\
+    \ and do they each call ReadFromUDP on their own conn or share a single receiving socket?\\\"]}\",\n                \"\
+    refusal\": null,\n                \"role\": \"assistant\",\n                \"annotations\": [],\n                \"audio\"\
+    : null,\n                \"function_call\": null,\n                \"tool_calls\": null\n              }\n           \
+    \ }\n          ],\n          \"created\": 1764771237,\n          \"model\": \"gpt-5.1-2025-11-13\",\n          \"object\"\
+    : \"chat.completion\",\n          \"service_tier\": \"default\",\n          \"system_fingerprint\": null,\n          \"\
+    usage\": {\n            \"completion_tokens\": 10601,\n            \"prompt_tokens\": 26461,\n            \"total_tokens\"\
+    : 37062,\n            \"completion_tokens_details\": {\n              \"accepted_prediction_tokens\": 0,\n           \
+    \   \"audio_tokens\": 0,\n              \"reasoning_tokens\": 9870,\n              \"rejected_prediction_tokens\": 0\n\
+    \            },\n            \"prompt_tokens_details\": {\n              \"audio_tokens\": 0,\n              \"cached_tokens\"\
+    : 21760\n            }\n          }\n        },\n        \"status\": \"continue\",\n        \"Summary\": \"RAG confirms\
+    \ that for policy=agent the server always spawns all Config.Workers, sets pebble_agent_state.Active exactly equal to the\
+    \ worker count, and inserts every worker FD into pebble_udp_targets at slot i for worker i. The eBPF selector computes\
+    \ start = reuse->hash % Active and uses bpf_sk_select_reuseport once per packet, so each 4\\u2011tuple (UDP flow) is pinned\
+    \ to a single worker slot. Client code uses one UDPConn per send worker (distinct source ports), and p99 latency is computed\
+    \ over all requests. Logs show that in each run only a subset of workers report any traffic, and aggregate server throughput\
+    \ plateaus around ~75\\u2013105k req/s while offered load rises to 180k; missing responses and outstanding counts grow\
+    \ substantially at higher rates.\",\n        \"hypothesis\": {\n          \"text\": \"Because agent_udp_selector hashes\
+    \ on reuse->hash and uses that to choose exactly one reuseport slot per flow, each client UDP flow (one per send worker\
+    \ / source port) is pinned to a single server worker. The experiment is running with only a small number of client send\
+    \ workers, so their flows hash into only 3\\u20135 of the 6 reuseport slots; workers with no flow assignment never see\
+    \ traffic and therefore never appear in the perf logs. Each active worker processes requests sequentially and spends most\
+    \ of its time in busy\\u2011wait delays (10\\u00b5s GET, 2ms SCAN), capping per\\u2011worker throughput around 20\\u201325k\
+    \ req/s. The system\\u2019s effective capacity is thus roughly (#hash-occupied slots) \\u00d7 (~20\\u201325k). At 80k\\\
+    u2013100k offered load, about 5 workers are occupied, and the system can nearly keep up (yielding ~95k req/s at 100k and\
+    \ moderate queueing). At higher loads, random hashing assigns only 3\\u20134 slots, so total capacity drops to ~75\\u2013100k\
+    \ while offered load is 140\\u2013180k. Packets to those few hot workers queue up in the UDP receive queues, causing long\
+    \ wait times before handleRequest runs and ultimately packet drops once queues overflow, which explains the very high\
+    \ overall p99 latencies and the large number of missing responses while some workers remain idle.\",\n          \"score\"\
+    : 7\n        },\n        \"questions\": [\n          \"In run.sh, when invoking cmd/workload_client in the run_client\
+    \ function, what value is passed to the -send-workers flag (and is it derived from any server-side workers setting or\
+    \ fixed)?\",\n          \"In internal/server/server.go\\u2019s startStatsLogger implementation, does it iterate over all\
+    \ s.stats entries every second and only emit a \\\"[perf] worker=...\\\" line when that worker\\u2019s gets+scans count\
+    \ for the interval is > 0?\",\n          \"In internal/server/server.go\\u2019s spawnWorker function, for each packet\
+    \ read from the UDP socket, is handleRequest executed synchronously in the same goroutine (one request at a time per worker),\
+    \ or is the request handed off to a separate goroutine or pool?\",\n          \"Looking at the full handleRequest implementation\
+    \ in internal/server/server.go, aside from the busy-wait delay and a single conn.Write to send the response, are there\
+    \ any other potentially blocking operations (e.g., channel sends, mutexes, heavy logging) on the hot path for each request?\"\
+    ,\n          \"In cmd/workload_client, how many receive goroutines are created relative to the number of send workers\
+    \ and UDPConns, and do they each call ReadFromUDP on their own conn or share a single receiving socket?\"\n        ],\n\
+    \        \"question_answers\": [\n          {\n            \"question\": \"In run.sh, when invoking cmd/workload_client\
+    \ in the run_client function, what value is passed to the -send-workers flag (and is it derived from any server-side workers\
+    \ setting or fixed)?\",\n            \"answer\": {\n              \"answer\": \"The client is not invoked from run.sh\
+    \ at all; it is invoked by workload/run_client.sh, which calls `go run ./cmd/workload_client` with `-send-workers \\\"\
+    $SEND_WORKERS\\\"`. In that script, `SEND_WORKERS` is initialized to 1 and can only be changed via the `-w` command-line\
+    \ option to run_client.sh. It is not derived from any server-side workers setting; it is a client-side value with a default\
+    \ of 1.\",\n              \"code_snippets\": [\n                {\n                  \"path\": \"workload/run_client.sh\"\
+    ,\n                  \"snippet\": \"SEND_WORKERS=1\\n...\\nwhile getopts \\\":s:t:r:g:m:k:N:l:w:\\\" opt; do\\n  case\
+    \ \\\"$opt\\\" in\\n    ...\\n    w) SEND_WORKERS=\\\"$OPTARG\\\" ;;\\n  esac\\ndone\\n...\\ngo run ./cmd/workload_client\
+    \ \\\\\\n  ... \\\\\\n  -send-workers \\\"$SEND_WORKERS\\\" \\\\\"\n                },\n                {\n          \
+    \        \"path\": \"cmd/workload_client/main.go\",\n                  \"snippet\": \"sendWorkers = flag.Int(\\\"send-workers\\\
+    \", 1, \\\"number of concurrent send workers\\\")\\n...\\nworkers := *sendWorkers\\nif workers <= 0 {\\n    workers =\
+    \ 1\\n}\"\n                }\n              ]\n            }\n          },\n          {\n            \"question\": \"\
+    In internal/server/server.go\\u2019s startStatsLogger implementation, does it iterate over all s.stats entries every second\
+    \ and only emit a \\\"[perf] worker=...\\\" line when that worker\\u2019s gets+scans count for the interval is > 0?\"\
+    ,\n            \"answer\": {\n              \"answer\": \"Yes. In the stats-logging loop, each second it iterates over\
+    \ every entry in s.stats, calls snapshotAndReset on each worker\\u2019s stats, and only prints a \\\"[perf] worker=...\\\
+    \" line if that worker\\u2019s getCount or scanCount for that interval is greater than zero. Afterward, it aggregates\
+    \ those per-worker snapshots into a total and prints the overall \\\"[perf] interval=1s ...\\\" line.\",\n           \
+    \   \"code_snippets\": [\n                {\n                  \"path\": \"internal/server/server.go\",\n            \
+    \      \"snippet\": \"if s.logger == nil || len(s.stats) == 0 {\\n\\t\\treturn\\n\\t}\\n\\ts.statsWG.Add(1)\\n\\t...\\\
+    n\\tfor i := range s.stats {\\n\\t\\t\\t\\t\\t\\t\\t\\n\\t\\t\\tsnap := s.stats[i].snapshotAndReset()\\n\\t\\t\\tif snap.getCount\
+    \ > 0 || snap.scanCount > 0 {\\n\\t\\t\\t\\tvar workerAvgGet time.Duration\\n\\t\\t\\t\\tif snap.getCount > 0 {\\n\\t\\\
+    t\\t\\t\\tworkerAvgGet = time.Duration(int64(snap.getLatency) / int64(snap.getCount))\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\tvar\
+    \ workerAvgScan time.Duration\\n\\t\\t\\t\\tif snap.scanCount > 0 {\\n\\t\\t\\t\\t\\tworkerAvgScan = time.Duration(int64(snap.scanLatency)\
+    \ / int64(snap.scanCount))\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\ts.logger.Printf(\\n\\t\\t\\t\\t\\t\\\"[perf] worker=%d gets=%d\
+    \ get_errors=%d avg_get=%s scans=%d scan_errors=%d avg_scan=%s\\\",\\n\\t\\t\\t\\t\\ti,\\n\\t\\t\\t\\t\\tsnap.getCount,\\\
+    n\\t\\t\\t\\t\\tsnap.getErrors,\\n\\t\\t\\t\\t\\tworkerAvgGet,\\n\\t\\t\\t\\t\\tsnap.scanCount,\\n\\t\\t\\t\\t\\tsnap.scanErrors,\\\
+    n\\t\\t\\t\\t\\tworkerAvgScan,\\n\\t\\t\\t\\t)\\n\\t\\t\\t}\\n\\t\\t\\ttotal.getCount += snap.getCount\\n\\t\\t\\ttotal.getErrors\
+    \ += snap.getErrors\\n\\t\\t\\ttotal.getLatency += snap.getLatency\\n\\t\\t\\ttotal.scanCount += snap.scanCount\\n\\t\\\
+    t\\ttotal.scanErrors += snap.scanErrors\\n\\t\\t\\ttotal.scanLatency += snap.scanLatency\\n\\t\\t}\\n\\t\\tif total.getCount\
+    \ == 0 && total.scanCount == 0 {\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tvar avgGet time.Duration\\n\\t\\tif total.getCount\
+    \ > 0 {\\n\\t\\t\\tavgGet = time.Duration(int64(total.getLatency) / int64(total.getCount))\\n\\t\\t}\\n\\t\\tvar avgScan\
+    \ time.Duration\\n\\t\\tif total.scanCount > 0 {\\n\\t\\t\\tavgScan = time.Duration(int64(total.scanLatency) / int64(total.scanCount))\\\
+    n\\t\\t}\"\n                },\n                {\n                  \"path\": \"internal/server/server.go\",\n      \
+    \            \"snippet\": \"s.logger.Printf(\\n\\t\\t\\t\\t\\\"[perf] interval=1s gets=%d get_errors=%d avg_get=%s scans=%d\
+    \ scan_errors=%d avg_scan=%s\\\",\\n\\t\\t\\t\\ttotal.getCount,\\n\\t\\t\\t\\ttotal.getErrors,\\n\\t\\t\\t\\tavgGet,\\\
+    n\\t\\t\\t\\ttotal.scanCount,\\n\\t\\t\\t\\ttotal.scanErrors,\\n\\t\\t\\t\\tavgScan,\\n\\t\\t\\t)\\n\"\n             \
+    \   }\n              ]\n            }\n          },\n          {\n            \"question\": \"In internal/server/server.go\\\
+    u2019s spawnWorker function, for each packet read from the UDP socket, is handleRequest executed synchronously in the\
+    \ same goroutine (one request at a time per worker), or is the request handed off to a separate goroutine or pool?\",\n\
+    \            \"answer\": {\n              \"answer\": \"In internal/server/server.go\\u2019s spawnWorker function, each\
+    \ packet read from the UDP socket is processed by handleRequest synchronously in the same worker goroutine. The code calls\
+    \ s.handleRequest directly inside the read loop and only after it finishes does the worker send the response and move\
+    \ on to the next ReadFromUDP call. No additional goroutine or pool is used per request; concurrency is limited to one\
+    \ in-flight request per worker goroutine.\",\n              \"code_snippets\": [\n                {\n                \
+    \  \"path\": \"internal/server/server.go\",\n                  \"snippet\": \"for {\\n\\t\\t\\tn, addr, err := conn.ReadFromUDP(buf)\\\
+    n\\t\\t\\t...\\n\\t\\t\\tresponse := s.handleRequest(idx, buf[:n])\\n\\t\\t\\tif response == nil {\\n\\t\\t\\t\\tcontinue\\\
+    n\\t\\t\\t}\\n\\n\\t\\t\\tif _, err := conn.WriteToUDP(response, addr); err != nil {\\n\\t\\t\\t\\t...\\n\\t\\t\\t}\\\
+    n\\t\\t}\"\n                },\n                {\n                  \"path\": \"internal/server/server.go\",\n      \
+    \            \"snippet\": \"func (s *Server) spawnWorker(ctx context.Context, idx int, conn *net.UDPConn) {\\n\\ts.wg.Add(1)\\\
+    n\\tgo func() {\\n\\t\\tdefer s.wg.Done()\\n\\t\\tbuf := make([]byte, 16*1024)\\n\\n\\t\\tfor {\\n\\t\\t\\t...\\n\\t\\\
+    t\\tresponse := s.handleRequest(idx, buf[:n])\\n\\t\\t\\t...\\n\\t\\t}\\n\\t}()\\n}\"\n                }\n           \
+    \   ]\n            }\n          },\n          {\n            \"question\": \"Looking at the full handleRequest implementation\
+    \ in internal/server/server.go, aside from the busy-wait delay and a single conn.Write to send the response, are there\
+    \ any other potentially blocking operations (e.g., channel sends, mutexes, heavy logging) on the hot path for each request?\"\
+    ,\n            \"answer\": {\n              \"answer\": \"No. In the handleRequest implementation, the hot path for each\
+    \ request only includes:\\n- parseRequest(payload)\\n- some simple argument handling and strconv.Atoi for SCAN\\n- time.Now()\
+    \ calls and a busy-wait loop for the configured delay\\n- stats.recordGet / stats.recordScan calls (which appear as local\
+    \ method calls with no visible synchronization here)\\n- formatResponse to build the reply bytes\\n\\nThere are no channel\
+    \ operations, mutex locks/unlocks, logging calls, or other obvious blocking primitives on the request path besides the\
+    \ intentional busy-wait delay and whatever I/O occurs when the caller later writes the response on the connection.\",\n\
+    \              \"code_snippets\": [\n                {\n                  \"path\": \"internal/server/server.go\",\n \
+    \                 \"snippet\": \"func (s *Server) handleRequest(idx int, payload []byte) []byte {\\n\\tcmd, args, err\
+    \ := parseRequest(payload)\\n\\tif err != nil {\\n\\t\\treturn []byte(fmt.Sprintf(\\\"ERR %v\\\", err))\\n\\t}\\n\\n\\\
+    tvar stats *workerStats\\n\\tif idx >= 0 && idx < len(s.stats) {\\n\\t\\tstats = &s.stats[idx]\\n\\t}\\n\\n\\tswitch cmd\
+    \ {\\n\\tcase \\\"GET\\\":\\n\\t\\tvar reqID string\\n\\t\\tif len(args) == 2 {\\n\\t\\t\\treqID = args[1]\\n\\t\\t\\\
+    targs = args[:1]\\n\\t\\t}\\n\\t\\t// Busy wait for accurate timing\\n\\t\\tstart := time.Now()\\n\\t\\tdeadline := start.Add(s.cfg.GetDelay)\\\
+    n\\t\\tfor time.Now().Before(deadline) {\\n\\t\\t}\\n\\t\\telapsed := time.Since(start)\\n\\t\\tif stats != nil {\\n\\\
+    t\\t\\tstats.recordGet(elapsed, false)\\n\\t\\t}\\n\\t\\treturn formatResponse(\\\"VALUE\\\", reqID, []byte(args[0]))\\\
+    n\\n\\tcase \\\"SCAN\\\":\\n\\t\\tvar reqID string\\n\\t\\tif len(args) == 3 {\\n\\t\\t\\treqID = args[2]\\n\\t\\t\\targs\
+    \ = args[:2]\\n\\t\\t}\\n\\t\\tlimit, err := strconv.Atoi(args[1])\\n\\t\\tif err != nil || limit <= 0 {\\n\\t\\t\\tif\
+    \ stats != nil {\\n\\t\\t\\t\\tstats.recordScan(0, true)\\n\\t\\t\\t}\\n\\t\\t\\treturn formatResponse(\\\"ERR\\\", reqID,\
+    \ []byte(\\\"invalid scan limit\\\"))\\n\\t\\t}\\n\\t\\tif limit > s.cfg.MaxScanKeys {\\n\\t\\t\\tlimit = s.cfg.MaxScanKeys\\\
+    n\\t\\t}\\n\\t\\t// Busy wait for accurate timing\\n\\t\\tstart := time.Now()\\n\\t\\tdeadline := start.Add(s.cfg.ScanDelay)\\\
+    n\\t\\tfor time.Now().Before(deadline) {\\n\\t\\t}\\n\\t\\telapsed := time.Since(start)\\n\\t\\tif stats != nil {\\n\\\
+    t\\t\\tstats.recordScan(elapsed, false)\\n\\t\\t}\\n\\t\\treturn formatResponse(\\\"SCAN\\\", reqID, []byte(\\\"EMPTY\\\
+    \"))\\n\\tdefault:\\n\\t\\treturn []byte(\\\"ERR unknown command\\\")\\n\\t}\\n}\\n\"\n                }\n           \
+    \   ]\n            }\n          },\n          {\n            \"question\": \"In cmd/workload_client, how many receive\
+    \ goroutines are created relative to the number of send workers and UDPConns, and do they each call ReadFromUDP on their\
+    \ own conn or share a single receiving socket?\",\n            \"answer\": {\n              \"answer\": \"In cmd/workload_client,\
+    \ each send worker that dials its own UDPConn also spawns exactly one receive goroutine using that same conn, so the number\
+    \ of receive goroutines matches the number of per\\u2011worker UDPConns. Separately, there is a single top\\u2011level\
+    \ UDPConn that is also used with its own single receive goroutine. Each receive goroutine calls Read on its own dedicated\
+    \ UDPConn; they do not share a single receiving socket across multiple goroutines.\",\n              \"code_snippets\"\
+    : [\n                {\n                  \"path\": \"cmd/workload_client/main.go\",\n                  \"snippet\": \"\
+    conn, err := net.DialUDP(\\\"udp\\\", nil, udpAddr)\\n\\t\\tif err != nil {\\n\\t\\t\\tlogger.Fatalf(\\\"dial udp worker=%d:\
+    \ %v\\\", i, err)\\n\\t\\t}\\n\\t\\tdefer conn.Close()\\n\\n\\t\\tseed := time.Now().UnixNano() + int64(i)\\n\\t\\trng\
+    \ := rand.New(rand.NewSource(seed))\\n\\n\\t\\tworkerID := i\\n\\n\\t\\tsendWG.Add(1)\\n\\t\\tgo func(workerID int, conn\
+    \ *net.UDPConn, rng *rand.Rand) {\\n\\t\\t\\tdefer sendWG.Done()\\n\\t\\t\\tbuf := make([]byte, 0, 256)\\n\\t\\t\\tfor\
+    \ {\\n\\t\\t\\t\\tif err := limiter.Wait(ctx); err != nil {\\n\\t\\t\\t\\t\\treturn\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\t// ...\
+    \ send via this worker's conn ...\\n\\t\\t\\t\\tif _, err := conn.Write(payload); err != nil {\\n\\t\\t\\t\\t\\tlogger.Printf(\\\
+    \"write error (worker=%d): %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tbuf = payload[:0]\\n\\t\\t\\t\\t\\tcontinue\\n\\t\\\
+    t\\t\\t}\\n\\t\\t\\t\\t// ...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn, rng)\\n\\n\\t\\trecvWG.Add(1)\\n\\t\\tgo func(workerID\
+    \ int, conn *net.UDPConn) {\"\n                },\n                {\n                  \"path\": \"cmd/workload_client/main.go\"\
+    ,\n                  \"snippet\": \"go func(workerID int, conn *net.UDPConn) {\\n\\t\\t\\tdefer recvWG.Done()\\n\\t\\\
+    t\\tbuf := make([]byte, 64*1024)\\n\\t\\t\\t// Set read deadline once to avoid blocking forever\\n\\t\\t\\tconn.SetReadDeadline(time.Now().Add(5\
+    \ * time.Second))\\n\\t\\t\\tfor {\\n\\t\\t\\t\\tn, err := conn.Read(buf)\\n\\t\\t\\t\\t// Capture receive timestamp immediately\\\
+    n\\t\\t\\t\\trecvNano := time.Now().UnixNano()\\n\\t\\t\\t\\tif err != nil {\\n\\t\\t\\t\\t\\tif ne, ok := err.(net.Error);\
+    \ ok && ne.Timeout() {\\n\\t\\t\\t\\t\\t\\t// Reset deadline on timeout\\n\\t\\t\\t\\t\\t\\tconn.SetReadDeadline(time.Now().Add(5\
+    \ * time.Second))\\n\\t\\t\\t\\t\\t\\tselect {\\n\\t\\t\\t\\t\\t\\tcase <-quit:\\n\\t\\t\\t\\t\\t\\t\\treturn\\n\\t\\\
+    t\\t\\t\\t\\tdefault:\\n\\t\\t\\t\\t\\t\\t\\tcontinue\\n\\t\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\tif errors.Is(err,\
+    \ net.ErrClosed) || errors.Is(err, os.ErrClosed) {\\n\\t\\t\\t\\t\\t\\treturn\\n\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\tlogger.Printf(\\\
+    \"read error (worker=%d): %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tcontinue\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\t// ... process\
+    \ response from this conn ...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn)\"\n                },\n                {\n      \
+    \            \"path\": \"cmd/workload_client/main.go\",\n                  \"snippet\": \"conn, err := net.DialUDP(\\\"\
+    udp\\\", nil, udpAddr)\\nif err != nil {\\n\\tlogger.Fatalf(\\\"dial udp: %v\\\", err)\\n}\\ndefer conn.Close()\\n\\nlogger.Printf(\\\
+    \"starting workload server=%s duration=%s rate=%.2f get_frac=%.2f\\\", *serverAddr, duration.String(), *targetRate, *getFrac)\\\
+    n\\n// ... later, additional per-worker conns and goroutines are created ...\"\n                }\n              ]\n \
+    \           }\n          }\n        ],\n        \"iteration_type\": \"question\",\n        \"parsed_response\": {\n  \
+    \        \"status\": \"continue\",\n          \"Summary\": \"RAG confirms that for policy=agent the server always spawns\
+    \ all Config.Workers, sets pebble_agent_state.Active exactly equal to the worker count, and inserts every worker FD into\
+    \ pebble_udp_targets at slot i for worker i. The eBPF selector computes start = reuse->hash % Active and uses bpf_sk_select_reuseport\
+    \ once per packet, so each 4\\u2011tuple (UDP flow) is pinned to a single worker slot. Client code uses one UDPConn per\
+    \ send worker (distinct source ports), and p99 latency is computed over all requests. Logs show that in each run only\
+    \ a subset of workers report any traffic, and aggregate server throughput plateaus around ~75\\u2013105k req/s while offered\
+    \ load rises to 180k; missing responses and outstanding counts grow substantially at higher rates.\",\n          \"hypothesis\"\
+    : {\n            \"text\": \"Because agent_udp_selector hashes on reuse->hash and uses that to choose exactly one reuseport\
+    \ slot per flow, each client UDP flow (one per send worker / source port) is pinned to a single server worker. The experiment\
+    \ is running with only a small number of client send workers, so their flows hash into only 3\\u20135 of the 6 reuseport\
+    \ slots; workers with no flow assignment never see traffic and therefore never appear in the perf logs. Each active worker\
+    \ processes requests sequentially and spends most of its time in busy\\u2011wait delays (10\\u00b5s GET, 2ms SCAN), capping\
+    \ per\\u2011worker throughput around 20\\u201325k req/s. The system\\u2019s effective capacity is thus roughly (#hash-occupied\
+    \ slots) \\u00d7 (~20\\u201325k). At 80k\\u2013100k offered load, about 5 workers are occupied, and the system can nearly\
+    \ keep up (yielding ~95k req/s at 100k and moderate queueing). At higher loads, random hashing assigns only 3\\u20134\
+    \ slots, so total capacity drops to ~75\\u2013100k while offered load is 140\\u2013180k. Packets to those few hot workers\
+    \ queue up in the UDP receive queues, causing long wait times before handleRequest runs and ultimately packet drops once\
+    \ queues overflow, which explains the very high overall p99 latencies and the large number of missing responses while\
+    \ some workers remain idle.\",\n            \"score\": 7\n          },\n          \"questions\": [\n            \"In run.sh,\
+    \ when invoking cmd/workload_client in the run_client function, what value is passed to the -send-workers flag (and is\
+    \ it derived from any server-side workers setting or fixed)?\",\n            \"In internal/server/server.go\\u2019s startStatsLogger\
+    \ implementation, does it iterate over all s.stats entries every second and only emit a \\\"[perf] worker=...\\\" line\
+    \ when that worker\\u2019s gets+scans count for the interval is > 0?\",\n            \"In internal/server/server.go\\\
+    u2019s spawnWorker function, for each packet read from the UDP socket, is handleRequest executed synchronously in the\
+    \ same goroutine (one request at a time per worker), or is the request handed off to a separate goroutine or pool?\",\n\
+    \            \"Looking at the full handleRequest implementation in internal/server/server.go, aside from the busy-wait\
+    \ delay and a single conn.Write to send the response, are there any other potentially blocking operations (e.g., channel\
+    \ sends, mutexes, heavy logging) on the hot path for each request?\",\n            \"In cmd/workload_client, how many\
+    \ receive goroutines are created relative to the number of send workers and UDPConns, and do they each call ReadFromUDP\
+    \ on their own conn or share a single receiving socket?\"\n          ],\n          \"question_answers\": [\n         \
+    \   {\n              \"question\": \"In run.sh, when invoking cmd/workload_client in the run_client function, what value\
+    \ is passed to the -send-workers flag (and is it derived from any server-side workers setting or fixed)?\",\n        \
+    \      \"answer\": {\n                \"answer\": \"The client is not invoked from run.sh at all; it is invoked by workload/run_client.sh,\
+    \ which calls `go run ./cmd/workload_client` with `-send-workers \\\"$SEND_WORKERS\\\"`. In that script, `SEND_WORKERS`\
+    \ is initialized to 1 and can only be changed via the `-w` command-line option to run_client.sh. It is not derived from\
+    \ any server-side workers setting; it is a client-side value with a default of 1.\",\n                \"code_snippets\"\
+    : [\n                  {\n                    \"path\": \"workload/run_client.sh\",\n                    \"snippet\":\
+    \ \"SEND_WORKERS=1\\n...\\nwhile getopts \\\":s:t:r:g:m:k:N:l:w:\\\" opt; do\\n  case \\\"$opt\\\" in\\n    ...\\n   \
+    \ w) SEND_WORKERS=\\\"$OPTARG\\\" ;;\\n  esac\\ndone\\n...\\ngo run ./cmd/workload_client \\\\\\n  ... \\\\\\n  -send-workers\
+    \ \\\"$SEND_WORKERS\\\" \\\\\"\n                  },\n                  {\n                    \"path\": \"cmd/workload_client/main.go\"\
+    ,\n                    \"snippet\": \"sendWorkers = flag.Int(\\\"send-workers\\\", 1, \\\"number of concurrent send workers\\\
+    \")\\n...\\nworkers := *sendWorkers\\nif workers <= 0 {\\n    workers = 1\\n}\"\n                  }\n               \
+    \ ]\n              }\n            },\n            {\n              \"question\": \"In internal/server/server.go\\u2019s\
+    \ startStatsLogger implementation, does it iterate over all s.stats entries every second and only emit a \\\"[perf] worker=...\\\
+    \" line when that worker\\u2019s gets+scans count for the interval is > 0?\",\n              \"answer\": {\n         \
+    \       \"answer\": \"Yes. In the stats-logging loop, each second it iterates over every entry in s.stats, calls snapshotAndReset\
+    \ on each worker\\u2019s stats, and only prints a \\\"[perf] worker=...\\\" line if that worker\\u2019s getCount or scanCount\
+    \ for that interval is greater than zero. Afterward, it aggregates those per-worker snapshots into a total and prints\
+    \ the overall \\\"[perf] interval=1s ...\\\" line.\",\n                \"code_snippets\": [\n                  {\n   \
+    \                 \"path\": \"internal/server/server.go\",\n                    \"snippet\": \"if s.logger == nil || len(s.stats)\
+    \ == 0 {\\n\\t\\treturn\\n\\t}\\n\\ts.statsWG.Add(1)\\n\\t...\\n\\tfor i := range s.stats {\\n\\t\\t\\t\\t\\t\\t\\t\\\
+    n\\t\\t\\tsnap := s.stats[i].snapshotAndReset()\\n\\t\\t\\tif snap.getCount > 0 || snap.scanCount > 0 {\\n\\t\\t\\t\\\
+    tvar workerAvgGet time.Duration\\n\\t\\t\\t\\tif snap.getCount > 0 {\\n\\t\\t\\t\\t\\tworkerAvgGet = time.Duration(int64(snap.getLatency)\
+    \ / int64(snap.getCount))\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\tvar workerAvgScan time.Duration\\n\\t\\t\\t\\tif snap.scanCount\
+    \ > 0 {\\n\\t\\t\\t\\t\\tworkerAvgScan = time.Duration(int64(snap.scanLatency) / int64(snap.scanCount))\\n\\t\\t\\t\\\
+    t}\\n\\t\\t\\t\\ts.logger.Printf(\\n\\t\\t\\t\\t\\t\\\"[perf] worker=%d gets=%d get_errors=%d avg_get=%s scans=%d scan_errors=%d\
+    \ avg_scan=%s\\\",\\n\\t\\t\\t\\t\\ti,\\n\\t\\t\\t\\t\\tsnap.getCount,\\n\\t\\t\\t\\t\\tsnap.getErrors,\\n\\t\\t\\t\\\
+    t\\tworkerAvgGet,\\n\\t\\t\\t\\t\\tsnap.scanCount,\\n\\t\\t\\t\\t\\tsnap.scanErrors,\\n\\t\\t\\t\\t\\tworkerAvgScan,\\\
+    n\\t\\t\\t\\t)\\n\\t\\t\\t}\\n\\t\\t\\ttotal.getCount += snap.getCount\\n\\t\\t\\ttotal.getErrors += snap.getErrors\\\
+    n\\t\\t\\ttotal.getLatency += snap.getLatency\\n\\t\\t\\ttotal.scanCount += snap.scanCount\\n\\t\\t\\ttotal.scanErrors\
+    \ += snap.scanErrors\\n\\t\\t\\ttotal.scanLatency += snap.scanLatency\\n\\t\\t}\\n\\t\\tif total.getCount == 0 && total.scanCount\
+    \ == 0 {\\n\\t\\t\\tcontinue\\n\\t\\t}\\n\\t\\tvar avgGet time.Duration\\n\\t\\tif total.getCount > 0 {\\n\\t\\t\\tavgGet\
+    \ = time.Duration(int64(total.getLatency) / int64(total.getCount))\\n\\t\\t}\\n\\t\\tvar avgScan time.Duration\\n\\t\\\
+    tif total.scanCount > 0 {\\n\\t\\t\\tavgScan = time.Duration(int64(total.scanLatency) / int64(total.scanCount))\\n\\t\\\
+    t}\"\n                  },\n                  {\n                    \"path\": \"internal/server/server.go\",\n      \
+    \              \"snippet\": \"s.logger.Printf(\\n\\t\\t\\t\\t\\\"[perf] interval=1s gets=%d get_errors=%d avg_get=%s scans=%d\
+    \ scan_errors=%d avg_scan=%s\\\",\\n\\t\\t\\t\\ttotal.getCount,\\n\\t\\t\\t\\ttotal.getErrors,\\n\\t\\t\\t\\tavgGet,\\\
+    n\\t\\t\\t\\ttotal.scanCount,\\n\\t\\t\\t\\ttotal.scanErrors,\\n\\t\\t\\t\\tavgScan,\\n\\t\\t\\t)\\n\"\n             \
+    \     }\n                ]\n              }\n            },\n            {\n              \"question\": \"In internal/server/server.go\\\
+    u2019s spawnWorker function, for each packet read from the UDP socket, is handleRequest executed synchronously in the\
+    \ same goroutine (one request at a time per worker), or is the request handed off to a separate goroutine or pool?\",\n\
+    \              \"answer\": {\n                \"answer\": \"In internal/server/server.go\\u2019s spawnWorker function,\
+    \ each packet read from the UDP socket is processed by handleRequest synchronously in the same worker goroutine. The code\
+    \ calls s.handleRequest directly inside the read loop and only after it finishes does the worker send the response and\
+    \ move on to the next ReadFromUDP call. No additional goroutine or pool is used per request; concurrency is limited to\
+    \ one in-flight request per worker goroutine.\",\n                \"code_snippets\": [\n                  {\n        \
+    \            \"path\": \"internal/server/server.go\",\n                    \"snippet\": \"for {\\n\\t\\t\\tn, addr, err\
+    \ := conn.ReadFromUDP(buf)\\n\\t\\t\\t...\\n\\t\\t\\tresponse := s.handleRequest(idx, buf[:n])\\n\\t\\t\\tif response\
+    \ == nil {\\n\\t\\t\\t\\tcontinue\\n\\t\\t\\t}\\n\\n\\t\\t\\tif _, err := conn.WriteToUDP(response, addr); err != nil\
+    \ {\\n\\t\\t\\t\\t...\\n\\t\\t\\t}\\n\\t\\t}\"\n                  },\n                  {\n                    \"path\"\
+    : \"internal/server/server.go\",\n                    \"snippet\": \"func (s *Server) spawnWorker(ctx context.Context,\
+    \ idx int, conn *net.UDPConn) {\\n\\ts.wg.Add(1)\\n\\tgo func() {\\n\\t\\tdefer s.wg.Done()\\n\\t\\tbuf := make([]byte,\
+    \ 16*1024)\\n\\n\\t\\tfor {\\n\\t\\t\\t...\\n\\t\\t\\tresponse := s.handleRequest(idx, buf[:n])\\n\\t\\t\\t...\\n\\t\\\
+    t}\\n\\t}()\\n}\"\n                  }\n                ]\n              }\n            },\n            {\n          \
+    \    \"question\": \"Looking at the full handleRequest implementation in internal/server/server.go, aside from the busy-wait\
+    \ delay and a single conn.Write to send the response, are there any other potentially blocking operations (e.g., channel\
+    \ sends, mutexes, heavy logging) on the hot path for each request?\",\n              \"answer\": {\n                \"\
+    answer\": \"No. In the handleRequest implementation, the hot path for each request only includes:\\n- parseRequest(payload)\\\
+    n- some simple argument handling and strconv.Atoi for SCAN\\n- time.Now() calls and a busy-wait loop for the configured\
+    \ delay\\n- stats.recordGet / stats.recordScan calls (which appear as local method calls with no visible synchronization\
+    \ here)\\n- formatResponse to build the reply bytes\\n\\nThere are no channel operations, mutex locks/unlocks, logging\
+    \ calls, or other obvious blocking primitives on the request path besides the intentional busy-wait delay and whatever\
+    \ I/O occurs when the caller later writes the response on the connection.\",\n                \"code_snippets\": [\n \
+    \                 {\n                    \"path\": \"internal/server/server.go\",\n                    \"snippet\": \"\
+    func (s *Server) handleRequest(idx int, payload []byte) []byte {\\n\\tcmd, args, err := parseRequest(payload)\\n\\tif\
+    \ err != nil {\\n\\t\\treturn []byte(fmt.Sprintf(\\\"ERR %v\\\", err))\\n\\t}\\n\\n\\tvar stats *workerStats\\n\\tif idx\
+    \ >= 0 && idx < len(s.stats) {\\n\\t\\tstats = &s.stats[idx]\\n\\t}\\n\\n\\tswitch cmd {\\n\\tcase \\\"GET\\\":\\n\\t\\\
+    tvar reqID string\\n\\t\\tif len(args) == 2 {\\n\\t\\t\\treqID = args[1]\\n\\t\\t\\targs = args[:1]\\n\\t\\t}\\n\\t\\\
+    t// Busy wait for accurate timing\\n\\t\\tstart := time.Now()\\n\\t\\tdeadline := start.Add(s.cfg.GetDelay)\\n\\t\\tfor\
+    \ time.Now().Before(deadline) {\\n\\t\\t}\\n\\t\\telapsed := time.Since(start)\\n\\t\\tif stats != nil {\\n\\t\\t\\tstats.recordGet(elapsed,\
+    \ false)\\n\\t\\t}\\n\\t\\treturn formatResponse(\\\"VALUE\\\", reqID, []byte(args[0]))\\n\\n\\tcase \\\"SCAN\\\":\\n\\\
+    t\\tvar reqID string\\n\\t\\tif len(args) == 3 {\\n\\t\\t\\treqID = args[2]\\n\\t\\t\\targs = args[:2]\\n\\t\\t}\\n\\\
+    t\\tlimit, err := strconv.Atoi(args[1])\\n\\t\\tif err != nil || limit <= 0 {\\n\\t\\t\\tif stats != nil {\\n\\t\\t\\\
+    t\\tstats.recordScan(0, true)\\n\\t\\t\\t}\\n\\t\\t\\treturn formatResponse(\\\"ERR\\\", reqID, []byte(\\\"invalid scan\
+    \ limit\\\"))\\n\\t\\t}\\n\\t\\tif limit > s.cfg.MaxScanKeys {\\n\\t\\t\\tlimit = s.cfg.MaxScanKeys\\n\\t\\t}\\n\\t\\\
+    t// Busy wait for accurate timing\\n\\t\\tstart := time.Now()\\n\\t\\tdeadline := start.Add(s.cfg.ScanDelay)\\n\\t\\tfor\
+    \ time.Now().Before(deadline) {\\n\\t\\t}\\n\\t\\telapsed := time.Since(start)\\n\\t\\tif stats != nil {\\n\\t\\t\\tstats.recordScan(elapsed,\
+    \ false)\\n\\t\\t}\\n\\t\\treturn formatResponse(\\\"SCAN\\\", reqID, []byte(\\\"EMPTY\\\"))\\n\\tdefault:\\n\\t\\treturn\
+    \ []byte(\\\"ERR unknown command\\\")\\n\\t}\\n}\\n\"\n                  }\n                ]\n              }\n     \
+    \       },\n            {\n              \"question\": \"In cmd/workload_client, how many receive goroutines are created\
+    \ relative to the number of send workers and UDPConns, and do they each call ReadFromUDP on their own conn or share a\
+    \ single receiving socket?\",\n              \"answer\": {\n                \"answer\": \"In cmd/workload_client, each\
+    \ send worker that dials its own UDPConn also spawns exactly one receive goroutine using that same conn, so the number\
+    \ of receive goroutines matches the number of per\\u2011worker UDPConns. Separately, there is a single top\\u2011level\
+    \ UDPConn that is also used with its own single receive goroutine. Each receive goroutine calls Read on its own dedicated\
+    \ UDPConn; they do not share a single receiving socket across multiple goroutines.\",\n                \"code_snippets\"\
+    : [\n                  {\n                    \"path\": \"cmd/workload_client/main.go\",\n                    \"snippet\"\
+    : \"conn, err := net.DialUDP(\\\"udp\\\", nil, udpAddr)\\n\\t\\tif err != nil {\\n\\t\\t\\tlogger.Fatalf(\\\"dial udp\
+    \ worker=%d: %v\\\", i, err)\\n\\t\\t}\\n\\t\\tdefer conn.Close()\\n\\n\\t\\tseed := time.Now().UnixNano() + int64(i)\\\
+    n\\t\\trng := rand.New(rand.NewSource(seed))\\n\\n\\t\\tworkerID := i\\n\\n\\t\\tsendWG.Add(1)\\n\\t\\tgo func(workerID\
+    \ int, conn *net.UDPConn, rng *rand.Rand) {\\n\\t\\t\\tdefer sendWG.Done()\\n\\t\\t\\tbuf := make([]byte, 0, 256)\\n\\\
+    t\\t\\tfor {\\n\\t\\t\\t\\tif err := limiter.Wait(ctx); err != nil {\\n\\t\\t\\t\\t\\treturn\\n\\t\\t\\t\\t}\\n\\t\\t\\\
+    t\\t// ... send via this worker's conn ...\\n\\t\\t\\t\\tif _, err := conn.Write(payload); err != nil {\\n\\t\\t\\t\\\
+    t\\tlogger.Printf(\\\"write error (worker=%d): %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tbuf = payload[:0]\\n\\t\\t\\t\\\
+    t\\tcontinue\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\t// ...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn, rng)\\n\\n\\t\\trecvWG.Add(1)\\\
+    n\\t\\tgo func(workerID int, conn *net.UDPConn) {\"\n                  },\n                  {\n                    \"\
+    path\": \"cmd/workload_client/main.go\",\n                    \"snippet\": \"go func(workerID int, conn *net.UDPConn)\
+    \ {\\n\\t\\t\\tdefer recvWG.Done()\\n\\t\\t\\tbuf := make([]byte, 64*1024)\\n\\t\\t\\t// Set read deadline once to avoid\
+    \ blocking forever\\n\\t\\t\\tconn.SetReadDeadline(time.Now().Add(5 * time.Second))\\n\\t\\t\\tfor {\\n\\t\\t\\t\\tn,\
+    \ err := conn.Read(buf)\\n\\t\\t\\t\\t// Capture receive timestamp immediately\\n\\t\\t\\t\\trecvNano := time.Now().UnixNano()\\\
+    n\\t\\t\\t\\tif err != nil {\\n\\t\\t\\t\\t\\tif ne, ok := err.(net.Error); ok && ne.Timeout() {\\n\\t\\t\\t\\t\\t\\t//\
+    \ Reset deadline on timeout\\n\\t\\t\\t\\t\\t\\tconn.SetReadDeadline(time.Now().Add(5 * time.Second))\\n\\t\\t\\t\\t\\\
+    t\\tselect {\\n\\t\\t\\t\\t\\t\\tcase <-quit:\\n\\t\\t\\t\\t\\t\\t\\treturn\\n\\t\\t\\t\\t\\t\\tdefault:\\n\\t\\t\\t\\\
+    t\\t\\t\\tcontinue\\n\\t\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\tif errors.Is(err, net.ErrClosed) || errors.Is(err,\
+    \ os.ErrClosed) {\\n\\t\\t\\t\\t\\t\\treturn\\n\\t\\t\\t\\t\\t}\\n\\t\\t\\t\\t\\tlogger.Printf(\\\"read error (worker=%d):\
+    \ %v\\\", workerID, err)\\n\\t\\t\\t\\t\\tcontinue\\n\\t\\t\\t\\t}\\n\\t\\t\\t\\t// ... process response from this conn\
+    \ ...\\n\\t\\t\\t}\\n\\t\\t}(workerID, conn)\"\n                  },\n                  {\n                    \"path\"\
+    : \"cmd/workload_client/main.go\",\n                    \"snippet\": \"conn, err := net.DialUDP(\\\"udp\\\", nil, udpAddr)\\\
+    nif err != nil {\\n\\tlogger.Fatalf(\\\"dial udp: %v\\\", err)\\n}\\ndefer conn.Close()\\n\\nlogger.Printf(\\\"starting\
+    \ workload server=%s duration=%s rate=%.2f get_frac=%.2f\\\", *serverAddr, duration.String(), *targetRate, *getFrac)\\\
+    n\\n// ... later, additional per-worker conns and goroutines are created ...\"\n                  }\n                ]\n\
+    \              }\n            }\n          ]\n        }\n      },\n      {\n        \"iteration\": 2,\n        \"assistant_role\"\
+    : \"assistant\",\n        \"assistant_content_format\": \"json\",\n        \"assistant_content_raw\": \"{\\\"status\\\"\
+    :\\\"finish\\\",\\\"Summary\\\":\\\"The agent policy\\u2019s eBPF program is not doing any dynamic, load-aware steering:\
+    \ on every packet it looks up pebble_agent_state.Active (set once at load to the configured worker count, 6) and deterministically\
+    \ picks a reuseport slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The\
+    \ Go server always opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets map at indices 0\\\
+    u20135, and spawns one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP` \\u2192 `handleRequest`\
+    \ \\u2192 `WriteToUDP`; `handleRequest` parses the request, performs only a busy\\u2011wait delay (10\\u202f\\u00b5s for\
+    \ GET, 2\\u202fms for SCAN) plus some light parsing/formatting and stats accounting, and returns a response. There are\
+    \ no other blocking operations on the hot path, so each worker is effectively a single\\u2011threaded server whose capacity\
+    \ is bounded by that synthetic delay and a small fixed per\\u2011request overhead. The client runs open\\u2011loop at\
+    \ fixed target rates (80k\\u2013180k req/s) with a small number of UDPConns (one per send worker, each with its own source\
+    \ port) and matching per\\u2011conn receive goroutines. The experiment logs show that in each run only 3\\u20135 of the\
+    \ 6 server workers ever report traffic in a given second, and which indices are active changes between runs. Aggregate\
+    \ server throughput flattens between ~70k and ~105k req/s depending on the run, while the client continues to inject traffic\
+    \ at the configured rate, so outstanding requests build up and a growing fraction of responses never arrive; the client\
+    \ logs these as \\u201cresponses missing\\u201d. Overall p99 latency (measured at the client over all requests) is lowest\
+    \ around 100k req/s and very high at 80k and \\u2265140k, reflecting how long packets spend queued in the kernel and at\
+    \ the workers before they can be processed by the limited number of busy\\u2011waiting goroutines; the server\\u2019s\
+    \ own \\u201c[perf] avg_get/avg_scan\\u201d numbers remain fixed near the configured synthetic delays because they do\
+    \ not include time spent in queues.\\\",\\\"hypothesis\\\":{\\\"text\\\":\\\"The observed behavior is driven by the combination\
+    \ of (1) the agent eBPF selector doing a simple, static hash\\u2011based choice of reuseport slot per packet/flow (`slot\
+    \ = reuse->hash % active` with `active = 6`), (2) a small number of client UDP flows (one per send worker / source port)\
+    \ so there are fewer flows than server workers, and (3) each server worker processing requests strictly sequentially with\
+    \ busy\\u2011wait delays. At startup, all 6 worker sockets are inserted into the pebble_udp_targets map and the agent\
+    \ state\\u2019s Active count is set to 6, but because the client only originates a handful of flows, those flows hash\
+    \ onto only 3\\u20135 of the 6 slots in each run. Which specific workers are used (and how many flows collide on the same\
+    \ worker) varies randomly from run to run as source ports and hashes change. Within a run, each packet for a given flow\
+    \ is effectively pinned to its chosen worker; that worker\\u2019s goroutine then handles the request synchronously and\
+    \ spends ~10\\u202f\\u00b5s (GET) or 2\\u202fms (SCAN) in a busy\\u2011wait loop for every request. This architecture\
+    \ means: (a) the system\\u2019s true parallelism is limited to the number of reuseport slots that actually receive traffic,\
+    \ not the configured 6 workers; and (b) if multiple high\\u2011rate client flows hash to the same worker, that worker\
+    \ becomes a hot spot and builds a long queue while other workers are underutilized. When the client target rate is near\
+    \ or above the sum of the capacities of the few workers that are actually receiving traffic, packets accumulate in the\
+    \ per\\u2011socket UDP receive queues. Because handleRequest\\u2019s measured latency only times the busy\\u2011wait,\
+    \ the server\\u2019s \\u201c[perf] avg_get/avg_scan\\u201d stay near 10\\u202f\\u00b5s/2\\u202fms even as queues grow\
+    \ large. From the client\\u2019s perspective, however, end\\u2011to\\u2011end latency includes this queueing, so p99 balloons\
+    \ into the multi\\u2011second range at 80k and \\u2265140k req/s. Once the socket receive buffers fill, new datagrams\
+    \ are dropped silently by the kernel, so the client sees increasing \\u201cresponses missing\\u201d counts and outstanding\
+    \ request counts that never drain before the run ends. The non\\u2011monotonicity in throughput and p99 across rates (e.g.,\
+    \ 100k performing better than 80k) is explained by the random hash placement of a small number of flows onto 6 workers:\
+    \ in the 100k run, flows happen to be spread relatively evenly across 5 workers, keeping each below saturation and yielding\
+    \ lower queueing, while in the 80k and higher\\u2011rate runs, more flows collide on fewer workers, reducing effective\
+    \ usable capacity and causing larger queues, more UDP drops, and worse tail latency even at a lower offered rate.\\\"\
+    ,\\\"score\\\":8},\\\"questions\\\":[]}\",\n        \"full_response\": {\n          \"id\": \"chatcmpl-CihyFy7LWTrVaFxbaMJvtikqsfrkt\"\
+    ,\n          \"choices\": [\n            {\n              \"finish_reason\": \"stop\",\n              \"index\": 0,\n\
+    \              \"logprobs\": null,\n              \"message\": {\n                \"content\": \"{\\\"status\\\":\\\"\
+    finish\\\",\\\"Summary\\\":\\\"The agent policy\\u2019s eBPF program is not doing any dynamic, load-aware steering: on\
+    \ every packet it looks up pebble_agent_state.Active (set once at load to the configured worker count, 6) and deterministically\
+    \ picks a reuseport slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The\
+    \ Go server always opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets map at indices 0\\\
+    u20135, and spawns one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP` \\u2192 `handleRequest`\
+    \ \\u2192 `WriteToUDP`; `handleRequest` parses the request, performs only a busy\\u2011wait delay (10\\u202f\\u00b5s for\
+    \ GET, 2\\u202fms for SCAN) plus some light parsing/formatting and stats accounting, and returns a response. There are\
+    \ no other blocking operations on the hot path, so each worker is effectively a single\\u2011threaded server whose capacity\
+    \ is bounded by that synthetic delay and a small fixed per\\u2011request overhead. The client runs open\\u2011loop at\
+    \ fixed target rates (80k\\u2013180k req/s) with a small number of UDPConns (one per send worker, each with its own source\
+    \ port) and matching per\\u2011conn receive goroutines. The experiment logs show that in each run only 3\\u20135 of the\
+    \ 6 server workers ever report traffic in a given second, and which indices are active changes between runs. Aggregate\
+    \ server throughput flattens between ~70k and ~105k req/s depending on the run, while the client continues to inject traffic\
+    \ at the configured rate, so outstanding requests build up and a growing fraction of responses never arrive; the client\
+    \ logs these as \\u201cresponses missing\\u201d. Overall p99 latency (measured at the client over all requests) is lowest\
+    \ around 100k req/s and very high at 80k and \\u2265140k, reflecting how long packets spend queued in the kernel and at\
+    \ the workers before they can be processed by the limited number of busy\\u2011waiting goroutines; the server\\u2019s\
+    \ own \\u201c[perf] avg_get/avg_scan\\u201d numbers remain fixed near the configured synthetic delays because they do\
+    \ not include time spent in queues.\\\",\\\"hypothesis\\\":{\\\"text\\\":\\\"The observed behavior is driven by the combination\
+    \ of (1) the agent eBPF selector doing a simple, static hash\\u2011based choice of reuseport slot per packet/flow (`slot\
+    \ = reuse->hash % active` with `active = 6`), (2) a small number of client UDP flows (one per send worker / source port)\
+    \ so there are fewer flows than server workers, and (3) each server worker processing requests strictly sequentially with\
+    \ busy\\u2011wait delays. At startup, all 6 worker sockets are inserted into the pebble_udp_targets map and the agent\
+    \ state\\u2019s Active count is set to 6, but because the client only originates a handful of flows, those flows hash\
+    \ onto only 3\\u20135 of the 6 slots in each run. Which specific workers are used (and how many flows collide on the same\
+    \ worker) varies randomly from run to run as source ports and hashes change. Within a run, each packet for a given flow\
+    \ is effectively pinned to its chosen worker; that worker\\u2019s goroutine then handles the request synchronously and\
+    \ spends ~10\\u202f\\u00b5s (GET) or 2\\u202fms (SCAN) in a busy\\u2011wait loop for every request. This architecture\
+    \ means: (a) the system\\u2019s true parallelism is limited to the number of reuseport slots that actually receive traffic,\
+    \ not the configured 6 workers; and (b) if multiple high\\u2011rate client flows hash to the same worker, that worker\
+    \ becomes a hot spot and builds a long queue while other workers are underutilized. When the client target rate is near\
+    \ or above the sum of the capacities of the few workers that are actually receiving traffic, packets accumulate in the\
+    \ per\\u2011socket UDP receive queues. Because handleRequest\\u2019s measured latency only times the busy\\u2011wait,\
+    \ the server\\u2019s \\u201c[perf] avg_get/avg_scan\\u201d stay near 10\\u202f\\u00b5s/2\\u202fms even as queues grow\
+    \ large. From the client\\u2019s perspective, however, end\\u2011to\\u2011end latency includes this queueing, so p99 balloons\
+    \ into the multi\\u2011second range at 80k and \\u2265140k req/s. Once the socket receive buffers fill, new datagrams\
+    \ are dropped silently by the kernel, so the client sees increasing \\u201cresponses missing\\u201d counts and outstanding\
+    \ request counts that never drain before the run ends. The non\\u2011monotonicity in throughput and p99 across rates (e.g.,\
+    \ 100k performing better than 80k) is explained by the random hash placement of a small number of flows onto 6 workers:\
+    \ in the 100k run, flows happen to be spread relatively evenly across 5 workers, keeping each below saturation and yielding\
+    \ lower queueing, while in the 80k and higher\\u2011rate runs, more flows collide on fewer workers, reducing effective\
+    \ usable capacity and causing larger queues, more UDP drops, and worse tail latency even at a lower offered rate.\\\"\
+    ,\\\"score\\\":8},\\\"questions\\\":[]}\",\n                \"refusal\": null,\n                \"role\": \"assistant\"\
+    ,\n                \"annotations\": [],\n                \"audio\": null,\n                \"function_call\": null,\n\
+    \                \"tool_calls\": null\n              }\n            }\n          ],\n          \"created\": 1764771491,\n\
+    \          \"model\": \"gpt-5.1-2025-11-13\",\n          \"object\": \"chat.completion\",\n          \"service_tier\"\
+    : \"default\",\n          \"system_fingerprint\": null,\n          \"usage\": {\n            \"completion_tokens\": 16305,\n\
+    \            \"prompt_tokens\": 34256,\n            \"total_tokens\": 50561,\n            \"completion_tokens_details\"\
+    : {\n              \"accepted_prediction_tokens\": 0,\n              \"audio_tokens\": 0,\n              \"reasoning_tokens\"\
+    : 15224,\n              \"rejected_prediction_tokens\": 0\n            },\n            \"prompt_tokens_details\": {\n\
+    \              \"audio_tokens\": 0,\n              \"cached_tokens\": 26368\n            }\n          }\n        },\n\
+    \        \"status\": \"finish\",\n        \"Summary\": \"The agent policy\\u2019s eBPF program is not doing any dynamic,\
+    \ load-aware steering: on every packet it looks up pebble_agent_state.Active (set once at load to the configured worker\
+    \ count, 6) and deterministically picks a reuseport slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport`\
+    \ and returns SK_PASS. The Go server always opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets\
+    \ map at indices 0\\u20135, and spawns one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP`\
+    \ \\u2192 `handleRequest` \\u2192 `WriteToUDP`; `handleRequest` parses the request, performs only a busy\\u2011wait delay\
+    \ (10\\u202f\\u00b5s for GET, 2\\u202fms for SCAN) plus some light parsing/formatting and stats accounting, and returns\
+    \ a response. There are no other blocking operations on the hot path, so each worker is effectively a single\\u2011threaded\
+    \ server whose capacity is bounded by that synthetic delay and a small fixed per\\u2011request overhead. The client runs\
+    \ open\\u2011loop at fixed target rates (80k\\u2013180k req/s) with a small number of UDPConns (one per send worker, each\
+    \ with its own source port) and matching per\\u2011conn receive goroutines. The experiment logs show that in each run\
+    \ only 3\\u20135 of the 6 server workers ever report traffic in a given second, and which indices are active changes between\
+    \ runs. Aggregate server throughput flattens between ~70k and ~105k req/s depending on the run, while the client continues\
+    \ to inject traffic at the configured rate, so outstanding requests build up and a growing fraction of responses never\
+    \ arrive; the client logs these as \\u201cresponses missing\\u201d. Overall p99 latency (measured at the client over all\
+    \ requests) is lowest around 100k req/s and very high at 80k and \\u2265140k, reflecting how long packets spend queued\
+    \ in the kernel and at the workers before they can be processed by the limited number of busy\\u2011waiting goroutines;\
+    \ the server\\u2019s own \\u201c[perf] avg_get/avg_scan\\u201d numbers remain fixed near the configured synthetic delays\
+    \ because they do not include time spent in queues.\",\n        \"hypothesis\": {\n          \"text\": \"The observed\
+    \ behavior is driven by the combination of (1) the agent eBPF selector doing a simple, static hash\\u2011based choice\
+    \ of reuseport slot per packet/flow (`slot = reuse->hash % active` with `active = 6`), (2) a small number of client UDP\
+    \ flows (one per send worker / source port) so there are fewer flows than server workers, and (3) each server worker processing\
+    \ requests strictly sequentially with busy\\u2011wait delays. At startup, all 6 worker sockets are inserted into the pebble_udp_targets\
+    \ map and the agent state\\u2019s Active count is set to 6, but because the client only originates a handful of flows,\
+    \ those flows hash onto only 3\\u20135 of the 6 slots in each run. Which specific workers are used (and how many flows\
+    \ collide on the same worker) varies randomly from run to run as source ports and hashes change. Within a run, each packet\
+    \ for a given flow is effectively pinned to its chosen worker; that worker\\u2019s goroutine then handles the request\
+    \ synchronously and spends ~10\\u202f\\u00b5s (GET) or 2\\u202fms (SCAN) in a busy\\u2011wait loop for every request.\
+    \ This architecture means: (a) the system\\u2019s true parallelism is limited to the number of reuseport slots that actually\
+    \ receive traffic, not the configured 6 workers; and (b) if multiple high\\u2011rate client flows hash to the same worker,\
+    \ that worker becomes a hot spot and builds a long queue while other workers are underutilized. When the client target\
+    \ rate is near or above the sum of the capacities of the few workers that are actually receiving traffic, packets accumulate\
+    \ in the per\\u2011socket UDP receive queues. Because handleRequest\\u2019s measured latency only times the busy\\u2011wait,\
+    \ the server\\u2019s \\u201c[perf] avg_get/avg_scan\\u201d stay near 10\\u202f\\u00b5s/2\\u202fms even as queues grow\
+    \ large. From the client\\u2019s perspective, however, end\\u2011to\\u2011end latency includes this queueing, so p99 balloons\
+    \ into the multi\\u2011second range at 80k and \\u2265140k req/s. Once the socket receive buffers fill, new datagrams\
+    \ are dropped silently by the kernel, so the client sees increasing \\u201cresponses missing\\u201d counts and outstanding\
+    \ request counts that never drain before the run ends. The non\\u2011monotonicity in throughput and p99 across rates (e.g.,\
+    \ 100k performing better than 80k) is explained by the random hash placement of a small number of flows onto 6 workers:\
+    \ in the 100k run, flows happen to be spread relatively evenly across 5 workers, keeping each below saturation and yielding\
+    \ lower queueing, while in the 80k and higher\\u2011rate runs, more flows collide on fewer workers, reducing effective\
+    \ usable capacity and causing larger queues, more UDP drops, and worse tail latency even at a lower offered rate.\",\n\
+    \          \"score\": 8\n        },\n        \"questions\": [],\n        \"question_answers\": [],\n        \"iteration_type\"\
+    : \"final\",\n        \"parsed_response\": {\n          \"status\": \"finish\",\n          \"Summary\": \"The agent policy\\\
+    u2019s eBPF program is not doing any dynamic, load-aware steering: on every packet it looks up pebble_agent_state.Active\
+    \ (set once at load to the configured worker count, 6) and deterministically picks a reuseport slot as `slot = reuse->hash\
+    \ % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The Go server always opens 6 SO_REUSEPORT UDP sockets,\
+    \ inserts all 6 FDs into the pebble_udp_targets map at indices 0\\u20135, and spawns one goroutine per worker. Each worker\
+    \ goroutine runs a tight loop of `ReadFromUDP` \\u2192 `handleRequest` \\u2192 `WriteToUDP`; `handleRequest` parses the\
+    \ request, performs only a busy\\u2011wait delay (10\\u202f\\u00b5s for GET, 2\\u202fms for SCAN) plus some light parsing/formatting\
+    \ and stats accounting, and returns a response. There are no other blocking operations on the hot path, so each worker\
+    \ is effectively a single\\u2011threaded server whose capacity is bounded by that synthetic delay and a small fixed per\\\
+    u2011request overhead. The client runs open\\u2011loop at fixed target rates (80k\\u2013180k req/s) with a small number\
+    \ of UDPConns (one per send worker, each with its own source port) and matching per\\u2011conn receive goroutines. The\
+    \ experiment logs show that in each run only 3\\u20135 of the 6 server workers ever report traffic in a given second,\
+    \ and which indices are active changes between runs. Aggregate server throughput flattens between ~70k and ~105k req/s\
+    \ depending on the run, while the client continues to inject traffic at the configured rate, so outstanding requests build\
+    \ up and a growing fraction of responses never arrive; the client logs these as \\u201cresponses missing\\u201d. Overall\
+    \ p99 latency (measured at the client over all requests) is lowest around 100k req/s and very high at 80k and \\u2265140k,\
+    \ reflecting how long packets spend queued in the kernel and at the workers before they can be processed by the limited\
+    \ number of busy\\u2011waiting goroutines; the server\\u2019s own \\u201c[perf] avg_get/avg_scan\\u201d numbers remain\
+    \ fixed near the configured synthetic delays because they do not include time spent in queues.\",\n          \"hypothesis\"\
+    : {\n            \"text\": \"The observed behavior is driven by the combination of (1) the agent eBPF selector doing a\
+    \ simple, static hash\\u2011based choice of reuseport slot per packet/flow (`slot = reuse->hash % active` with `active\
+    \ = 6`), (2) a small number of client UDP flows (one per send worker / source port) so there are fewer flows than server\
+    \ workers, and (3) each server worker processing requests strictly sequentially with busy\\u2011wait delays. At startup,\
+    \ all 6 worker sockets are inserted into the pebble_udp_targets map and the agent state\\u2019s Active count is set to\
+    \ 6, but because the client only originates a handful of flows, those flows hash onto only 3\\u20135 of the 6 slots in\
+    \ each run. Which specific workers are used (and how many flows collide on the same worker) varies randomly from run to\
+    \ run as source ports and hashes change. Within a run, each packet for a given flow is effectively pinned to its chosen\
+    \ worker; that worker\\u2019s goroutine then handles the request synchronously and spends ~10\\u202f\\u00b5s (GET) or\
+    \ 2\\u202fms (SCAN) in a busy\\u2011wait loop for every request. This architecture means: (a) the system\\u2019s true\
+    \ parallelism is limited to the number of reuseport slots that actually receive traffic, not the configured 6 workers;\
+    \ and (b) if multiple high\\u2011rate client flows hash to the same worker, that worker becomes a hot spot and builds\
+    \ a long queue while other workers are underutilized. When the client target rate is near or above the sum of the capacities\
+    \ of the few workers that are actually receiving traffic, packets accumulate in the per\\u2011socket UDP receive queues.\
+    \ Because handleRequest\\u2019s measured latency only times the busy\\u2011wait, the server\\u2019s \\u201c[perf] avg_get/avg_scan\\\
+    u201d stay near 10\\u202f\\u00b5s/2\\u202fms even as queues grow large. From the client\\u2019s perspective, however,\
+    \ end\\u2011to\\u2011end latency includes this queueing, so p99 balloons into the multi\\u2011second range at 80k and\
+    \ \\u2265140k req/s. Once the socket receive buffers fill, new datagrams are dropped silently by the kernel, so the client\
+    \ sees increasing \\u201cresponses missing\\u201d counts and outstanding request counts that never drain before the run\
+    \ ends. The non\\u2011monotonicity in throughput and p99 across rates (e.g., 100k performing better than 80k) is explained\
+    \ by the random hash placement of a small number of flows onto 6 workers: in the 100k run, flows happen to be spread relatively\
+    \ evenly across 5 workers, keeping each below saturation and yielding lower queueing, while in the 80k and higher\\u2011rate\
+    \ runs, more flows collide on fewer workers, reducing effective usable capacity and causing larger queues, more UDP drops,\
+    \ and worse tail latency even at a lower offered rate.\",\n            \"score\": 8\n          },\n          \"questions\"\
+    : [],\n          \"question_answers\": []\n        }\n      }\n    ]\n  }\n]\n- Attempt metrics: policy=agent, rates=[80000,\
+    \ 100000, 140000, 160000, 180000], load_p99_curve=[(80000.0, 3.473), (100000.0, 4.175), (140000.0, 14.838), (160000.0,\
+    \ 620.416), (180000.0, 1482.244)], load_p99_stddev_curve=[(80000.0, 0.0), (100000.0, 0.0), (140000.0, 0.0), (160000.0,\
+    \ 0.0), (180000.0, 0.0)], compile=1.0, load=1.0, combined_score=-2783.5879999999997, run_success=1.0\n- Attempt artifacts\
+    \ (errors, logs, stderr/stdout): runs: [\n  {\n    \"name\": \"agent-80000\",\n    \"server_log\": \"2025/12/03 14:30:41.071452\
+    \ server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\\
+    n2025/12/03 14:30:43.075523 server stopped\\n2025/12/03 14:30:43.226980 server starting addr=127.0.0.1:9000 workers=6\
+    \ policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\n2025/12/03 14:30:46.227328 [perf] worker=0 gets=10539\
+    \ get_errors=0 avg_get=10.156\\u00b5s scans=44 scan_errors=0 avg_scan=2.00106ms\\n2025/12/03 14:30:46.227378 [perf] worker=1\
+    \ gets=10667 get_errors=0 avg_get=10.225\\u00b5s scans=49 scan_errors=0 avg_scan=2.000095ms\\n2025/12/03 14:30:46.227390\
+    \ [perf] worker=2 gets=10610 get_errors=0 avg_get=10.144\\u00b5s scans=50 scan_errors=0 avg_scan=2.0001ms\\n2025/12/03\
+    \ 14:30:46.227398 [perf] worker=3 gets=10413 get_errors=0 avg_get=10.149\\u00b5s scans=48 scan_errors=0 avg_scan=2.000101ms\\\
+    n2025/12/03 14:30:46.227406 [perf] worker=4 gets=10527 get_errors=0 avg_get=10.184\\u00b5s scans=45 scan_errors=0 avg_scan=2.000099ms\\\
+    n2025/12/03 14:30:46.227413 [perf] worker=5 gets=10542 get_errors=0 avg_get=10.225\\u00b5s scans=46 scan_errors=0 avg_scan=2.000372ms\\\
+    n2025/12/03 14:30:46.227421 [perf] interval=1s gets=63298 get_errors=0 avg_get=10.181\\u00b5s scans=282 scan_errors=0\
+    \ avg_scan=2.000293ms\\n2025/12/03 14:30:47.227336 [perf] worker=0 gets=13158 get_errors=0 avg_get=10.152\\u00b5s scans=61\
+    \ scan_errors=0 avg_scan=2.000103ms\\n2025/12/03 14:30:47.227378 [perf] worker=1 gets=13223 get_errors=0 avg_get=10.138\\\
+    u00b5s scans=69 scan_errors=0 avg_scan=2.000097ms\\n2025/12/03 14:30:47.227389 [perf] worker=2 gets=13225 get_errors=0\
+    \ avg_get=10.144\\u00b5s scans=79 scan_errors=0 avg_scan=2.000105ms\\n2025/12/03 14:30:47.227397 [perf] worker=3 gets=13489\
+    \ get_errors=0 avg_get=10.133\\u00b5s scans=63 scan_errors=0 avg_scan=2.000848ms\\n2025/12/03 14:30:47.227404 [perf] worker=4\
+    \ gets=13134 get_errors=0 avg_get=10.146\\u00b5s scans=77 scan_errors=0 avg_scan=2.000103ms\\n2025/12/03 14:30:47.22\n\
+    - Recent feedback so far: - **Assessment vs idea intent**\n\n- This version *does* implement the intended fix:\n  - Uses\
+    \ `bpf_get_prandom_u32()` per packet and `slot = rnd % active`, so there is **no flow-hash pinning** anymore.\n  - Still\
+    \ uses only the existing `pebble_agent_state` and `pebble_udp_targets` maps; no new maps or userspace knobs.\n  - Exactly\
+    \ one `bpf_sk_select_reuseport` call, simple O(1) logic, and stateless per packet.\n\n- Evidence that it\u2019s working\
+    \ as intended:\n  - At 80k req/s, server log shows **all 6 workers active** with similar load:\n    - First interval:\
+    \ worker 0\u20135 get counts \u2248 10.3k\u201310.8k, total gets=63,435, scans=323.\n    - Second interval (snippet):\
+    \ worker 0\u20135 all around 13.2\u201313.4k gets each, total \u224879k gets.\n  - This is a big change vs the parent,\
+    \ where only 3\u20135 workers saw traffic and others were idle.\n  - p99 latencies:\n    - 80k: 3.6 ms, 100k: 4.3 ms \u2014\
+    \ close to the synthetic 2 ms SCAN delay plus small queueing.\n    - 140k: 14.6 ms \u2014 moderate queueing as we approach\
+    \ total CPU capacity.\n    - 160k: 547 ms, 180k: 1.5 s \u2014 workers saturated; queues get long as offered load exceeds\
+    \ what 6 single-threaded workers can process.\n\n- Overall: this attempt *strongly* matches the design goals:\n  - Worker\
+    \ underutilization from flow pinning is gone.\n  - No obvious hot-spot worker; load is spread across all configured workers.\n\
+    \  - Complexity is minimal and self-contained in the selector.\n\n**Key behavior / takeaways**\n\n- **All workers utilized:**\
+    \ Logs at 80k clearly show all 6 workers handling similar request volumes. That\u2019s exactly what we wanted versus the\
+    \ previous flow-hash pinning.\n- **Throughput now limited by true CPU capacity, not hash skew:**\n  - At 80k\u2013100k,\
+    \ the server almost fully keeps up; p99 stays low (single-digit ms).\n  - Around 140k+, aggregate demand exceeds ~6\xD7\
+    \ per-worker capacity, so queueing and drops reappear; that\u2019s an inherent capacity limit, not a balancing bug.\n\
+    - **Latency curve shape is now sensible:**\n  - Low, flat p99 in the under-capacity region, then growing tail once you\
+    \ push above ~140k req/s, rather than the non-monotonic, hash-dependent behavior from the parent.\n\n**Top next changes\
+    \ to try**\n\nThe current behavior is already a good \u201Cbaseline\u201D selector. The next tweaks are mostly about small\
+    \ robustness/perf improvements rather than fixing a conceptual bug.\n\n1. **Replace `% active` with a multiply-shift to\
+    \ avoid division and bias**\n\n   Division can be relatively expensive in BPF, and `% active` introduces small bias when\
+    \ `active` is not a power of two. You can keep the same semantics (uniform random in `[0, active)`) with:\n\n   ```c\n\
+    \   __u32 rnd = bpf_get_prandom_u32();\n   __u32 slot = ((__u64)rnd * active) >> 32;  // uniform in [0, active) without\
+    \ div\n   ```\n\n   This keeps everything else identical but is cheaper and slightly more statistically uniform.\n\n2.\
+    \ **Use hash+random instead of pure random (for stability under heavy load)**\n\n   To add a tiny bit more structure (while\
+    \ still avoiding pinning) you can mix in `reuse->hash`:\n\n   ```c\n   __u32 rnd = bpf_get_prandom_u32();\n   __u32 mixed\
+    \ = rnd ^ reuse->hash;\n   __u32 slot = ((__u64)mixed * active) >> 32;\n   ```\n\n   - This keeps per-packet randomness\
+    \ but slightly stabilizes the distribution across flows, which may reduce very short-term bursts on a single worker at\
+    \ extremely high rates.\n\n3. **Tighten safety checks around `active` (defensive, but cheap)**\n\n   Your current clamp\
+    \ to 128 is good. You could make the exit conditions a bit stricter (helps if Go side is ever misconfigured):\n\n   ```c\n\
+    \   if (!state)\n       return SK_PASS;\n\n   __u32 active = state->active;\n   if (active == 0 || active > 128)\n   \
+    \    return SK_PASS;\n   ```\n\n   That ensures we never index beyond the map even if userspace accidentally sets `Active`\
+    \ too high.\n\nIf you want to explore more aggressive optimizations later (like probabilistic shedding at overload), that\
+    \ will be a separate, more opinionated step. For now, the current design is aligned with the original intent; I\u2019\
+    d focus on the lightweight math/robustness tweaks above and then confirm that all workers remain evenly loaded across\
+    \ all rates.\n- Current attempt code:\n```.c\n//go:build ignore\n\n#include <linux/bpf.h>\n#include <bpf/bpf_helpers.h>\n\
+    \nstruct {\n    __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);\n    __uint(max_entries, 128);\n    __type(key, __u32);\n\
+    \    __type(value, __u32);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n} pebble_udp_targets SEC(\".maps\");\n\n// EVOLVE-BLOCK-START\n\
+    /*\n * Agent UDP selector: stateless per-packet randomized load balancing\n * using multiply-shift instead of division.\n\
+    \ *\n * Motivation\n * ----------\n * The previous version already removed flow-hash pinning by picking a\n * random slot\
+    \ per packet:\n *\n *     slot = bpf_get_prandom_u32() % active;\n *\n * This evenly utilized all workers even with very\
+    \ few client flows, which\n * fixed the worst hot-spotting issues. The next refinement is purely\n * micro-optimizations\
+    \ and minor robustness:\n *\n *   - Avoid 32-bit division/modulo in the hot path.\n *   - Keep a uniform distribution\
+    \ over [0, active) without bias.\n *   - Add a small amount of structure via reuse->hash mixing while\n *     retaining\
+    \ per-packet randomness (no flow affinity).\n *\n * Approach\n * --------\n * - agent_state.active is still the only knob\
+    \ and is written once at\n *   startup from Go to the number of active SO_REUSEPORT workers.\n * - Per packet:\n *   \
+    \  1. Load `active`; if 0 or > 128, fall back to SK_PASS.\n *     2. Draw a pseudo-random 32-bit value: rnd = bpf_get_prandom_u32().\n\
+    \ *     3. Mix in the kernel-provided flow hash:\n *\n *            mixed = rnd ^ reuse->hash;\n *\n *     4. Map `mixed`\
+    \ into [0, active) with 64-bit multiply-shift:\n *\n *            slot = ((__u64)mixed * active) >> 32;\n *\n *      \
+    \  This is a standard technique that avoids division while providing\n *        an (approximately) uniform integer in\
+    \ [0, active).\n * - Call bpf_sk_select_reuseport exactly once with this slot and always\n *   return SK_PASS so the kernel\
+    \ proceeds with the (possibly updated)\n *   selection.\n *\n * Properties\n * ----------\n * - Still stateless and self-contained:\
+    \ no new maps, no extra userspace\n *   configuration, and O(1) work per packet.\n * - Preserves per-packet randomized\
+    \ load balancing, so even a single\n *   high-rate flow is spread across all workers, avoiding queue hot spots.\n * -\
+    \ Multiply-shift removes the modulo/division cost while keeping a\n *   uniform distribution over the active sockets.\n\
+    \ */\n\nstruct agent_state {\n    __u32 active;\n    __u32 pad;\n};\n\nstruct {\n    __uint(type, BPF_MAP_TYPE_ARRAY);\n\
+    \    __uint(max_entries, 1);\n    __type(key, __u32);\n    __type(value, struct agent_state);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n\
+    } pebble_agent_state SEC(\".maps\");\n\nSEC(\"sk_reuseport/selector\")\nenum sk_action agent_udp_selector(struct sk_reuseport_md\
+    \ *reuse)\n{\n    __u32 key = 0;\n    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);\n  \
+    \  if (!state)\n        return SK_PASS;\n\n    __u32 active = state->active;\n    /* Defensive: require a sane active\
+    \ range that matches pebble_udp_targets. */\n    if (active == 0 || active > 128)\n        return SK_PASS;\n\n    /* Per-packet\
+    \ randomness, lightly mixed with the flow hash. */\n    __u32 rnd = bpf_get_prandom_u32();\n    __u32 mixed = rnd ^ reuse->hash;\n\
+    \n    /* Uniform mapping to [0, active) via 64-bit multiply-shift, avoiding div/mod. */\n    __u32 slot = ((__u64)mixed\
+    \ * active) >> 32;\n\n    /* Single helper call; kernel ignores additional calls anyway. */\n    (void)bpf_sk_select_reuseport(reuse,\
+    \ &pebble_udp_targets, &slot, 0);\n\n    return SK_PASS;\n}\n// EVOLVE-BLOCK-END\n\nchar _license[] SEC(\"license\") =\
+    \ \"GPL\";\n```\n- Codebase summary: {\n  \"overview\": {\n    \"scope\": \"Synthetic UDP storage emulator with eBPF-aware\
+    \ load balancing (pebble-server) \u2014 only internal/, cmd/, scripts/, workload/, run.sh, run_exp.py included.\",\n \
+    \   \"languages\": [\n      \"Go 1.22 (internal/*, cmd/*)\",\n      \"Bash (run.sh, scripts/*, workload/run_client.sh)\"\
+    ,\n      \"Python 3 (run_exp.py, scripts/dispatch_docker_experiments.py)\"\n    ],\n    \"artifact_conventions\": {\n\
+    \      \"logs\": \"logs/<role> (server|client)\",\n      \"results\": \"results/run-* (per run.sh invocation) containing\
+    \ experiment.json + workload_summary.json\",\n      \"eBPF_pin_paths\": \"/sys/fs/bpf/pebble/<RUN_ID> (set by run.sh before\
+    \ launching the Go server)\"\n    }\n  },\n  \"execution_flow\": [\n    {\n      \"order\": 1,\n      \"name\": \"Experiment\
+    \ orchestration\",\n      \"artefact\": \"run_exp.py\",\n      \"description\": \"Thin experiment wrapper: either shells\
+    \ into run.sh for fresh sweeps or parses dispatch manifests to summarise existing runs, then emits summary.json and optional\
+    \ matplotlib plots.\",\n      \"key_steps\": [\n        \"parse_args (run_exp.py:29-95) exposes policies/rates/threads\
+    \ plus manifest + plotting toggles.\",\n        \"invoke_run_sh/load_manifest_runs gather `run-*` directories, extract\
+    \ metrics from workload_summary.json, and pass records into write_experiment_summary/generate_plots.\"\n      ]\n    },\n\
+    \    {\n      \"order\": 2,\n      \"name\": \"Per-run workflow\",\n      \"artefact\": \"run.sh\",\n      \"description\"\
+    : \"Convenience script that (a) slices NUMA CPUs between server/client, (b) rebuilds eBPF assets, (c) restarts the Go\
+    \ server for each workload iteration, (d) runs cmd/workload_client under taskset, and (e) aggregates iteration outputs\
+    \ into workload_summary.json.\",\n      \"key_steps\": [\n        \"resolve_cpu_pool/join_by (run.sh:27-118) derive SERVER_CPUSET\
+    \ + CLIENT_CPUSET from CPUSET_POOL or NUMA node 0.\",\n        \"Calls scripts/build_ebpf.sh + scripts/cleanup_ebpf_maps.sh,\
+    \ then orchestrates server via scripts/launch_server.sh and client via run_client wrapper.\",\n        \"Embedded Python\
+    \ (run.sh:415-452) regex-parses client logs into workload_summary.json; final line prints the run directory for downstream\
+    \ tooling.\"\n      ]\n    },\n    {\n      \"order\": 3,\n      \"name\": \"Runtime services\",\n      \"artefacts\"\
+    : [\n        \"cmd/pebble_server/main.go:21-91 -> internal/server/*\",\n        \"cmd/workload_client/main.go:67-450\"\
+    \n      ],\n      \"description\": \"Go binaries that run.sh controls. The server exposes UDP reuseport workers with synthetic\
+    \ latency and optional eBPF selection, while the workload client generates GET/SCAN traffic with latency tracking.\",\n\
+    \      \"key_steps\": [\n        \"cmd/pebble_server wires CLI flags, creates log/results dirs, enables pprof/profiling,\
+    \ builds server.Config and runs server.New/Run under signal-aware context.\",\n        \"internal/server.Server.New/Run\
+    \ (server.go:104-181) validate config, load eBPF policy, clear pinned maps, then open reuseport sockets, attach eBPF,\
+    \ and spawn workers; handleRequest (server.go:268-325) executes busy-wait delays and records stats.\",\n        \"cmd/workload_client\
+    \ main loop (main.go:67-347) builds UDP payloads, enforces rate limit via golang.org/x/time/rate, tags each request with\
+    \ reqID (makeReqID/parseReqID, main.go:308-337) so receive goroutines can compute latency and feed the aggregator (latencyAggregator,\
+    \ main.go:40-66).\",\n        \"Server stats logger (server.go:328-395) emits per-worker and aggregate lines that scripts/monitoring\
+    \ can scrape.\"\n      ],\n      \"downstream\": [\n        \"Server relies on internal/server/ebpf.go + generated internal/ebpfutil\
+    \ bindings.\",\n        \"Client output is parsed by run.sh\u2019s Python aggregator; logs feed human debugging.\"\n \
+    \     ]\n    },\n    {\n      \"order\": 4,\n      \"name\": \"Support scripts\",\n      \"artefacts\": [\n        \"\
+    scripts/build_ebpf.sh:1-34\",\n        \"scripts/cleanup_ebpf_maps.sh:1-25\",\n        \"scripts/launch_server.sh:1-96\"\
+    ,\n        \"scripts/dispatch_docker_experiments.py:1-654\",\n        \"workload/run_client.sh:1-62\"\n      ],\n    \
+    \  \"description\": \"Reusable helpers for building eBPF assets, cleaning pinned maps, launching the server standalone,\
+    \ dispatching dockerized experiments, and invoking the workload client without run.sh.\",\n      \"key_steps\": [\n  \
+    \      \"build_ebpf.sh enforces clang availability, sets BPF_CLANG/BPF_CFLAGS, adds arch include paths, then runs `go\
+    \ generate ./internal/ebpfutil`.\",\n        \"cleanup_ebpf_maps.sh deletes global pinned maps unless run-specific BPF_PIN_PATH\
+    \ is set, preventing fd leaks between runs.\",\n        \"launch_server.sh builds cmd/pebble_server (unless disabled),\
+    \ enforces single instance via PID file, applies taskset when SERVER_CPUSET is exported, and records PID for run.sh.\"\
+    ,\n        \"dispatch_docker_experiments.py reads NUMA topology (read_numa_cpu_map, line 106), assigns per-container CPU\
+    \ slices, constructs docker run commands (build_jobs, line 149), streams logs asynchronously (run_job, line 221), and\
+    \ optionally post-processes with run_exp.py.\",\n        \"workload/run_client.sh is a thin CLI around `go run ./cmd/workload_client`\
+    \ for ad-hoc manual traffic.\"\n      ]\n    }\n  ],\n  \"modules\": {\n    \"run_exp.py\": {\n      \"high_level_role\"\
+    : \"Top-level wrapper to sweep policies/rates and collect workload_summary.json files into one experiment summary.\",\n\
+    \      \"key_points\": [\n        \"parse_args exposes knobs for policies/rates, send-workers, duration, server/client\
+    \ cores, plotting, and manifest reuse.\",\n        \"invoke_run_sh executes run.sh and captures the run directory; load_manifest_runs\
+    \ + link_run_directories reuse docker-dispatched runs.\",\n        \"generate_overall_plot / generate_get_scan_plot optionally\
+    \ render PNGs (skip with --skip-plot).\"\n      ]\n    },\n    \"run.sh\": {\n      \"high_level_role\": \"Automation\
+    \ glue that sets up CPU pinning, rebuilds eBPF assets, runs cmd/pebble_server + cmd/workload_client for N iterations,\
+    \ and emits workload_summary.json.\",\n      \"key_points\": [\n        \"resolve_cpu_pool + join_by compute SERVER_CPUSET/CLIENT_CPUSET\
+    \ and export them for both taskset prefixes.\",\n        \"start_server/stop_server wrap scripts/launch_server.sh and\
+    \ enforce clean PID files; run_client pins workload_client under CLIENT_CPUSET.\",\n        \"Embedded Python generates\
+    \ workload_summary.json from logs/workload_iteration_*.txt, which run_exp.py later ingests.\"\n      ]\n    },\n    \"\
+    cmd/pebble_server\": {\n      \"high_level_role\": \"Go binary that instantiates internal/server.Server based on CLI flags\
+    \ and keeps it running with profiling enabled.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Flag wiring\
+    \ & filesystem setup\",\n          \"lines\": \"cmd/pebble_server/main.go:21-52\",\n          \"details\": [\n       \
+    \     \"Defines flags for listen addr, workers, policy, max scan, log/results dirs, timeouts, and synthetic delays; ensures\
+    \ directories exist before logging.\",\n            \"Creates/opens <log-dir>/server.log (append mode) and builds a microsecond-resolution\
+    \ logger.\"\n          ]\n        },\n        {\n          \"name\": \"Profiling + server lifecycle\",\n          \"lines\"\
+    : \"cmd/pebble_server/main.go:52-92\",\n          \"details\": [\n            \"Enables block/mutex profiling (runtime.SetBlockProfileRate/SetMutexProfileFraction)\
+    \ and hosts net/http/pprof on 127.0.0.1:6060.\",\n            \"Builds server.Config, calls server.New (fails fast on\
+    \ invalid config or eBPF load issues), installs SIGINT/SIGTERM handler, logs startup configuration, and blocks on srv.Run(ctx).\"\
+    \n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"Uses internal/server (Config, Server, eBPF\
+    \ loader).\",\n        \"scripts/launch_server.sh expects -log-dir and -results-dir to exist for log collation.\"\n  \
+    \    ]\n    },\n    \"cmd/workload_client\": {\n      \"high_level_role\": \"Open-loop UDP workload generator with reqID-based\
+    \ latency measurement and throughput reporting.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Latency\
+    \ data structures\",\n          \"lines\": \"cmd/workload_client/main.go:32-66\",\n          \"details\": [\n        \
+    \    \"latencyRecord and latencyAggregator store per-request latencies, split into overall/GET/SCAN slices; aggregator.totalRecv\
+    \ reports sample counts.\"\n          ]\n        },\n        {\n          \"name\": \"Main workload loop\",\n        \
+    \  \"lines\": \"cmd/workload_client/main.go:67-307\",\n          \"details\": [\n            \"Parses flags (server, duration,\
+    \ rate, get-frac, scan-limit, key prefix/space, log path, send workers), validates arguments, seeds RNGs per worker.\"\
+    ,\n            \"Creates a shared rate limiter (golang.org/x/time/rate), spawns send goroutines that build payloads (buildPayload,\
+    \ line 363) and assign reqIDs (makeReqID, line 308).\",\n            \"Spawns recv goroutines with deadlines that parse\
+    \ responses, extract reqIDs (parseReqID, line 320), compute latency, and push records into latencyCh.\",\n           \
+    \ \"Aggregator + monitor goroutines track outstanding requests and total received counts.\"\n          ]\n        },\n\
+    \        {\n          \"name\": \"Statistics reporting\",\n          \"lines\": \"cmd/workload_client/main.go:308-451\"\
+    ,\n          \"details\": [\n            \"Helper functions (makeReqID/parseReqID/writeHex/parseHex) ensure both sides\
+    \ share the encoding.\",\n            \"percentile/average/reportLatencyStats (lines 376-451) sort copies of the latency\
+    \ slices, compute p50/p90/p99/avg, and print textual summaries that run.sh\u2019s regex parser expects.\"\n          ]\n\
+    \        }\n      ],\n      \"cross_dependencies\": [\n        \"run.sh\u2019s run_client wrapper invokes this with -log\
+    \ pointing at logs/client.log; workload/run_client.sh uses go run for convenience.\",\n        \"Server assumes GET payload\
+    \ format 'GET key [reqID]' and SCAN 'SCAN start limit [reqID]' as implemented here.\"\n      ]\n    },\n    \"internal/server\"\
+    : {\n      \"high_level_role\": \"Core server runtime, including configuration validation, UDP worker pool, request parser,\
+    \ stats logging, and eBPF policy integration.\",\n      \"key_files\": [\n        {\n          \"path\": \"internal/server/config.go\"\
+    ,\n          \"summary\": \"Config struct + Validate clamp runtime knobs to sane defaults so CLI/script errors don\u2019\
+    t crash the server.\",\n          \"key_functions\": [\n            {\n              \"name\": \"Config.Validate\",\n\
+    \              \"lines\": \"internal/server/config.go:19-43\",\n              \"details\": [\n                \"Sets ListenAddr\
+    \ default (127.0.0.1:9000), ensures at least one worker, caps MaxScanKeys >= 1 (default 100k), enforces non-zero timeouts/delays.\"\
+    ,\n                \"Called by server.New before any socket/eBPF work, giving run.sh freedom to pass zero/negative placeholder\
+    \ values.\"\n              ]\n            }\n          ]\n        },\n        {\n          \"path\": \"internal/server/server.go\"\
+    ,\n          \"summary\": \"Implements the Server struct, worker lifecycle, UDP handler, and stats reporter.\",\n    \
+    \      \"key_functions\": [\n            {\n              \"name\": \"Server.New\",\n              \"lines\": \"internal/server/server.go:104-131\"\
+    ,\n              \"details\": [\n                \"Validates config, builds default logger when nil, loads eBPF policy\
+    \ via loadEBPF, clears pinned target map when a program is present, and preallocates workerStats.\"\n              ]\n\
+    \            },\n            {\n              \"name\": \"Server.Run\",\n              \"lines\": \"internal/server/server.go:144-182\"\
+    ,\n              \"details\": [\n                \"Resets stats, spawns stats logger, iterates workers to open UDP sockets\
+    \ (openWorker, lines 184-230), optionally attaches the eBPF program to worker 0, records socket fds into the pinned map,\
+    \ launches spawnWorker goroutines, and blocks until ctx cancellation.\"\n              ]\n            },\n           \
+    \ {\n              \"name\": \"openWorker + spawnWorker\",\n              \"lines\": \"internal/server/server.go:184-266\"\
+    ,\n              \"details\": [\n                \"openWorker sets SO_REUSEADDR/SO_REUSEPORT via net.ListenConfig.Control\
+    \ and attaches the eBPF program once; returns both UDPConn and fd for map updates.\",\n                \"spawnWorker loops\
+    \ on ReadFromUDP, handles ctx cancellation/ErrClosed gracefully, and logs transient read/write errors.\"\n           \
+    \   ]\n            },\n            {\n              \"name\": \"handleRequest\",\n              \"lines\": \"internal/server/server.go:268-325\"\
+    ,\n              \"details\": [\n                \"Parses payloads via parseRequest, extracts optional reqID tokens, enforces\
+    \ SCAN limit <= MaxScanKeys, executes accurate busy-wait delays for GET/SCAN, records latencies per worker, and formats\
+    \ responses (formatResponse, lines 397-407).\"\n              ]\n            },\n            {\n              \"name\"\
+    : \"startStatsLogger\",\n              \"lines\": \"internal/server/server.go:328-395\",\n              \"details\": [\n\
+    \                \"Every second, snapshots worker metrics, logs per-worker averages when there was traffic, accumulates\
+    \ totals, and emits aggregate '[perf] interval=1s ...' lines consumed by observability tooling.\"\n              ]\n \
+    \           }\n          ]\n        },\n        {\n          \"path\": \"internal/server/handler.go\",\n          \"summary\"\
+    : \"Robust ASCII parser for GET/SCAN requests.\",\n          \"key_functions\": [\n            {\n              \"name\"\
+    : \"parseRequest\",\n              \"lines\": \"internal/server/handler.go:14-45\",\n              \"details\": [\n  \
+    \              \"Trims whitespace, splits fields, enforces argument counts for GET/SCAN, and lowercases manually via equalFoldASCII\
+    \ (lines 48-66) to avoid allocations in hot paths.\"\n              ]\n            }\n          ]\n        },\n      \
+    \  {\n          \"path\": \"internal/server/ebpf.go\",\n          \"summary\": \"Loads eBPF selector programs, manages\
+    \ pin directories, and updates reuseport target maps.\",\n          \"key_functions\": [\n            {\n            \
+    \  \"name\": \"loadEBPF + load* variants\",\n              \"lines\": \"internal/server/ebpf.go:50-218\",\n          \
+    \    \"details\": [\n                \"Switches on policy names, ensures memlock rlimit is raised, creates pin directories,\
+    \ loads generated ebpfutil objects, seeds state maps (e.g., PebbleRrState.Active = workers), and returns ebpfPolicy handles\
+    \ with Close hooks.\",\n                \"Validates non-negative worker counts for agent/scan_split/hash policies.\"\n\
+    \              ]\n            },\n            {\n              \"name\": \"attach/updateTargetsMap/clearTargets\",\n \
+    \             \"lines\": \"internal/server/ebpf.go:220-268\",\n              \"details\": [\n                \"attach(fd)\
+    \ wraps SO_ATTACH_REUSEPORT_EBPF, updateTargetsMap writes worker fd values into the pinned pebble_udp_targets map so eBPF\
+    \ programs can redirect flows, clearTargets removes stale slots at startup (skips when map not present).\"\n         \
+    \     ]\n            }\n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"Relies on generated\
+    \ internal/ebpfutil bindings (bpf2go outputs).\",\n        \"Server expects run.sh or scripts/launch_server.sh to set\
+    \ BPF_PIN_BASE/PATH correctly.\"\n      ]\n    },\n    \"internal/ebpfutil\": {\n      \"high_level_role\": \"Generated\
+    \ Go bindings/objects for each eBPF selector program; rebuild with `go generate ./internal/ebpfutil`.\",\n      \"key_files\"\
+    : [\n        {\n          \"path\": \"internal/ebpfutil/bpf_assets.go\",\n          \"summary\": \"Contains go:generate\
+    \ directives pointing at ../../ebpf/*.c programs with bpf2go, ensuring clang builds BPF object files.\",\n          \"\
+    key_points\": [\n            \"Generated *_bpf.go files (e.g., agentselector_bpf.go) expose typed structs (AgentSelectorObjects,\
+    \ Maps, Programs) and embed corresponding *.o bytecode, which internal/server/ebpf.go loads with pinned map support.\"\
+    \n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"scripts/build_ebpf.sh must run before any\
+    \ policy other than 'default' is used, otherwise loadEBPF will fail due to missing object files.\"\n      ]\n    },\n\
+    \    \"scripts\": {\n      \"build_ebpf.sh\": {\n        \"role\": \"Rebuild internal/ebpfutil assets (`go generate ./internal/ebpfutil`)\
+    \ with clang, unless SKIP_EBPF_BUILD=true.\"\n      },\n      \"cleanup_ebpf_maps.sh\": {\n        \"role\": \"Remove\
+    \ pinned reuseport maps under $BPF_PIN_BASE to avoid stale file descriptor slots; skipped when BPF_PIN_PATH is set.\"\n\
+    \      },\n      \"launch_server.sh\": {\n        \"role\": \"Build/run cmd/pebble_server with provided flags, enforce\
+    \ single instance via PID files, and optionally wrap in taskset.\"\n      },\n      \"dispatch_docker_experiments.py\"\
+    : {\n        \"role\": \"NUMA-aware docker dispatcher: builds `docker run` commands per (policy, rate), streams logs,\
+    \ writes dispatch manifests, and can trigger run_exp.py on completion.\"\n      }\n    },\n    \"workload\": {\n     \
+    \ \"run_client.sh\": {\n        \"role\": \"Simplified wrapper to run cmd/workload_client without building binaries.\"\
+    ,\n        \"lines\": \"workload/run_client.sh:1-62\",\n        \"notes\": [\n          \"Accepts basic knobs (-s server,\
+    \ -t duration, -r rate, -g GET fraction, -m scan limit, -k prefix, -N key space, -w workers, -l log file).\",\n      \
+    \    \"Ensures client log directory exists, runs from repo root so go modules resolve, and writes logs to logs/client.log\
+    \ by default.\"\n        ]\n      }\n    }\n  }\n}\n\n\nREQUIREMENTS:\n- Keep responses short and actionable (bullets\
+    \ are fine).\n- Explicitly answer: How well does this attempt\u2019s behavior match the idea intent? Cite evidence from\
+    \ metrics/artifacts/code.\n- Carefully look at metrics and logs to understand the performance and potential problems/anomolies.\
+    \ For example, are all the workers being utilized? why not? \n- Use the parent eval output to learn lessons, but be cautious:\
+    \ the new program\u2019s behavior may differ. Do not assume identical behavior; generalize insights.\n- Suggest the top\
+    \ 2\u20133 changes to try next. Stay within constraints: only edit between EVOLVE-BLOCK markers, keep eBPF verifier-safe,\
+    \ only one bpf_sk_select_reuseport call, and only touch the existing agent_state map if state is needed (no new maps or\
+    \ pin path changes).\n\nOUTPUT:\n- Brief assessment of idea alignment.\n- Key behavior/takeaways from metrics/artifacts.\n\
+    - Concrete next changes to try.\n"
+response_text: "- **Idea alignment**\n\n  - This version matches the design goals very well:\n    - **No flow-hash pinning:**\
+  \ slot is derived from `bpf_get_prandom_u32()` and a multiply\u2011shift, not from `reuse->hash % active`, so flows are\
+  \ *not* pinned.\n    - **All workers used:** at 80k, server log shows workers 0\u20135 all active with very similar counts\
+  \ (\u224810.4\u201310.7k gets in the first second, \u224813.1\u201313.5k gets in the next), plus a balanced aggregate line:\
+  \  \n      `interval=1s gets=63298 ...` then \u224879k on the next second. That\u2019s a big improvement over the parent\
+  \ where only 3\u20135 workers ever did work.\n    - **Selector is simple and self-contained:** still only uses `pebble_agent_state`\
+  \ and `pebble_udp_targets`, one `bpf_sk_select_reuseport` call, O(1) logic, no extra maps or userspace knobs.\n    - **Correctness\
+  \ for the existing workload:** nothing in the selector depends on request contents; UDP handling remains stateless per packet\
+  \ at the Go layer.\n\n  - Remaining high p99 at high rates is now clearly a **capacity** issue, not a steering bug:\n  \
+  \  - p99: 80k=3.47ms, 100k=4.18ms, 140k=14.8ms, then 160k\u2248620ms, 180k\u22481.48s.\n    - All 6 workers are busy; when\
+  \ offered load exceeds \u201C6 \xD7 single-thread worker capacity\u201D, queues and drops are inevitable.\n\n- **Key behavior\
+  \ / takeaways**\n\n  - **Load balancing looks good:**\n    - At 80k, all 6 workers see near-identical traffic; no obvious\
+  \ hot spot worker.\n    - Aggregate throughput in the log (~63\u201379k/s depending on interval) is now limited by CPU/worker\
+  \ capacity, not by flow-placement pathologies.\n  - **Client metrics behave sensibly:**\n    - Low p99 in the under-capacity\
+  \ region (80k\u2013100k), rising smoothly as total demand approaches/exceeds server capacity.\n    - Very large p99 at 160k/180k\
+  \ is consistent with 6 busy\u2011wait workers each doing 2ms SCANs and the UDP queues backing up; this matches the model\
+  \ from the parent analysis.\n  - **The micro-change (modulo \u2192 multiply\u2011shift, optional hash mixing) did not obviously\
+  \ hurt or dramatically change the curve**; results are essentially similar to the previous per\u2011packet\u2011random attempt,\
+  \ as expected.\n\n- **Top 2\u20133 changes to try next**\n\n  1. **Clamp `active` against `reuse->num_sks` defensively**\n\
+  \n     - Today you trust `state->active` and only bound it to `1..128`. If userspace ever mis-syncs `Active` vs the actual\
+  \ number of installed sockets, you could hand `bpf_sk_select_reuseport` an index that has no FD.\n     - It\u2019s cheap\
+  \ to make `active` = min(`state->active`, `reuse->num_sks`, 128):\n\n     ```c\n     __u32 active = state->active;\n   \
+  \  /* Defensive sanity: non-zero and within map + kernel limits. */\n     if (active == 0)\n         return SK_PASS;\n\n\
+  \     if (active > 128)\n         active = 128;\n\n     /* Don't target more slots than there are sockets. */\n     if (reuse->num_sks\
+  \ && reuse->num_sks < active)\n         active = reuse->num_sks;\n     ```\n\n     - Then use this `active` in the multiply\u2011\
+  shift. This keeps behavior identical in the normal case but makes the program robust to misconfiguration or future changes.\n\
+  \n  2. **(Optional) Simplify randomness back to pure `prandom` if you want maximum clarity**\n\n     - The `mixed = rnd\
+  \ ^ reuse->hash;` step slightly \u201Cshapes\u201D randomness but doesn\u2019t fundamentally change behavior and hasn\u2019\
+  t shown a measurable benefit in the metrics.\n     - If you value maximal clarity over micro\u2011tuning, you can drop the\
+  \ mix:\n\n     ```c\n     __u32 rnd  = bpf_get_prandom_u32();\n     __u32 slot = ((__u64)rnd * active) >> 32;\n     ```\n\
+  \n     - This still gives uniform per-packet random load-balancing with fast multiply\u2011shift.\n\n  3. **Experiment-level\
+  \ (no code change): confirm full utilization across rates**\n\n     - For one run (e.g., at 140k or 160k), keep the current\
+  \ selector but:\n       - Inspect the server log to ensure *all* 6 workers are still showing traffic every interval.\n \
+  \      - Optionally bump client `-send-workers` above 1 to confirm the distribution remains even with more flows.\n    \
+  \ - This helps validate that any remaining tail issues are purely capacity, not subtle imbalance that appears only under\
+  \ heavier load.\n\nOverall, this attempt achieves the core intent: it eliminates flow-hash pinning, uses all workers, avoids\
+  \ obvious hot spots, and keeps the selector simple. The next changes are mainly defensive and stylistic, not functional\
+  \ rewrites."

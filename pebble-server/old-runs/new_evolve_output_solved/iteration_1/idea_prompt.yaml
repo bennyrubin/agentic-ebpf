@@ -1,0 +1,363 @@
+idea_agent_prompt: "You are an expert in high-performance Linux UDP servers that load-balance traffic with SO_REUSEPORT and\
+  \ a custom sk_reuseport eBPF program. The traffic comes in as short GET requests and longer SCAN requests with 99.5% of\
+  \ the workload being GETs. Study the supplied artifacts (current eBPF implementation, run metrics, short codebase summary,\
+  \ performance summary, and performance explanation hypothesis.) to understand how the system actually behaved and why. From\
+  \ that understanding, produce a draft design document for a next-generation eBPF selector that improves on the observed\
+  \ problems. Additionally, be creative, trying new, potentially drastic different approaches, when you believe it will improve\
+  \ performance. Avoid speculation, note uncertainties, and assume reuseport slots, worker sockets, and database wiring are\
+  \ correctly configured in the application.\n\nGuidelines:\n- Be precise, concise, and evidence-backed. Mark unknowns as\
+  \ uncertain.\n- Always use the simplest possible solution, unless necessary to add more complexity to achieve the goal.\
+  \ For example, don't introduce state or a map unless it is the only way to achieve the goal. Don't add complicated math\
+  \ or algorithms or branching unless necessary.\n- For now, do not focus on fallbacks or error handling, nor logging to ensure\
+  \ correctness.\n- Set \"status\": \"finish\" once you no longer need additional codebase information. Return \"continue\"\
+  \ only when you truly need RAG answers to refine the design.\n- Questions must target codebase details you cannot infer\
+  \ yet (e.g., \"In workload/client.go, how many sender threads are spawned?\"). The questions should be directly related\
+  \ to the codebase and not abstract. Never repeat answered questions or ask about artifacts already provided. For example,\
+  \ do not ask about the eBPF programs or logs that you already have access to and the RAG codebase knows nothing about.\n\
+  - For now, do not include code that requires any configuration in userspace. The eBPF program should be self-contained.\
+  \ You may include constant hyperparameters in the code, that you must tune yourself.\n- Do not worry about the selector\
+  \ logic. You only need to use AgentUDPSelector and can change state in the pebble_agent_state map, but may not create a\
+  \ new map.\n\nOutput strict JSON:\n{\n  \"status\": \"continue|finish\",\n  \"design_doc\": {\n    \"goals\": [\"clear goals\
+  \ tied to observed issues\"],\n    \"evidence\": [\"key supporting observations from the hypothesis and performance summary\"\
+  ],\n    \"architecture\": [\"specific approach that should be taken by the eBPF program. Do not include code, only a text,\
+  \ design level idea/thought. Keep it to a few lines.\"],\n    \"risks\": [\"open questions or assumptions to verify from\
+  \ the codebase\"]\n  },\n  \"questions\": [\"<=5 precise, code-focused RAG queries needed to finalize the design\"]\n}\n\
+  \nRun context:\nEvaluation summary: The agent policy\u2019s eBPF program is not doing any dynamic, load-aware steering:\
+  \ on every packet it looks up pebble_agent_state.Active (set once at load to the configured worker count, 6) and deterministically\
+  \ picks a reuseport slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The\
+  \ Go server always opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets map at indices 0\u2013\
+  5, and spawns one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP` \u2192 `handleRequest`\
+  \ \u2192 `WriteToUDP`; `handleRequest` parses the request, performs only a busy\u2011wait delay (10\u202F\xB5s for GET,\
+  \ 2\u202Fms for SCAN) plus some light parsing/formatting and stats accounting, and returns a response. There are no other\
+  \ blocking operations on the hot path, so each worker is effectively a single\u2011threaded server whose capacity is bounded\
+  \ by that synthetic delay and a small fixed per\u2011request overhead. The client runs open\u2011loop at fixed target rates\
+  \ (80k\u2013180k req/s) with a small number of UDPConns (one per send worker, each with its own source port) and matching\
+  \ per\u2011conn receive goroutines. The experiment logs show that in each run only 3\u20135 of the 6 server workers ever\
+  \ report traffic in a given second, and which indices are active changes between runs. Aggregate server throughput flattens\
+  \ between ~70k and ~105k req/s depending on the run, while the client continues to inject traffic at the configured rate,\
+  \ so outstanding requests build up and a growing fraction of responses never arrive; the client logs these as \u201Cresponses\
+  \ missing\u201D. Overall p99 latency (measured at the client over all requests) is lowest around 100k req/s and very high\
+  \ at 80k and \u2265140k, reflecting how long packets spend queued in the kernel and at the workers before they can be processed\
+  \ by the limited number of busy\u2011waiting goroutines; the server\u2019s own \u201C[perf] avg_get/avg_scan\u201D numbers\
+  \ remain fixed near the configured synthetic delays because they do not include time spent in queues.\nEvaluation hypothesis:\
+  \ The observed behavior is driven by the combination of (1) the agent eBPF selector doing a simple, static hash\u2011based\
+  \ choice of reuseport slot per packet/flow (`slot = reuse->hash % active` with `active = 6`), (2) a small number of client\
+  \ UDP flows (one per send worker / source port) so there are fewer flows than server workers, and (3) each server worker\
+  \ processing requests strictly sequentially with busy\u2011wait delays. At startup, all 6 worker sockets are inserted into\
+  \ the pebble_udp_targets map and the agent state\u2019s Active count is set to 6, but because the client only originates\
+  \ a handful of flows, those flows hash onto only 3\u20135 of the 6 slots in each run. Which specific workers are used (and\
+  \ how many flows collide on the same worker) varies randomly from run to run as source ports and hashes change. Within a\
+  \ run, each packet for a given flow is effectively pinned to its chosen worker; that worker\u2019s goroutine then handles\
+  \ the request synchronously and spends ~10\u202F\xB5s (GET) or 2\u202Fms (SCAN) in a busy\u2011wait loop for every request.\
+  \ This architecture means: (a) the system\u2019s true parallelism is limited to the number of reuseport slots that actually\
+  \ receive traffic, not the configured 6 workers; and (b) if multiple high\u2011rate client flows hash to the same worker,\
+  \ that worker becomes a hot spot and builds a long queue while other workers are underutilized. When the client target rate\
+  \ is near or above the sum of the capacities of the few workers that are actually receiving traffic, packets accumulate\
+  \ in the per\u2011socket UDP receive queues. Because handleRequest\u2019s measured latency only times the busy\u2011wait,\
+  \ the server\u2019s \u201C[perf] avg_get/avg_scan\u201D stay near 10\u202F\xB5s/2\u202Fms even as queues grow large. From\
+  \ the client\u2019s perspective, however, end\u2011to\u2011end latency includes this queueing, so p99 balloons into the\
+  \ multi\u2011second range at 80k and \u2265140k req/s. Once the socket receive buffers fill, new datagrams are dropped silently\
+  \ by the kernel, so the client sees increasing \u201Cresponses missing\u201D counts and outstanding request counts that\
+  \ never drain before the run ends. The non\u2011monotonicity in throughput and p99 across rates (e.g., 100k performing better\
+  \ than 80k) is explained by the random hash placement of a small number of flows onto 6 workers: in the 100k run, flows\
+  \ happen to be spread relatively evenly across 5 workers, keeping each below saturation and yielding lower queueing, while\
+  \ in the 80k and higher\u2011rate runs, more flows collide on fewer workers, reducing effective usable capacity and causing\
+  \ larger queues, more UDP drops, and worse tail latency even at a lower offered rate.\nBest program metrics: policy=agent,\
+  \ rates=[80000, 100000, 140000, 160000, 180000], load_p99_curve=[(80000.0, 2008.936), (100000.0, 452.41), (140000.0, 3117.071),\
+  \ (160000.0, 5461.561), (180000.0, 4340.95)], load_p99_stddev_curve=[(80000.0, 0.0), (100000.0, 0.0), (140000.0, 0.0), (160000.0,\
+  \ 0.0), (180000.0, 0.0)], compile=1.0, load=1.0, combined_score=-27981.450999999997, run_success=1.0\n\nCodebase summary:\n\
+  {\n  \"overview\": {\n    \"scope\": \"Synthetic UDP storage emulator with eBPF-aware load balancing (pebble-server) \u2014\
+  \ only internal/, cmd/, scripts/, workload/, run.sh, run_exp.py included.\",\n    \"languages\": [\n      \"Go 1.22 (internal/*,\
+  \ cmd/*)\",\n      \"Bash (run.sh, scripts/*, workload/run_client.sh)\",\n      \"Python 3 (run_exp.py, scripts/dispatch_docker_experiments.py)\"\
+  \n    ],\n    \"artifact_conventions\": {\n      \"logs\": \"logs/<role> (server|client)\",\n      \"results\": \"results/run-*\
+  \ (per run.sh invocation) containing experiment.json + workload_summary.json\",\n      \"eBPF_pin_paths\": \"/sys/fs/bpf/pebble/<RUN_ID>\
+  \ (set by run.sh before launching the Go server)\"\n    }\n  },\n  \"execution_flow\": [\n    {\n      \"order\": 1,\n \
+  \     \"name\": \"Experiment orchestration\",\n      \"artefact\": \"run_exp.py\",\n      \"description\": \"Thin experiment\
+  \ wrapper: either shells into run.sh for fresh sweeps or parses dispatch manifests to summarise existing runs, then emits\
+  \ summary.json and optional matplotlib plots.\",\n      \"key_steps\": [\n        \"parse_args (run_exp.py:29-95) exposes\
+  \ policies/rates/threads plus manifest + plotting toggles.\",\n        \"invoke_run_sh/load_manifest_runs gather `run-*`\
+  \ directories, extract metrics from workload_summary.json, and pass records into write_experiment_summary/generate_plots.\"\
+  \n      ]\n    },\n    {\n      \"order\": 2,\n      \"name\": \"Per-run workflow\",\n      \"artefact\": \"run.sh\",\n\
+  \      \"description\": \"Convenience script that (a) slices NUMA CPUs between server/client, (b) rebuilds eBPF assets,\
+  \ (c) restarts the Go server for each workload iteration, (d) runs cmd/workload_client under taskset, and (e) aggregates\
+  \ iteration outputs into workload_summary.json.\",\n      \"key_steps\": [\n        \"resolve_cpu_pool/join_by (run.sh:27-118)\
+  \ derive SERVER_CPUSET + CLIENT_CPUSET from CPUSET_POOL or NUMA node 0.\",\n        \"Calls scripts/build_ebpf.sh + scripts/cleanup_ebpf_maps.sh,\
+  \ then orchestrates server via scripts/launch_server.sh and client via run_client wrapper.\",\n        \"Embedded Python\
+  \ (run.sh:415-452) regex-parses client logs into workload_summary.json; final line prints the run directory for downstream\
+  \ tooling.\"\n      ]\n    },\n    {\n      \"order\": 3,\n      \"name\": \"Runtime services\",\n      \"artefacts\": [\n\
+  \        \"cmd/pebble_server/main.go:21-91 -> internal/server/*\",\n        \"cmd/workload_client/main.go:67-450\"\n   \
+  \   ],\n      \"description\": \"Go binaries that run.sh controls. The server exposes UDP reuseport workers with synthetic\
+  \ latency and optional eBPF selection, while the workload client generates GET/SCAN traffic with latency tracking.\",\n\
+  \      \"key_steps\": [\n        \"cmd/pebble_server wires CLI flags, creates log/results dirs, enables pprof/profiling,\
+  \ builds server.Config and runs server.New/Run under signal-aware context.\",\n        \"internal/server.Server.New/Run\
+  \ (server.go:104-181) validate config, load eBPF policy, clear pinned maps, then open reuseport sockets, attach eBPF, and\
+  \ spawn workers; handleRequest (server.go:268-325) executes busy-wait delays and records stats.\",\n        \"cmd/workload_client\
+  \ main loop (main.go:67-347) builds UDP payloads, enforces rate limit via golang.org/x/time/rate, tags each request with\
+  \ reqID (makeReqID/parseReqID, main.go:308-337) so receive goroutines can compute latency and feed the aggregator (latencyAggregator,\
+  \ main.go:40-66).\",\n        \"Server stats logger (server.go:328-395) emits per-worker and aggregate lines that scripts/monitoring\
+  \ can scrape.\"\n      ],\n      \"downstream\": [\n        \"Server relies on internal/server/ebpf.go + generated internal/ebpfutil\
+  \ bindings.\",\n        \"Client output is parsed by run.sh\u2019s Python aggregator; logs feed human debugging.\"\n   \
+  \   ]\n    },\n    {\n      \"order\": 4,\n      \"name\": \"Support scripts\",\n      \"artefacts\": [\n        \"scripts/build_ebpf.sh:1-34\"\
+  ,\n        \"scripts/cleanup_ebpf_maps.sh:1-25\",\n        \"scripts/launch_server.sh:1-96\",\n        \"scripts/dispatch_docker_experiments.py:1-654\"\
+  ,\n        \"workload/run_client.sh:1-62\"\n      ],\n      \"description\": \"Reusable helpers for building eBPF assets,\
+  \ cleaning pinned maps, launching the server standalone, dispatching dockerized experiments, and invoking the workload client\
+  \ without run.sh.\",\n      \"key_steps\": [\n        \"build_ebpf.sh enforces clang availability, sets BPF_CLANG/BPF_CFLAGS,\
+  \ adds arch include paths, then runs `go generate ./internal/ebpfutil`.\",\n        \"cleanup_ebpf_maps.sh deletes global\
+  \ pinned maps unless run-specific BPF_PIN_PATH is set, preventing fd leaks between runs.\",\n        \"launch_server.sh\
+  \ builds cmd/pebble_server (unless disabled), enforces single instance via PID file, applies taskset when SERVER_CPUSET\
+  \ is exported, and records PID for run.sh.\",\n        \"dispatch_docker_experiments.py reads NUMA topology (read_numa_cpu_map,\
+  \ line 106), assigns per-container CPU slices, constructs docker run commands (build_jobs, line 149), streams logs asynchronously\
+  \ (run_job, line 221), and optionally post-processes with run_exp.py.\",\n        \"workload/run_client.sh is a thin CLI\
+  \ around `go run ./cmd/workload_client` for ad-hoc manual traffic.\"\n      ]\n    }\n  ],\n  \"modules\": {\n    \"run_exp.py\"\
+  : {\n      \"high_level_role\": \"Top-level wrapper to sweep policies/rates and collect workload_summary.json files into\
+  \ one experiment summary.\",\n      \"key_points\": [\n        \"parse_args exposes knobs for policies/rates, send-workers,\
+  \ duration, server/client cores, plotting, and manifest reuse.\",\n        \"invoke_run_sh executes run.sh and captures\
+  \ the run directory; load_manifest_runs + link_run_directories reuse docker-dispatched runs.\",\n        \"generate_overall_plot\
+  \ / generate_get_scan_plot optionally render PNGs (skip with --skip-plot).\"\n      ]\n    },\n    \"run.sh\": {\n     \
+  \ \"high_level_role\": \"Automation glue that sets up CPU pinning, rebuilds eBPF assets, runs cmd/pebble_server + cmd/workload_client\
+  \ for N iterations, and emits workload_summary.json.\",\n      \"key_points\": [\n        \"resolve_cpu_pool + join_by compute\
+  \ SERVER_CPUSET/CLIENT_CPUSET and export them for both taskset prefixes.\",\n        \"start_server/stop_server wrap scripts/launch_server.sh\
+  \ and enforce clean PID files; run_client pins workload_client under CLIENT_CPUSET.\",\n        \"Embedded Python generates\
+  \ workload_summary.json from logs/workload_iteration_*.txt, which run_exp.py later ingests.\"\n      ]\n    },\n    \"cmd/pebble_server\"\
+  : {\n      \"high_level_role\": \"Go binary that instantiates internal/server.Server based on CLI flags and keeps it running\
+  \ with profiling enabled.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Flag wiring & filesystem setup\"\
+  ,\n          \"lines\": \"cmd/pebble_server/main.go:21-52\",\n          \"details\": [\n            \"Defines flags for\
+  \ listen addr, workers, policy, max scan, log/results dirs, timeouts, and synthetic delays; ensures directories exist before\
+  \ logging.\",\n            \"Creates/opens <log-dir>/server.log (append mode) and builds a microsecond-resolution logger.\"\
+  \n          ]\n        },\n        {\n          \"name\": \"Profiling + server lifecycle\",\n          \"lines\": \"cmd/pebble_server/main.go:52-92\"\
+  ,\n          \"details\": [\n            \"Enables block/mutex profiling (runtime.SetBlockProfileRate/SetMutexProfileFraction)\
+  \ and hosts net/http/pprof on 127.0.0.1:6060.\",\n            \"Builds server.Config, calls server.New (fails fast on invalid\
+  \ config or eBPF load issues), installs SIGINT/SIGTERM handler, logs startup configuration, and blocks on srv.Run(ctx).\"\
+  \n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"Uses internal/server (Config, Server, eBPF\
+  \ loader).\",\n        \"scripts/launch_server.sh expects -log-dir and -results-dir to exist for log collation.\"\n    \
+  \  ]\n    },\n    \"cmd/workload_client\": {\n      \"high_level_role\": \"Open-loop UDP workload generator with reqID-based\
+  \ latency measurement and throughput reporting.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Latency\
+  \ data structures\",\n          \"lines\": \"cmd/workload_client/main.go:32-66\",\n          \"details\": [\n          \
+  \  \"latencyRecord and latencyAggregator store per-request latencies, split into overall/GET/SCAN slices; aggregator.totalRecv\
+  \ reports sample counts.\"\n          ]\n        },\n        {\n          \"name\": \"Main workload loop\",\n          \"\
+  lines\": \"cmd/workload_client/main.go:67-307\",\n          \"details\": [\n            \"Parses flags (server, duration,\
+  \ rate, get-frac, scan-limit, key prefix/space, log path, send workers), validates arguments, seeds RNGs per worker.\",\n\
+  \            \"Creates a shared rate limiter (golang.org/x/time/rate), spawns send goroutines that build payloads (buildPayload,\
+  \ line 363) and assign reqIDs (makeReqID, line 308).\",\n            \"Spawns recv goroutines with deadlines that parse\
+  \ responses, extract reqIDs (parseReqID, line 320), compute latency, and push records into latencyCh.\",\n            \"\
+  Aggregator + monitor goroutines track outstanding requests and total received counts.\"\n          ]\n        },\n     \
+  \   {\n          \"name\": \"Statistics reporting\",\n          \"lines\": \"cmd/workload_client/main.go:308-451\",\n  \
+  \        \"details\": [\n            \"Helper functions (makeReqID/parseReqID/writeHex/parseHex) ensure both sides share\
+  \ the encoding.\",\n            \"percentile/average/reportLatencyStats (lines 376-451) sort copies of the latency slices,\
+  \ compute p50/p90/p99/avg, and print textual summaries that run.sh\u2019s regex parser expects.\"\n          ]\n       \
+  \ }\n      ],\n      \"cross_dependencies\": [\n        \"run.sh\u2019s run_client wrapper invokes this with -log pointing\
+  \ at logs/client.log; workload/run_client.sh uses go run for convenience.\",\n        \"Server assumes GET payload format\
+  \ 'GET key [reqID]' and SCAN 'SCAN start limit [reqID]' as implemented here.\"\n      ]\n    },\n    \"internal/server\"\
+  : {\n      \"high_level_role\": \"Core server runtime, including configuration validation, UDP worker pool, request parser,\
+  \ stats logging, and eBPF policy integration.\",\n      \"key_files\": [\n        {\n          \"path\": \"internal/server/config.go\"\
+  ,\n          \"summary\": \"Config struct + Validate clamp runtime knobs to sane defaults so CLI/script errors don\u2019\
+  t crash the server.\",\n          \"key_functions\": [\n            {\n              \"name\": \"Config.Validate\",\n  \
+  \            \"lines\": \"internal/server/config.go:19-43\",\n              \"details\": [\n                \"Sets ListenAddr\
+  \ default (127.0.0.1:9000), ensures at least one worker, caps MaxScanKeys >= 1 (default 100k), enforces non-zero timeouts/delays.\"\
+  ,\n                \"Called by server.New before any socket/eBPF work, giving run.sh freedom to pass zero/negative placeholder\
+  \ values.\"\n              ]\n            }\n          ]\n        },\n        {\n          \"path\": \"internal/server/server.go\"\
+  ,\n          \"summary\": \"Implements the Server struct, worker lifecycle, UDP handler, and stats reporter.\",\n      \
+  \    \"key_functions\": [\n            {\n              \"name\": \"Server.New\",\n              \"lines\": \"internal/server/server.go:104-131\"\
+  ,\n              \"details\": [\n                \"Validates config, builds default logger when nil, loads eBPF policy via\
+  \ loadEBPF, clears pinned target map when a program is present, and preallocates workerStats.\"\n              ]\n     \
+  \       },\n            {\n              \"name\": \"Server.Run\",\n              \"lines\": \"internal/server/server.go:144-182\"\
+  ,\n              \"details\": [\n                \"Resets stats, spawns stats logger, iterates workers to open UDP sockets\
+  \ (openWorker, lines 184-230), optionally attaches the eBPF program to worker 0, records socket fds into the pinned map,\
+  \ launches spawnWorker goroutines, and blocks until ctx cancellation.\"\n              ]\n            },\n            {\n\
+  \              \"name\": \"openWorker + spawnWorker\",\n              \"lines\": \"internal/server/server.go:184-266\",\n\
+  \              \"details\": [\n                \"openWorker sets SO_REUSEADDR/SO_REUSEPORT via net.ListenConfig.Control\
+  \ and attaches the eBPF program once; returns both UDPConn and fd for map updates.\",\n                \"spawnWorker loops\
+  \ on ReadFromUDP, handles ctx cancellation/ErrClosed gracefully, and logs transient read/write errors.\"\n             \
+  \ ]\n            },\n            {\n              \"name\": \"handleRequest\",\n              \"lines\": \"internal/server/server.go:268-325\"\
+  ,\n              \"details\": [\n                \"Parses payloads via parseRequest, extracts optional reqID tokens, enforces\
+  \ SCAN limit <= MaxScanKeys, executes accurate busy-wait delays for GET/SCAN, records latencies per worker, and formats\
+  \ responses (formatResponse, lines 397-407).\"\n              ]\n            },\n            {\n              \"name\":\
+  \ \"startStatsLogger\",\n              \"lines\": \"internal/server/server.go:328-395\",\n              \"details\": [\n\
+  \                \"Every second, snapshots worker metrics, logs per-worker averages when there was traffic, accumulates\
+  \ totals, and emits aggregate '[perf] interval=1s ...' lines consumed by observability tooling.\"\n              ]\n   \
+  \         }\n          ]\n        },\n        {\n          \"path\": \"internal/server/handler.go\",\n          \"summary\"\
+  : \"Robust ASCII parser for GET/SCAN requests.\",\n          \"key_functions\": [\n            {\n              \"name\"\
+  : \"parseRequest\",\n              \"lines\": \"internal/server/handler.go:14-45\",\n              \"details\": [\n    \
+  \            \"Trims whitespace, splits fields, enforces argument counts for GET/SCAN, and lowercases manually via equalFoldASCII\
+  \ (lines 48-66) to avoid allocations in hot paths.\"\n              ]\n            }\n          ]\n        },\n        {\n\
+  \          \"path\": \"internal/server/ebpf.go\",\n          \"summary\": \"Loads eBPF selector programs, manages pin directories,\
+  \ and updates reuseport target maps.\",\n          \"key_functions\": [\n            {\n              \"name\": \"loadEBPF\
+  \ + load* variants\",\n              \"lines\": \"internal/server/ebpf.go:50-218\",\n              \"details\": [\n    \
+  \            \"Switches on policy names, ensures memlock rlimit is raised, creates pin directories, loads generated ebpfutil\
+  \ objects, seeds state maps (e.g., PebbleRrState.Active = workers), and returns ebpfPolicy handles with Close hooks.\",\n\
+  \                \"Validates non-negative worker counts for agent/scan_split/hash policies.\"\n              ]\n       \
+  \     },\n            {\n              \"name\": \"attach/updateTargetsMap/clearTargets\",\n              \"lines\": \"\
+  internal/server/ebpf.go:220-268\",\n              \"details\": [\n                \"attach(fd) wraps SO_ATTACH_REUSEPORT_EBPF,\
+  \ updateTargetsMap writes worker fd values into the pinned pebble_udp_targets map so eBPF programs can redirect flows, clearTargets\
+  \ removes stale slots at startup (skips when map not present).\"\n              ]\n            }\n          ]\n        }\n\
+  \      ],\n      \"cross_dependencies\": [\n        \"Relies on generated internal/ebpfutil bindings (bpf2go outputs).\"\
+  ,\n        \"Server expects run.sh or scripts/launch_server.sh to set BPF_PIN_BASE/PATH correctly.\"\n      ]\n    },\n\
+  \    \"internal/ebpfutil\": {\n      \"high_level_role\": \"Generated Go bindings/objects for each eBPF selector program;\
+  \ rebuild with `go generate ./internal/ebpfutil`.\",\n      \"key_files\": [\n        {\n          \"path\": \"internal/ebpfutil/bpf_assets.go\"\
+  ,\n          \"summary\": \"Contains go:generate directives pointing at ../../ebpf/*.c programs with bpf2go, ensuring clang\
+  \ builds BPF object files.\",\n          \"key_points\": [\n            \"Generated *_bpf.go files (e.g., agentselector_bpf.go)\
+  \ expose typed structs (AgentSelectorObjects, Maps, Programs) and embed corresponding *.o bytecode, which internal/server/ebpf.go\
+  \ loads with pinned map support.\"\n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"scripts/build_ebpf.sh\
+  \ must run before any policy other than 'default' is used, otherwise loadEBPF will fail due to missing object files.\"\n\
+  \      ]\n    },\n    \"scripts\": {\n      \"build_ebpf.sh\": {\n        \"role\": \"Rebuild internal/ebpfutil assets (`go\
+  \ generate ./internal/ebpfutil`) with clang, unless SKIP_EBPF_BUILD=true.\"\n      },\n      \"cleanup_ebpf_maps.sh\": {\n\
+  \        \"role\": \"Remove pinned reuseport maps under $BPF_PIN_BASE to avoid stale file descriptor slots; skipped when\
+  \ BPF_PIN_PATH is set.\"\n      },\n      \"launch_server.sh\": {\n        \"role\": \"Build/run cmd/pebble_server with\
+  \ provided flags, enforce single instance via PID files, and optionally wrap in taskset.\"\n      },\n      \"dispatch_docker_experiments.py\"\
+  : {\n        \"role\": \"NUMA-aware docker dispatcher: builds `docker run` commands per (policy, rate), streams logs, writes\
+  \ dispatch manifests, and can trigger run_exp.py on completion.\"\n      }\n    },\n    \"workload\": {\n      \"run_client.sh\"\
+  : {\n        \"role\": \"Simplified wrapper to run cmd/workload_client without building binaries.\",\n        \"lines\"\
+  : \"workload/run_client.sh:1-62\",\n        \"notes\": [\n          \"Accepts basic knobs (-s server, -t duration, -r rate,\
+  \ -g GET fraction, -m scan limit, -k prefix, -N key space, -w workers, -l log file).\",\n          \"Ensures client log\
+  \ directory exists, runs from repo root so go modules resolve, and writes logs to logs/client.log by default.\"\n      \
+  \  ]\n      }\n    }\n  }\n}\n\n\nForbidden/rejected ideas so far:\nNone\n\nBest program code:\n```.c\n//go:build ignore\n\
+  \n#include <linux/bpf.h>\n#include <bpf/bpf_helpers.h>\n\nstruct {\n    __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);\n\
+  \    __uint(max_entries, 128);\n    __type(key, __u32);\n    __type(value, __u32);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n\
+  } pebble_udp_targets SEC(\".maps\");\n\n// EVOLVE-BLOCK-START\n\nstruct agent_state {\n    __u32 active;\n    __u32 pad;\n\
+  };\n\nstruct {\n    __uint(type, BPF_MAP_TYPE_ARRAY);\n    __uint(max_entries, 1);\n    __type(key, __u32);\n    __type(value,\
+  \ struct agent_state);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n} pebble_agent_state SEC(\".maps\");\n\n\nSEC(\"sk_reuseport/selector\"\
+  )\nenum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)\n{\n    __u32 key = 0;\n    struct agent_state *state\
+  \ = bpf_map_lookup_elem(&pebble_agent_state, &key);\n    if (!state || state->active == 0)\n        return SK_PASS;\n\n\
+  \    __u32 start = reuse->hash % state->active;\n\n    #pragma clang loop unroll(full)\n    for (int i = 0; i < 128; i++)\
+  \ {\n        if (i >= state->active)\n            break;\n\n        __u32 slot = start + i;\n        if (slot >= state->active)\n\
+  \            slot -= state->active;\n\n        if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)\n\
+  \            return SK_PASS;\n    }\n\n    return SK_PASS;\n}\n// EVOLVE-BLOCK-END\n\nchar _license[] SEC(\"license\") =\
+  \ \"GPL\";\n\n```"
+run_context:
+  best_metrics:
+    policy: |-
+      agent
+    rates:
+    - 80000
+    - 100000
+    - 140000
+    - 160000
+    - 180000
+    load_p99_curve:
+    - - 80000.0
+      - 2008.936
+    - - 100000.0
+      - 452.41
+    - - 140000.0
+      - 3117.071
+    - - 160000.0
+      - 5461.561
+    - - 180000.0
+      - 4340.95
+    load_p99_stddev_curve:
+    - - 80000.0
+      - 0.0
+    - - 100000.0
+      - 0.0
+    - - 140000.0
+      - 0.0
+    - - 160000.0
+      - 0.0
+    - - 180000.0
+      - 0.0
+    compile: 1.0
+    load: 1.0
+    combined_score: -27981.450999999997
+    run_success: 1.0
+  best_reasoning: null
+  eval_summary: "The agent policy\u2019s eBPF program is not doing any dynamic, load-aware steering: on every packet it looks\
+    \ up pebble_agent_state.Active (set once at load to the configured worker count, 6) and deterministically picks a reuseport\
+    \ slot as `slot = reuse->hash % active`, then calls `bpf_sk_select_reuseport` and returns SK_PASS. The Go server always\
+    \ opens 6 SO_REUSEPORT UDP sockets, inserts all 6 FDs into the pebble_udp_targets map at indices 0\u20135, and spawns\
+    \ one goroutine per worker. Each worker goroutine runs a tight loop of `ReadFromUDP` \u2192 `handleRequest` \u2192 `WriteToUDP`;\
+    \ `handleRequest` parses the request, performs only a busy\u2011wait delay (10\u202F\xB5s for GET, 2\u202Fms for SCAN)\
+    \ plus some light parsing/formatting and stats accounting, and returns a response. There are no other blocking operations\
+    \ on the hot path, so each worker is effectively a single\u2011threaded server whose capacity is bounded by that synthetic\
+    \ delay and a small fixed per\u2011request overhead. The client runs open\u2011loop at fixed target rates (80k\u2013180k\
+    \ req/s) with a small number of UDPConns (one per send worker, each with its own source port) and matching per\u2011conn\
+    \ receive goroutines. The experiment logs show that in each run only 3\u20135 of the 6 server workers ever report traffic\
+    \ in a given second, and which indices are active changes between runs. Aggregate server throughput flattens between ~70k\
+    \ and ~105k req/s depending on the run, while the client continues to inject traffic at the configured rate, so outstanding\
+    \ requests build up and a growing fraction of responses never arrive; the client logs these as \u201Cresponses missing\u201D\
+    . Overall p99 latency (measured at the client over all requests) is lowest around 100k req/s and very high at 80k and\
+    \ \u2265140k, reflecting how long packets spend queued in the kernel and at the workers before they can be processed by\
+    \ the limited number of busy\u2011waiting goroutines; the server\u2019s own \u201C[perf] avg_get/avg_scan\u201D numbers\
+    \ remain fixed near the configured synthetic delays because they do not include time spent in queues."
+  eval_hypothesis: "The observed behavior is driven by the combination of (1) the agent eBPF selector doing a simple, static\
+    \ hash\u2011based choice of reuseport slot per packet/flow (`slot = reuse->hash % active` with `active = 6`), (2) a small\
+    \ number of client UDP flows (one per send worker / source port) so there are fewer flows than server workers, and (3)\
+    \ each server worker processing requests strictly sequentially with busy\u2011wait delays. At startup, all 6 worker sockets\
+    \ are inserted into the pebble_udp_targets map and the agent state\u2019s Active count is set to 6, but because the client\
+    \ only originates a handful of flows, those flows hash onto only 3\u20135 of the 6 slots in each run. Which specific workers\
+    \ are used (and how many flows collide on the same worker) varies randomly from run to run as source ports and hashes\
+    \ change. Within a run, each packet for a given flow is effectively pinned to its chosen worker; that worker\u2019s goroutine\
+    \ then handles the request synchronously and spends ~10\u202F\xB5s (GET) or 2\u202Fms (SCAN) in a busy\u2011wait loop\
+    \ for every request. This architecture means: (a) the system\u2019s true parallelism is limited to the number of reuseport\
+    \ slots that actually receive traffic, not the configured 6 workers; and (b) if multiple high\u2011rate client flows hash\
+    \ to the same worker, that worker becomes a hot spot and builds a long queue while other workers are underutilized. When\
+    \ the client target rate is near or above the sum of the capacities of the few workers that are actually receiving traffic,\
+    \ packets accumulate in the per\u2011socket UDP receive queues. Because handleRequest\u2019s measured latency only times\
+    \ the busy\u2011wait, the server\u2019s \u201C[perf] avg_get/avg_scan\u201D stay near 10\u202F\xB5s/2\u202Fms even as\
+    \ queues grow large. From the client\u2019s perspective, however, end\u2011to\u2011end latency includes this queueing,\
+    \ so p99 balloons into the multi\u2011second range at 80k and \u2265140k req/s. Once the socket receive buffers fill,\
+    \ new datagrams are dropped silently by the kernel, so the client sees increasing \u201Cresponses missing\u201D counts\
+    \ and outstanding request counts that never drain before the run ends. The non\u2011monotonicity in throughput and p99\
+    \ across rates (e.g., 100k performing better than 80k) is explained by the random hash placement of a small number of\
+    \ flows onto 6 workers: in the 100k run, flows happen to be spread relatively evenly across 5 workers, keeping each below\
+    \ saturation and yielding lower queueing, while in the 80k and higher\u2011rate runs, more flows collide on fewer workers,\
+    \ reducing effective usable capacity and causing larger queues, more UDP drops, and worse tail latency even at a lower\
+    \ offered rate."
+  eval_score: 8
+best_program_code: |
+  //go:build ignore
+
+  #include <linux/bpf.h>
+  #include <bpf/bpf_helpers.h>
+
+  struct {
+      __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);
+      __uint(max_entries, 128);
+      __type(key, __u32);
+      __type(value, __u32);
+      __uint(pinning, LIBBPF_PIN_BY_NAME);
+  } pebble_udp_targets SEC(".maps");
+
+  // EVOLVE-BLOCK-START
+
+  struct agent_state {
+      __u32 active;
+      __u32 pad;
+  };
+
+  struct {
+      __uint(type, BPF_MAP_TYPE_ARRAY);
+      __uint(max_entries, 1);
+      __type(key, __u32);
+      __type(value, struct agent_state);
+      __uint(pinning, LIBBPF_PIN_BY_NAME);
+  } pebble_agent_state SEC(".maps");
+
+
+  SEC("sk_reuseport/selector")
+  enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
+  {
+      __u32 key = 0;
+      struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);
+      if (!state || state->active == 0)
+          return SK_PASS;
+
+      __u32 start = reuse->hash % state->active;
+
+      #pragma clang loop unroll(full)
+      for (int i = 0; i < 128; i++) {
+          if (i >= state->active)
+              break;
+
+          __u32 slot = start + i;
+          if (slot >= state->active)
+              slot -= state->active;
+
+          if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)
+              return SK_PASS;
+      }
+
+      return SK_PASS;
+  }
+  // EVOLVE-BLOCK-END
+
+  char _license[] SEC("license") = "GPL";

@@ -1,0 +1,23 @@
+{
+  "metrics": {
+    "policy": "agent",
+    "rates": [
+      50000,
+      60000,
+      80000,
+      100000,
+      140000
+    ],
+    "load_p99_curve": [],
+    "load_p99_stddev_curve": [],
+    "compile": 1.0,
+    "load": 0.0,
+    "combined_score": -Infinity,
+    "run_success": 0.0,
+    "error": "run_exp.py failed."
+  },
+  "artifacts": {
+    "run_exp_stdout": "=== Running experiment policy=agent rate=50000 iterations=1 ===\n== CPU pinning ==\nServer cores: 6 (cpuset: 0,2,4,6,8,10)\nClient cores: 7 (cpuset: 12,14,16,18,20,22,24)\n== Building eBPF assets ==\nSkipping eBPF build (SKIP_EBPF_BUILD=true)\n== Cleaning pinned eBPF maps ==\nSkipping global eBPF map cleanup; using isolated pin path /sys/fs/bpf/pebble/run-20251113-175400\n== Starting server ==\npprof available at http://127.0.0.1:6060/debug/pprof/\nblock/mutex profiling enabled (SetBlockProfileRate=1)\n== Running workload iterations (1) ==\n-- Iteration 1/1 --\nRestarting server for iteration 1",
+    "run_exp_stderr": "Traceback (most recent call last):\n  File \"/home/benny/evolve_agent/agentic-ebpf/pebble-server/run_exp.py\", line 595, in <module>\n    main()\n  File \"/home/benny/evolve_agent/agentic-ebpf/pebble-server/run_exp.py\", line 523, in main\n    run_dir = invoke_run_sh(\n              ^^^^^^^^^^^^^^\n  File \"/home/benny/evolve_agent/agentic-ebpf/pebble-server/run_exp.py\", line 168, in invoke_run_sh\n    for line in process.stdout:\nKeyboardInterrupt"
+  }
+}

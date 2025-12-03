@@ -1,0 +1,12 @@
+[client] 2025/12/03 14:59:55.682459 starting workload server=127.0.0.1:9000 duration=7s rate=160000.00 get_frac=0.99
+[client] 2025/12/03 14:59:56.682935 outstanding=305 sent=157358 recv=157053
+[client] 2025/12/03 14:59:57.682947 outstanding=1548 sent=314306 recv=312758
+[client] 2025/12/03 14:59:58.682942 outstanding=921 sent=470262 recv=469341
+[client] 2025/12/03 14:59:59.684212 outstanding=1981 sent=628185 recv=626204
+[client] 2025/12/03 15:00:00.682947 outstanding=1451 sent=785653 recv=784202
+[client] 2025/12/03 15:00:01.682935 outstanding=1858 sent=941437 recv=939579
+[client] 2025/12/03 15:00:02.682958 outstanding=2018 sent=1100280 recv=1098262
+[client] 2025/12/03 15:00:03.683754 outstanding=1518 sent=1100280 recv=1098762
+[client] 2025/12/03 15:00:04.683965 outstanding=1024 sent=1100280 recv=1099256
+[client] 2025/12/03 15:00:04.773787 warning: 1014 responses missing (sent=1100280 recv=1099266)
+[client] 2025/12/03 15:00:04.773829 sent=1100280 recv=1099266

@@ -1,0 +1,17 @@
+== Iteration 1 ==
+Total sent: 558317 (GET=555463 SCAN=2854)
+Total received: 558317 (GET=555463 SCAN=2854)
+Throughput: 79759.57 req/s
+Overall latency p50: 1.158 ms
+Overall latency p90: 5.410 ms
+Overall latency p99: 15.001 ms
+Overall latency avg: 2.139 ms
+GET latency p50: 1.142 ms
+GET latency p90: 5.393 ms
+GET latency p99: 14.959 ms
+GET latency avg: 2.128 ms
+SCAN latency p50: 3.063 ms
+SCAN latency p90: 7.547 ms
+SCAN latency p99: 19.919 ms
+SCAN latency avg: 4.185 ms
+

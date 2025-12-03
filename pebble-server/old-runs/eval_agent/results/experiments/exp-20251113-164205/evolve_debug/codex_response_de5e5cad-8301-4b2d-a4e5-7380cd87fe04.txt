@@ -1,0 +1,20 @@
+**Behavior & Performance**
+- Load sweep shows p99 exploding to 2.6–2.7 s at 60–80 k rps (vs the parent’s 18.8 ms/11.7 ms) and even the “easy” 50 k point regressed to 7.2 ms (vs 5 ms), while 100 k dipped slightly to 660 ms from 750 ms and 140 k stayed a multi-second stall (results/experiments/exp-20251113-164205/summary.json:29-128 vs results/experiments/exp-20251113-164205/evolve_debug/codex_payload_de5e5cad-8301-4b2d-a4e5-7380cd87fe04.json:1).
+- Despite six configured workers (internal/server/server.go:144-210), the 50 k run drove only workers 0/2/4 and the 60 k run only 2/3/5, keeping throughput capped near 48–53 k rps and 51 k rps respectively (results/run-20251113-164205/logs/server/server.log:4-44; results/run-20251113-164225/logs/server/server.log:4-44), and the 80 k run used just four workers (results/run-20251113-164245/logs/server/server.log:4-44).
+- The new selector computes `slot = ((__u64)reuse->hash * active) >> 32` and makes only a single selection attempt (ebpf/agent.c:20-79), so when the kernel’s `reuse->hash` values mostly occupy the lower half of the 32-bit range, only low-index slots ever fire—exactly matching the “stuck” worker IDs seen in the logs.
+- Under-utilized workers cannot drain the offered load, so client outstanding counts balloon to 75 k+ with 22 k/26 k responses missing at 60 k/80 k rps, and to 76 k missing at 140 k rps (results/run-20251113-164225/logs/client.log:2-18; results/run-20251113-164245/logs/client.log:2-18; results/run-20251113-164325/logs/client.log:2-17).
+- Even when all workers finally log activity at 140 k rps, the pool only sustains ~124 k rps and p99 stays at 3.8 s because the backlog amassed earlier never drains (results/run-20251113-164325/logs/server/server.log:4-34; results/experiments/exp-20251113-164205/summary.json:109-128).
+- Confidence: **Medium** (hash-range bias inferred from the skewed worker activation plus the slot-reduction math, but we lack direct visibility into the kernel’s hash distribution).
+
+**Program Intent**
+- Intent (per code comments) is to keep per-request latency low by hashing evenly across the active reuseport sockets with fewer instructions than the prior 128-iteration probe (ebpf/agent.c:1-74).
+- The behavior fails that intent at moderate loads: only half the workers get any traffic, so 60–80 k rps back up into multi-second p99s and drop thousands of replies, whereas the parent’s modulo-based selector held p99 ≤20 ms there (results/experiments/exp-20251113-164205/summary.json:50-88 vs results/experiments/exp-20251113-164205/evolve_debug/codex_payload_de5e5cad-8301-4b2d-a4e5-7380cd87fe04.json:1).
+- Partial success exists only at 100 k rps where shaving instructions yields a modest p99 gain (660 ms vs 750 ms), but even there five of six workers do all the work and backlog still accumulates (results/run-20251113-164305/logs/server/server.log cited via summary at 92-107).
+- At 140 k rps the system both under-delivers (≈125 k rps processed) and drops 76 k replies, so it neither maintains fairness nor reliability under peak load (results/run-20251113-164325/logs/server/server.log:4-44; results/run-20251113-164325/logs/client.log:2-17).
+- Conclusion: the single-shot hash policy undermines its own fairness goal and therefore does not achieve the program’s stated intent except in a narrow point case.
+
+**Evidence**
+- Metrics summaries: results/experiments/exp-20251113-164205/summary.json:29-128 and parent baseline in results/experiments/exp-20251113-164205/evolve_debug/codex_payload_de5e5cad-8301-4b2d-a4e5-7380cd87fe04.json:1.
+- Server worker activity showing skew: results/run-20251113-164205/logs/server/server.log:4-44; results/run-20251113-164225/logs/server/server.log:4-44; results/run-20251113-164245/logs/server/server.log:4-44; results/run-20251113-164325/logs/server/server.log:4-34.
+- Client backlog/missed replies: results/run-20251113-164225/logs/client.log:2-18; results/run-20251113-164245/logs/client.log:2-18; results/run-20251113-164325/logs/client.log:2-17.
+- Implementation details tying causes: ebpf/agent.c:20-79 and internal/server/server.go:144-210.

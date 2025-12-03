@@ -1,0 +1,36 @@
+2025/12/01 21:18:52.441318 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10µs scan_delay=2ms pprof=127.0.0.1:6060
+2025/12/01 21:18:54.444302 server stopped
+2025/12/01 21:18:54.591386 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10µs scan_delay=2ms pprof=127.0.0.1:6060
+2025/12/01 21:18:57.591686 [perf] worker=0 gets=19940 get_errors=0 avg_get=10.121µs scans=105 scan_errors=0 avg_scan=2.004339ms
+2025/12/01 21:18:57.591738 [perf] worker=1 gets=20190 get_errors=0 avg_get=10.166µs scans=104 scan_errors=0 avg_scan=2.000097ms
+2025/12/01 21:18:57.591745 [perf] worker=2 gets=20225 get_errors=0 avg_get=10.151µs scans=104 scan_errors=0 avg_scan=2.000097ms
+2025/12/01 21:18:57.591751 [perf] interval=1s gets=60355 get_errors=0 avg_get=10.146µs scans=313 scan_errors=0 avg_scan=2.00152ms
+2025/12/01 21:18:58.591692 [perf] worker=0 gets=26934 get_errors=0 avg_get=10.29µs scans=109 scan_errors=0 avg_scan=2.000096ms
+2025/12/01 21:18:58.591737 [perf] worker=1 gets=24575 get_errors=0 avg_get=10.17µs scans=142 scan_errors=0 avg_scan=2.000096ms
+2025/12/01 21:18:58.591744 [perf] worker=2 gets=25585 get_errors=0 avg_get=10.186µs scans=129 scan_errors=0 avg_scan=2.001742ms
+2025/12/01 21:18:58.591751 [perf] interval=1s gets=77094 get_errors=0 avg_get=10.217µs scans=380 scan_errors=0 avg_scan=2.000655ms
+2025/12/01 21:18:59.591689 [perf] worker=0 gets=25879 get_errors=0 avg_get=10.121µs scans=126 scan_errors=0 avg_scan=2.000891ms
+2025/12/01 21:18:59.591722 [perf] worker=1 gets=25714 get_errors=0 avg_get=10.116µs scans=129 scan_errors=0 avg_scan=2.000096ms
+2025/12/01 21:18:59.591728 [perf] worker=2 gets=25454 get_errors=0 avg_get=10.117µs scans=132 scan_errors=0 avg_scan=2.000095ms
+2025/12/01 21:18:59.591734 [perf] interval=1s gets=77047 get_errors=0 avg_get=10.118µs scans=387 scan_errors=0 avg_scan=2.000355ms
+2025/12/01 21:19:00.591696 [perf] worker=0 gets=25370 get_errors=0 avg_get=10.159µs scans=130 scan_errors=0 avg_scan=2.000571ms
+2025/12/01 21:19:00.591750 [perf] worker=1 gets=24515 get_errors=0 avg_get=10.235µs scans=142 scan_errors=0 avg_scan=2.000094ms
+2025/12/01 21:19:00.591757 [perf] worker=2 gets=24597 get_errors=0 avg_get=10.144µs scans=141 scan_errors=0 avg_scan=2.010944ms
+2025/12/01 21:19:00.591763 [perf] interval=1s gets=74482 get_errors=0 avg_get=10.179µs scans=413 scan_errors=0 avg_scan=2.003948ms
+2025/12/01 21:19:01.591696 [perf] worker=0 gets=25345 get_errors=0 avg_get=10.122µs scans=131 scan_errors=0 avg_scan=2.000121ms
+2025/12/01 21:19:01.591738 [perf] worker=1 gets=25362 get_errors=0 avg_get=10.13µs scans=131 scan_errors=0 avg_scan=2.000095ms
+2025/12/01 21:19:01.591745 [perf] worker=2 gets=25177 get_errors=0 avg_get=10.127µs scans=133 scan_errors=0 avg_scan=2.000177ms
+2025/12/01 21:19:01.591751 [perf] interval=1s gets=75884 get_errors=0 avg_get=10.126µs scans=395 scan_errors=0 avg_scan=2.000131ms
+2025/12/01 21:19:02.591686 [perf] worker=0 gets=24693 get_errors=0 avg_get=10.111µs scans=140 scan_errors=0 avg_scan=2.000095ms
+2025/12/01 21:19:02.591732 [perf] worker=1 gets=25459 get_errors=0 avg_get=10.114µs scans=129 scan_errors=0 avg_scan=2.000098ms
+2025/12/01 21:19:02.591738 [perf] worker=2 gets=25019 get_errors=0 avg_get=10.121µs scans=133 scan_errors=0 avg_scan=2.000097ms
+2025/12/01 21:19:02.591744 [perf] interval=1s gets=75171 get_errors=0 avg_get=10.116µs scans=402 scan_errors=0 avg_scan=2.000097ms
+2025/12/01 21:19:03.591700 [perf] worker=0 gets=25059 get_errors=0 avg_get=10.136µs scans=131 scan_errors=0 avg_scan=2.000119ms
+2025/12/01 21:19:03.591745 [perf] worker=1 gets=24039 get_errors=0 avg_get=10.134µs scans=146 scan_errors=0 avg_scan=2.000484ms
+2025/12/01 21:19:03.591770 [perf] worker=2 gets=25467 get_errors=0 avg_get=10.141µs scans=126 scan_errors=0 avg_scan=2.000767ms
+2025/12/01 21:19:03.591776 [perf] interval=1s gets=74565 get_errors=0 avg_get=10.137µs scans=403 scan_errors=0 avg_scan=2.000453ms
+2025/12/01 21:19:04.592425 [perf] worker=0 gets=11309 get_errors=0 avg_get=10.122µs scans=54 scan_errors=0 avg_scan=2.000092ms
+2025/12/01 21:19:04.592473 [perf] worker=1 gets=15037 get_errors=0 avg_get=10.143µs scans=72 scan_errors=0 avg_scan=2.000098ms
+2025/12/01 21:19:04.592504 [perf] worker=2 gets=13830 get_errors=0 avg_get=10.114µs scans=75 scan_errors=0 avg_scan=2.000096ms
+2025/12/01 21:19:04.592510 [perf] interval=1s gets=40176 get_errors=0 avg_get=10.127µs scans=201 scan_errors=0 avg_scan=2.000096ms
+2025/12/01 21:19:06.929819 server stopped

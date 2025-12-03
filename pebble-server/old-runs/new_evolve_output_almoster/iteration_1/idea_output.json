@@ -1,0 +1,209 @@
+{
+  "iterations": [
+    {
+      "iteration": 0,
+      "idea_payload": {
+        "status": "continue",
+        "design_doc": {
+          "goals": [
+            "Eliminate sensitivity to the number of client UDP flows so that all reuseport workers are used even when there are only a few flows (e.g., 7 send workers vs 6 server workers).",
+            "Avoid concentrating traffic on a small subset of workers, which previously caused per-worker saturation, long UDP queues, and dropped packets while other workers were idle.",
+            "Reduce GET p99 latency at higher offered loads (\u2265100k req/s) by shrinking per-worker queues and spreading rare, long SCAN requests across all workers instead of a few hotspots.",
+            "Keep the eBPF selector simple and stateless (no new maps, no per-flow state), with constant-time per-packet overhead and no new user-space configuration requirements.",
+            "Preserve existing server semantics (stateless per-request handling, no dependence on flow affinity) so that responses remain correct regardless of which worker processes a given packet."
+          ],
+          "evidence": [
+            "The current agent selector uses `slot = reuse->hash % active` where `active` is the number of workers (6), causing per-flow consistent hashing onto a fixed worker index per 4\u2011tuple.",
+            "With ~7 client send workers (flows) and 6 server workers, logs show only 4\u20135 workers carry traffic, and each hot worker\u2019s GET count per second is an integer multiple of a common base, summing to ~7\u00d7 that base, confirming flow pinning.",
+            "At 50\u201380k req/s, the active workers have headroom so queues stay short: sent\u2248recv, no drops, and GET p99 only a few microseconds above the synthetic 10\u00b5s delay.",
+            "At 100k and 140k req/s, aggregate throughput plateaus near 90\u201395k req/s even as offered load rises and at least one worker remains idle in each run, proving that the bottleneck is uneven worker utilization, not total CPU.",
+            "Each hot worker processes GET (10\u00b5s) and SCAN (2ms) requests in a single FIFO goroutine; SCANs are only 1% of requests but account for ~67% of CPU time, so when traffic is concentrated on 4\u20135 workers, these 2ms SCANs repeatedly cause head-of-line blocking for short GETs.",
+            "Under high load, per-socket UDP receive queues and in-process queues grow dramatically, driving GET p99 latency from microseconds to ~0.6ms at 100k and ~5ms at 140k, and eventually overflowing so that ~222k responses are never received at 140k even though the server logs show no application-level errors.",
+            "The eBPF selector does not look at queue length, load, or request type; it always hashes by 4\u2011tuple, so it cannot rebalance away from saturated sockets or spread SCANs across more workers."
+          ],
+          "architecture": [
+            "Replace the per-flow consistent hashing in agent_udp_selector with a per-packet, time-salted hash that breaks flow stickiness while remaining stateless: on each packet, read `agent_state.active` as the number of available workers, obtain a fast monotonically-increasing timestamp via a BPF helper (e.g., `ktime_get_ns`), combine it with `reuse->hash` using a simple operation (such as XOR), and map the result into `[0, active)` to choose the target slot for a single `bpf_sk_select_reuseport` call.",
+            "This design keeps using the existing pebble_agent_state map (no new maps, no extra fields required) but stops relying on `reuse->hash % active`, so packets from a small number of client flows are evenly distributed across all active workers over time, naturally balancing both GET and SCAN load without any explicit per-flow or per-worker state.",
+            "Because selection is per-packet and independent of any session state, every worker will see approximately the same share of total traffic (and of the rare long SCANs), which reduces per-worker queuing, mitigates head-of-line blocking for GETs, and allows aggregate throughput to scale up to the true capacity of all 6 workers under the existing synthetic workload."
+          ],
+          "risks": [
+            "The design assumes that the server\u2019s request handling is fully stateless per packet and that no Go code maintains per-client or per-flow state that depends on all packets from a given 4\u2011tuple arriving on the same worker; if such state exists, breaking flow affinity could cause correctness issues.",
+            "It is assumed but not yet verified from the code that no other components (e.g., metrics, debugging tools) rely on the current consistent mapping between client flow and worker index for interpretation; changing the selection policy could make some existing logs less intuitive if they implicitly expect per-flow stickiness.",
+            "The proposal relies on using a time-based BPF helper (such as `bpf_ktime_get_ns`) from within an sk_reuseport program; while this should be supported on the target kernel, it needs to be confirmed against the actual kernel and BPF helper set used in this environment.",
+            "The current Go initialization of the pebble_agent_state map for the 'agent' policy must not depend on any specific struct layout beyond the 'active' field; if it does (e.g., uses padding or assumes a particular size), we need to be careful when regenerating eBPF assets so that any minor changes in the C struct are reflected correctly in the generated Go bindings.",
+            "Because the new selector eliminates per-flow affinity, per-flow ordering of packets is no longer guaranteed at the worker level; for this synthetic storage emulator this appears safe, but we should verify that no future extensions or tests assume ordered processing on a per-flow basis."
+          ]
+        },
+        "questions": [
+          "In internal/server/ebpf.go, in the loadEBPF function\u2019s case for the 'agent' policy, how is the PebbleAgentState map initialised exactly (which fields of the generated value struct are written, and with what values)?",
+          "In the generated bindings under internal/ebpfutil for the agent selector, what is the exact Go struct definition (type name and field list) corresponding to the C struct agent_state used by the pebble_agent_state map?",
+          "Under ebpf/ (or wherever the other sk_reuseport selectors live), is there an existing selector program (e.g., for the 'scan_split' or 'hash' policy) that reads from reuse->data / reuse->data_end to inspect the UDP payload, and if so, what does its core bounds-checking pattern for accessing the payload look like?",
+          "In internal/server/server.go, does handleRequest or any other server code maintain state keyed by the remote UDP address (e.g., maps keyed by net.UDPAddr or IP/port) that would rely on all packets from a given client 4\u2011tuple consistently arriving on the same worker?",
+          "In cmd/workload_client/main.go, within the per-worker send goroutine, does the main loop issue multiple outstanding requests on a single UDPConn without waiting for their responses (true pipelining), or does it wait for a response before sending the next request on that socket?"
+        ]
+      },
+      "rag_answers": [
+        {
+          "question": "In internal/server/ebpf.go, in the loadEBPF function\u2019s case for the 'agent' policy, how is the PebbleAgentState map initialised exactly (which fields of the generated value struct are written, and with what values)?",
+          "answer": {
+            "answer": "When `loadEBPF` is called with the `\"agent\"` policy, it calls `loadAgent(workers)`. Inside `loadAgent`, after loading the eBPF objects, it initialises the `PebbleAgentState` map as follows:\n\n1. It declares a key of type `uint32` and sets it to 0:\n   - `var key uint32 = 0`\n\n2. It creates a value of type `ebpfutil.AgentSelectorAgentState` and sets only its `Active` field to the provided `workers` count, cast to `uint32`:\n   - `state := ebpfutil.AgentSelectorAgentState{ Active: uint32(workers), }`\n\n3. If `objs.PebbleAgentState` is non-nil, it performs an `Update` on the map with that single key\u2013value pair using `ebpf.UpdateAny`:\n   - `objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny)`\n\nNo other fields of the `AgentSelectorAgentState` struct are written; only the `Active` field is set to `uint32(workers)` and stored under key `0`.",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\t...\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In the generated bindings under internal/ebpfutil for the agent selector, what is the exact Go struct definition (type name and field list) corresponding to the C struct agent_state used by the pebble_agent_state map?",
+          "answer": {
+            "answer": "The Go struct generated for the C struct `agent_state` (used by the `pebble_agent_state` map) is named `AgentSelectorAgentState` and is defined exactly as:\n\n```go\ntype AgentSelectorAgentState struct {\n    Active uint32\n}\n```",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "state := ebpfutil.AgentSelectorAgentState{\n    Active: uint32(workers),\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "Under ebpf/ (or wherever the other sk_reuseport selectors live), is there an existing selector program (e.g., for the 'scan_split' or 'hash' policy) that reads from reuse->data / reuse->data_end to inspect the UDP payload, and if so, what does its core bounds-checking pattern for accessing the payload look like?",
+          "answer": {
+            "answer": "The Go server code configures and attaches existing sk_reuseport selector programs for the `scan_split`, `hash`, and `round_robin` policies (`SplitUdpSelector`, `HashUdpSelector`, and `RrUdpSelector` respectively), but the actual eBPF program code that implements those selectors (including any logic that would read from `reuse->data` / `reuse->data_end` and perform bounds checks on the UDP payload) is not present in the provided files. The Go layer only:\n\n1. Loads the compiled eBPF object collections for each policy (`ScanSplitSelectorObjects`, `HashSelectorObjects`, `RrSelectorObjects`).\n2. Optionally initializes per-policy state maps (e.g., `PebbleSplitState`, `PebbleHashState`, `PebbleRrState`) with an `Active` worker count (and `Counter` for round robin).\n3. Attaches the selected eBPF program to the listening socket via `SO_ATTACH_REUSEPORT_EBPF`.\n\nNo UDP payload inspection or `reuse->data` / `reuse->data_end` access patterns are shown in these files, so the core bounds-checking pattern for payload access cannot be determined from the available code.",
+            "code_snippets": [
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadScanSplit(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.ScanSplitSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadScanSplitSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load scan split objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.ScanSplitSelectorSplitState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleSplitState != nil {\n\t\tif err := objs.PebbleSplitState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure scan split state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"scan_split\",\n\t\tprogram: objs.SplitUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadHash(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.HashSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadHashSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load hash selector objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.HashSelectorHashState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleHashState != nil {\n\t\tif err := objs.PebbleHashState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure hash state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"hash\",\n\t\tprogram: objs.HashUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func loadRoundRobin(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.RrSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadRrSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load round robin objects: %w\", err)\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.RrSelectorRrState{}\n\tif err := objs.PebbleRrState.Lookup(&key, &state); err != nil {\n\t\tstate.Active = uint32(workers)\n\t\tstate.Counter = 0\n\t} else {\n\t\tstate.Active = uint32(workers)\n\t}\n\tif err := objs.PebbleRrState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure round robin state: %w\", err)\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"round_robin\",\n\t\tprogram: objs.RrUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+              },
+              {
+                "path": "internal/server/ebpf.go",
+                "snippet": "func (p *ebpfPolicy) attach(fd int) error {\n\tif p == nil || p.program == nil {\n\t\treturn nil\n\t}\n\tif err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ATTACH_REUSEPORT_EBPF, p.program.FD()); err != nil {\n\t\treturn fmt.Errorf(\"attach reuseport ebpf: %w\", err)\n\t}\n\treturn nil\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In internal/server/server.go, does handleRequest or any other server code maintain state keyed by the remote UDP address (e.g., maps keyed by net.UDPAddr or IP/port) that would rely on all packets from a given client 4\u2011tuple consistently arriving on the same worker?",
+          "answer": {
+            "answer": "No. The shown server logic does not maintain any state keyed by the remote UDP address or client 4\u2011tuple.\n\nThe request handler `handleRequest` is fully stateless with respect to client identity: it parses the incoming payload, optionally records timing metrics in a per\u2011worker `workerStats` entry, and returns a response. It does not access or store any `net.UDPAddr`, IP/port, or similar per\u2011client key. The only state it touches is:\n- The per\u2011worker stats slice `s.stats[idx]` identified solely by worker index `idx`.\n- Configuration fields like delays and maximum scan keys.\n\nThe worker\u2011opening code similarly configures and returns a UDP listener and file descriptor, with no map or other structure keyed by client address. As a result, there is nothing in this code that depends on all packets from a given client arriving on the same worker.\n",
+            "code_snippets": [
+              {
+                "path": "internal/server/server.go",
+                "snippet": "func (s *Server) handleRequest(idx int, payload []byte) []byte {\n\tcmd, args, err := parseRequest(payload)\n\tif err != nil {\n\t\treturn []byte(fmt.Sprintf(\"ERR %v\", err))\n\t}\n\n\tvar stats *workerStats\n\tif idx >= 0 && idx < len(s.stats) {\n\t\tstats = &s.stats[idx]\n\t}\n\n\tswitch cmd {\n\tcase \"GET\":\n\t\tvar reqID string\n\t\tif len(args) == 2 {\n\t\t\treqID = args[1]\n\t\t\targs = args[:1]\n\t\t}\n\t\t// Busy wait for accurate timing\n\t\tstart := time.Now()\n\t\tdeadline := start.Add(s.cfg.GetDelay)\n\t\tfor time.Now().Before(deadline) {\n\t\t}\n\t\telapsed := time.Since(start)\n\t\tif stats != nil {\n\t\t\tstats.recordGet(elapsed, false)\n\t\t}\n\t\treturn formatResponse(\"VALUE\", reqID, []byte(args[0]))\n\n\tcase \"SCAN\":\n\t\tvar reqID string\n\t\tif len(args) == 3 {\n\t\t\treqID = args[2]\n\t\t\targs = args[:2]\n\t\t}\n\t\tlimit, err := strconv.Atoi(args[1])\n\t\tif err != nil || limit <= 0 {\n\t\t\tif stats != nil {\n\t\t\t\tstats.recordScan(0, true)\n\t\t\t}\n\t\t\treturn formatResponse(\"ERR\", reqID, []byte(\"invalid scan limit\"))\n\t\t}\n\t\tif limit > s.cfg.MaxScanKeys {\n\t\t\tlimit = s.cfg.MaxScanKeys\n\t\t}\n\t\t// Busy wait for accurate timing\n\t\tstart := time.Now()\n\t\tdeadline := start.Add(s.cfg.ScanDelay)\n\t\tfor time.Now().Before(deadline) {\n\t\t}\n\t\telapsed := time.Since(start)\n\t\tif stats != nil {\n\t\t\tstats.recordScan(elapsed, false)\n\t\t}\n\t\treturn formatResponse(\"SCAN\", reqID, []byte(\"EMPTY\"))\n\tdefault:\n\t\treturn []byte(\"ERR unknown command\")\n\t}\n}\n"
+              },
+              {
+                "path": "internal/server/server.go",
+                "snippet": "func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\n\tattachPolicy := s.policy != nil && s.policy.program != nil && idx == 0\n\tvar attachErr error\n\n\tlc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {\n\t\treturn c.Control(func(fd uintptr) {\n\t\t\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil && attachErr == nil {\n\t\t\t\tattachErr = fmt.Errorf(\"SO_REUSEADDR: %w\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil && attachErr == nil {\n\t\t\t\tattachErr = fmt.Errorf(\"SO_REUSEPORT: %w\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif attachPolicy && attachErr == nil {\n\t\t\t\tif err := s.policy.attach(int(fd)); err != nil {\n\t\t\t\t\tattachErr = err\n\t\t\t\t}\n\t\t\t}\n\t\t})\n\t}}\n\n\tpc, err := lc.ListenPacket(context.Background(), \"udp\", s.cfg.ListenAddr)\n\tif err != nil {\n\t\treturn nil, -1, err\n\t}\n\tif attachErr != nil {\n\t\tpc.Close()\n\t\treturn nil, -1, attachErr\n\t}\n\n\tudpConn := pc.(*net.UDPConn)\n\tvar fd int\n\traw, err := udpConn.SyscallConn()\n\tif err != nil {\n\t\tudpConn.Close()\n\t\treturn nil, -1, err\n\t}\n\tif err := raw.Control(func(value uintptr) {\n\t\tfd = int(value)\n\t}); err != nil {\n\t\tudpConn.Close()\n\t\treturn nil, -1, err\n\t}\n\n\treturn udpConn, fd, nil\n}\n"
+              }
+            ]
+          }
+        },
+        {
+          "question": "In cmd/workload_client/main.go, within the per-worker send goroutine, does the main loop issue multiple outstanding requests on a single UDPConn without waiting for their responses (true pipelining), or does it wait for a response before sending the next request on that socket?",
+          "answer": {
+            "answer": "The per-worker send goroutine issues requests continuously on the same UDPConn without ever waiting for a response before sending the next one. The loop only waits on the rate limiter (`limiter.Wait(ctx)`) and then immediately sends another request; it does not perform any read or synchronization with the receive path. Responses are handled by a separate receive goroutine that shares the same `*net.UDPConn`, so multiple outstanding requests are in flight concurrently on each UDPConn (true pipelining).",
+            "code_snippets": [
+              {
+                "path": "cmd/workload_client/main.go",
+                "snippet": "go func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\n\tdefer sendWG.Done()\n\tbuf := make([]byte, 0, 256)\n\tfor {\n\t\tif err := limiter.Wait(ctx); err != nil {\n\t\t\treturn\n\t\t}\n\t\tcurrSeq := atomic.AddUint64(&seq, 1) - 1\n\t\tisGet := true\n\t\treqType := \"GET\"\n\t\tif rng.Float64() > *getFrac {\n\t\t\treqType = \"SCAN\"\n\t\t\tisGet = false\n\t\t}\n\t\t// Capture timestamp, build payload, and send immediately\n\t\treqID := makeReqID(time.Now().UnixNano(), currSeq, isGet)\n\t\tpayload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, *scanLimit)\n\t\tif _, err := conn.Write(payload); err != nil {\n\t\t\tlogger.Printf(\"write error (worker=%d): %v\", workerID, err)\n\t\t\tbuf = payload[:0]\n\t\t\tcontinue\n\t\t}\n\t\tatomic.AddInt64(&sentTotal, 1)\n\t\tif isGet {\n\t\t\tatomic.AddInt64(&sentGet, 1)\n\t\t} else {\n\t\t\tatomic.AddInt64(&sentScan, 1)\n\t\t}\n\t\tbuf = payload[:0]\n\t}\n}(workerID, conn, rng)"
+              },
+              {
+                "path": "cmd/workload_client/main.go",
+                "snippet": "go func(workerID int, conn *net.UDPConn) {\n\tdefer recvWG.Done()\n\tbuf := make([]byte, 64*1024)\n\t// Set read deadline once to avoid blocking forever\n\tconn.SetReadDeadline(time.Now().Add(5 * time.Second))\n\tfor {\n\t\tn, err := conn.Read(buf)\n\t\t// Capture receive timestamp immediately\n\t\trecvNano := time.Now().UnixNano()\n\t\t...\n\t}\n}(workerID, conn)"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "iteration": 1,
+      "idea_payload": {
+        "status": "finish",
+        "design_doc": {
+          "goals": [
+            "Eliminate sensitivity to the number of client UDP flows so that all reuseport workers are used even when there are only a few flows (e.g., 7 send workers vs 6 server workers).",
+            "Avoid concentrating traffic on a small subset of workers, which previously caused per-worker saturation, long UDP queues, and dropped packets while other workers were idle.",
+            "Reduce GET p99 latency at higher offered loads (\u2265100k req/s) by shrinking per-worker queues and spreading rare, long SCAN requests across all workers instead of a few hotspots.",
+            "Keep the eBPF selector simple, stateless, and O(1) per packet, with no new user-space configuration or additional maps.",
+            "Preserve the server\u2019s stateless per-request semantics and the client\u2019s existing pipelined, reqID-based request/response handling so that responses remain correct regardless of which worker processes a given packet."
+          ],
+          "evidence": [
+            "The current agent selector computes `start = reuse->hash % state->active` and then probes from that slot, which pins each client 4\u2011tuple to a fixed worker index, implementing per-flow consistent hashing.",
+            "With ~7 client send workers and 6 server workers, server logs show only 4\u20135 workers handle traffic; each active worker\u2019s GET count per second is an integer multiple of a common base, and those multiples sum to \u22487, confirming that flows are pinned and unevenly packed into 6 buckets.",
+            "At offered rates of 50\u201380k req/s, these 4\u20135 hot workers still have headroom, so UDP and in-process queues stay short: client sent\u2248recv, there are no missing responses, and GET p99 latency is only a few microseconds above the synthetic 10\u00b5s delay.",
+            "At 100k and 140k req/s, total server throughput plateaus around 90\u201395k req/s even as offered load increases and at least one worker remains idle in each run, indicating that the bottleneck is uneven worker utilization rather than total CPU capacity.",
+            "Each worker is a single goroutine that synchronously processes GET (10\u00b5s busy-wait) and SCAN (2ms busy-wait) requests in FIFO order; although SCANs are only ~1% of requests, they dominate CPU time (~67%), so when traffic is concentrated on a few workers, those 2ms SCANs repeatedly cause head-of-line blocking for the many short GETs queued behind them.",
+            "Under high load, these hot workers\u2019 UDP receive queues and in-process queues grow, pushing GET p99 latency from microseconds to ~0.6ms at 100k and ~5ms at 140k, and eventually overflowing so that ~222k responses are never received at 140k even though the server logs show no application-level errors.",
+            "Server-side code (handleRequest and worker setup) is fully stateless with respect to client identity: there is no state keyed by remote UDP address or 4\u2011tuple, only per-worker stats indexed by worker ID. This means breaking flow affinity does not threaten correctness within the current design.",
+            "On the client side, each send goroutine continuously issues requests on its UDPConn under a rate limiter without waiting for responses; a separate recv goroutine on the same UDPConn handles replies and uses embedded reqIDs for matching. Multiple outstanding requests per flow and response reordering are already supported by design, so changing worker selection per packet will not violate any ordering assumptions."
+          ],
+          "architecture": [
+            "Replace the flow-sticky `reuse->hash % active` selection in AgentUDPSelector with per-packet randomized selection: for each packet, look up `PebbleAgentState[0].Active` to obtain the number of configured workers (`active`), call `bpf_get_prandom_u32()` to get a 32\u2011bit pseudo-random value, compute `slot = random % active`, and invoke `bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0)` exactly once.",
+            "Keep using the existing `pebble_agent_state` and `pebble_udp_targets` maps without adding new maps or user-space configuration: `Active` remains the only field, set by Go to the worker count; the BPF program is otherwise stateless and depends only on generic helpers (`bpf_get_prandom_u32`) and the reuseport metadata.",
+            "By making the selection independent for each packet and uniformly random across `[0, active)`, packets from a small number of client flows are evenly distributed over all workers over time, ensuring all 6 reuseport sockets share both GET and SCAN load, which reduces per-worker queue depth, mitigates head-of-line blocking for GETs, and allows aggregate throughput to scale closer to the theoretical capacity of all workers."
+          ],
+          "risks": [
+            "The design assumes that `bpf_get_prandom_u32()` is available and permitted in sk_reuseport programs on the target kernel; this is expected but not guaranteed solely from the codebase and should be confirmed against the actual runtime environment (uncertain).",
+            "Per-packet random selection eliminates flow affinity entirely; while this is safe for the current stateless server and pipelined, reqID-based client, any future features that rely on per-client or per-flow affinity (e.g., per-client rate limiting, stateful sessions) would need to either opt into a different selector policy or reintroduce some form of affinity.",
+            "Randomized load balancing provides good balance in expectation but can still produce short-term bursts on individual workers; at very high loads, transient imbalance might slightly increase tail latency relative to an ideal clairvoyant scheduler, though this is likely far smaller than the imbalance caused by the existing flow-hash scheme (uncertain magnitude).",
+            "The Go struct `AgentSelectorAgentState` currently contains only an `Active uint32` field; any future changes to the C definition of `struct agent_state` used by `pebble_agent_state` must be accompanied by regenerating the ebpfutil bindings to avoid layout mismatches between BPF and Go."
+          ]
+        },
+        "questions": [],
+        "implementation_snippets": [
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadAgent(workers int) (*ebpfPolicy, error) {\n\t...\n\tvar key uint32 = 0\n\tstate := ebpfutil.AgentSelectorAgentState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleAgentState != nil {\n\t\tif err := objs.PebbleAgentState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure agent state: %w\", err)\n\t\t}\n\t}\n\t...\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "state := ebpfutil.AgentSelectorAgentState{\n    Active: uint32(workers),\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadScanSplit(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.ScanSplitSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadScanSplitSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load scan split objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.ScanSplitSelectorSplitState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleSplitState != nil {\n\t\tif err := objs.PebbleSplitState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure scan split state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"scan_split\",\n\t\tprogram: objs.SplitUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadHash(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.HashSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadHashSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load hash selector objects: %w\", err)\n\t}\n\n\tif workers < 0 {\n\t\tobjs.Close()\n\t\treturn nil, ErrInvalidConfig(\"workers must be non-negative\")\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.HashSelectorHashState{\n\t\tActive: uint32(workers),\n\t}\n\tif objs.PebbleHashState != nil {\n\t\tif err := objs.PebbleHashState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\t\tobjs.Close()\n\t\t\treturn nil, fmt.Errorf(\"configure hash state: %w\", err)\n\t\t}\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"hash\",\n\t\tprogram: objs.HashUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func loadRoundRobin(workers int) (*ebpfPolicy, error) {\n\tif err := ensureRlimit(); err != nil {\n\t\treturn nil, err\n\t}\n\tpinDir := pinDirectory()\n\tif err := ensurePinDirectory(pinDir); err != nil {\n\t\treturn nil, fmt.Errorf(\"ensure pin directory: %w\", err)\n\t}\n\tvar objs ebpfutil.RrSelectorObjects\n\topts := &ebpf.CollectionOptions{\n\t\tMaps: ebpf.MapOptions{PinPath: pinDir},\n\t}\n\tif err := ebpfutil.LoadRrSelectorObjects(&objs, opts); err != nil {\n\t\treturn nil, fmt.Errorf(\"load round robin objects: %w\", err)\n\t}\n\n\tvar key uint32 = 0\n\tstate := ebpfutil.RrSelectorRrState{}\n\tif err := objs.PebbleRrState.Lookup(&key, &state); err != nil {\n\t\tstate.Active = uint32(workers)\n\t\tstate.Counter = 0\n\t} else {\n\t\tstate.Active = uint32(workers)\n\t}\n\tif err := objs.PebbleRrState.Update(&key, &state, ebpf.UpdateAny); err != nil {\n\t\tobjs.Close()\n\t\treturn nil, fmt.Errorf(\"configure round robin state: %w\", err)\n\t}\n\n\treturn &ebpfPolicy{\n\t\tname:    \"round_robin\",\n\t\tprogram: objs.RrUdpSelector,\n\t\tclose:   objs.Close,\n\t}, nil\n}\n"
+          },
+          {
+            "path": "internal/server/ebpf.go",
+            "snippet": "func (p *ebpfPolicy) attach(fd int) error {\n\tif p == nil || p.program == nil {\n\t\treturn nil\n\t}\n\tif err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ATTACH_REUSEPORT_EBPF, p.program.FD()); err != nil {\n\t\treturn fmt.Errorf(\"attach reuseport ebpf: %w\", err)\n\t}\n\treturn nil\n}\n"
+          },
+          {
+            "path": "internal/server/server.go",
+            "snippet": "func (s *Server) handleRequest(idx int, payload []byte) []byte {\n\tcmd, args, err := parseRequest(payload)\n\tif err != nil {\n\t\treturn []byte(fmt.Sprintf(\"ERR %v\", err))\n\t}\n\n\tvar stats *workerStats\n\tif idx >= 0 && idx < len(s.stats) {\n\t\tstats = &s.stats[idx]\n\t}\n\n\tswitch cmd {\n\tcase \"GET\":\n\t\tvar reqID string\n\t\tif len(args) == 2 {\n\t\t\treqID = args[1]\n\t\t\targs = args[:1]\n\t\t}\n\t\t// Busy wait for accurate timing\n\t\tstart := time.Now()\n\t\tdeadline := start.Add(s.cfg.GetDelay)\n\t\tfor time.Now().Before(deadline) {\n\t\t}\n\t\telapsed := time.Since(start)\n\t\tif stats != nil {\n\t\t\tstats.recordGet(elapsed, false)\n\t\t}\n\t\treturn formatResponse(\"VALUE\", reqID, []byte(args[0]))\n\n\tcase \"SCAN\":\n\t\tvar reqID string\n\t\tif len(args) == 3 {\n\t\t\treqID = args[2]\n\t\t\targs = args[:2]\n\t\t}\n\t\tlimit, err := strconv.Atoi(args[1])\n\t\tif err != nil || limit <= 0 {\n\t\t\tif stats != nil {\n\t\t\t\tstats.recordScan(0, true)\n\t\t\t}\n\t\t\treturn formatResponse(\"ERR\", reqID, []byte(\"invalid scan limit\"))\n\t\t}\n\t\tif limit > s.cfg.MaxScanKeys {\n\t\t\tlimit = s.cfg.MaxScanKeys\n\t\t}\n\t\t// Busy wait for accurate timing\n\t\tstart := time.Now()\n\t\tdeadline := start.Add(s.cfg.ScanDelay)\n\t\tfor time.Now().Before(deadline) {\n\t\t}\n\t\telapsed := time.Since(start)\n\t\tif stats != nil {\n\t\t\tstats.recordScan(elapsed, false)\n\t\t}\n\t\treturn formatResponse(\"SCAN\", reqID, []byte(\"EMPTY\"))\n\tdefault:\n\t\treturn []byte(\"ERR unknown command\")\n\t}\n}\n"
+          },
+          {
+            "path": "internal/server/server.go",
+            "snippet": "func (s *Server) openWorker(idx int) (*net.UDPConn, int, error) {\n\tattachPolicy := s.policy != nil && s.policy.program != nil && idx == 0\n\tvar attachErr error\n\n\tlc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {\n\t\treturn c.Control(func(fd uintptr) {\n\t\t\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil && attachErr == nil {\n\t\t\t\tattachErr = fmt.Errorf(\"SO_REUSEADDR: %w\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil && attachErr == nil {\n\t\t\t\tattachErr = fmt.Errorf(\"SO_REUSEPORT: %w\", err)\n\t\t\t\treturn\n\t\t\t}\n\t\t\tif attachPolicy && attachErr == nil {\n\t\t\t\tif err := s.policy.attach(int(fd)); err != nil {\n\t\t\t\t\tattachErr = err\n\t\t\t\t}\n\t\t\t}\n\t\t})\n\t}}\n\n\tpc, err := lc.ListenPacket(context.Background(), \"udp\", s.cfg.ListenAddr)\n\tif err != nil {\n\t\treturn nil, -1, err\n\t}\n\tif attachErr != nil {\n\t\tpc.Close()\n\t\treturn nil, -1, attachErr\n\t}\n\n\tudpConn := pc.(*net.UDPConn)\n\tvar fd int\n\traw, err := udpConn.SyscallConn()\n\tif err != nil {\n\t\tudpConn.Close()\n\t\treturn nil, -1, err\n\t}\n\tif err := raw.Control(func(value uintptr) {\n\t\tfd = int(value)\n\t}); err != nil {\n\t\tudpConn.Close()\n\t\treturn nil, -1, err\n\t}\n\n\treturn udpConn, fd, nil\n}\n"
+          },
+          {
+            "path": "cmd/workload_client/main.go",
+            "snippet": "go func(workerID int, conn *net.UDPConn, rng *rand.Rand) {\n\tdefer sendWG.Done()\n\tbuf := make([]byte, 0, 256)\n\tfor {\n\t\tif err := limiter.Wait(ctx); err != nil {\n\t\t\treturn\n\t\t}\n\t\tcurrSeq := atomic.AddUint64(&seq, 1) - 1\n\t\tisGet := true\n\t\treqType := \"GET\"\n\t\tif rng.Float64() > *getFrac {\n\t\t\treqType = \"SCAN\"\n\t\t\tisGet = false\n\t\t}\n\t\t// Capture timestamp, build payload, and send immediately\n\t\treqID := makeReqID(time.Now().UnixNano(), currSeq, isGet)\n\t\tpayload := buildPayload(rng, buf, reqType, reqID, *keyPrefix, *keySpace, *scanLimit)\n\t\tif _, err := conn.Write(payload); err != nil {\n\t\t\tlogger.Printf(\"write error (worker=%d): %v\", workerID, err)\n\t\t\tbuf = payload[:0]\n\t\t\tcontinue\n\t\t}\n\t\tatomic.AddInt64(&sentTotal, 1)\n\t\tif isGet {\n\t\t\tatomic.AddInt64(&sentGet, 1)\n\t\t} else {\n\t\t\tatomic.AddInt64(&sentScan, 1)\n\t\t}\n\t\tbuf = payload[:0]\n\t}\n}(workerID, conn, rng)"
+          },
+          {
+            "path": "cmd/workload_client/main.go",
+            "snippet": "go func(workerID int, conn *net.UDPConn) {\n\tdefer recvWG.Done()\n\tbuf := make([]byte, 64*1024)\n\t// Set read deadline once to avoid blocking forever\n\tconn.SetReadDeadline(time.Now().Add(5 * time.Second))\n\tfor {\n\t\tn, err := conn.Read(buf)\n\t\t// Capture receive timestamp immediately\n\t\trecvNano := time.Now().UnixNano()\n\t\t...\n\t}\n}(workerID, conn)"
+          }
+        ]
+      },
+      "rag_answers": []
+    }
+  ]
+}

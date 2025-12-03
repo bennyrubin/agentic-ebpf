@@ -1,0 +1,105 @@
+<<<<<<< SEARCH
+//go:build ignore
+=======
+/*
+ Pebble agent UDP reuseport selector — compact, single-pick with tiny fallback window
+
+ Overview and motivation:
+ - The previous revision computed a start slot as hash % active and then carried
+   a fully unrolled 128-iteration probe loop, even though the hot path always
+   selects on the very first iteration. That unrolling bloats the eBPF program,
+   increases I-cache pressure, and can hurt tail latency at high request rates.
+
+ What changes:
+ - Keep exactly one fast selection on the hot path (derived from reuse->hash).
+ - Add a tiny bounded probe window (up to 2 neighbors) only if the first attempt
+   unexpectedly fails. This preserves safety without the 128x code size blow-up.
+ - Clamp 'active' into [1,128] and use a power-of-two fast path to avoid an
+   expensive modulo where possible.
+
+ Why this should improve p99:
+ - Dramatically smaller instruction footprint reduces instruction cache misses
+   and verifier/JIT overhead, which matters under heavy UDP load.
+ - The selection formula remains stable and uniform; we only avoid the giant
+   unrolled loop that the kernel would ignore after the first successful select.
+
+ Verifier and runtime notes:
+ - Bounded loop with at most 3 iterations; no stack use; helper eligibility OK.
+ - Exactly the same maps and section; GPL license and pinning stay unchanged.
+*/
+ //go:build ignore
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+// EVOLVE-BLOCK-START
+
+SEC("sk_reuseport/selector")
+enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
+{
+    __u32 key = 0;
+    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);
+    if (!state || state->active == 0)
+        return SK_PASS;
+
+    __u32 start = reuse->hash % state->active;
+
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 128; i++) {
+        if (i >= state->active)
+            break;
+
+        __u32 slot = start + i;
+        if (slot >= state->active)
+            slot -= state->active;
+
+        if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)
+            return SK_PASS;
+    }
+
+    return SK_PASS;
+}
+// EVOLVE-BLOCK-END
+=======
+/* EVOLVE-BLOCK-START
+
+   Compact selector with tiny fallback window:
+   - Hot path does a single select based on reuse->hash.
+   - If that rare first attempt fails, probe up to two neighboring slots.
+   - Clamp active to [1,128] and use a power-of-two fast path.
+*/
+SEC("sk_reuseport/selector")
+enum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)
+{
+    __u32 key = 0;
+    struct agent_state *st = bpf_map_lookup_elem(&pebble_agent_state, &key);
+    if (!st)
+        return SK_PASS;
+
+    __u32 active = st->active;
+    if (active == 0)
+        return SK_PASS;
+    if (active > 128)
+        active = 128;
+
+    __u32 base;
+    if ((active & (active - 1)) == 0) {
+        // Power-of-two: mask instead of modulo.
+        base = reuse->hash & (active - 1);
+    } else {
+        base = reuse->hash % active;
+    }
+
+    // Try first choice; if it unexpectedly fails, probe a couple of neighbors.
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < 3; i++) {
+        __u32 slot = base + (__u32)i;
+        if (slot >= active)
+            slot -= active;
+
+        if (bpf_sk_select_reuseport(reuse, &pebble_udp_targets, &slot, 0) == 0)
+            return SK_PASS;
+    }
+
+    return SK_PASS;
+}
+// EVOLVE-BLOCK-END
+>>>>>>> REPLACE

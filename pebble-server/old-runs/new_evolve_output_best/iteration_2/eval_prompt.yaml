@@ -1,0 +1,626 @@
+eval_agent_prompt: "You are an expert evaluator of high-performance networking systems, specializing in Linux UDP servers\
+  \ that use SO_REUSEPORT with an eBPF sk_reuseport program to steer requests to worker sockets, backed by a database. There\
+  \ are quick point GET requests and longer scans, which block until complete. 99.5% of requests are GET and the rest are\
+  \ SCANs. Your goal is to come up with a hypothesis to explain how the system actually behaved and why, using the provided\
+  \ artifacts: the current eBPF program, run metrics. Included below is a codebase summary. Do not limit analysis to simply\
+  \ deltas\u2014surface deeper insights and analysis across all layers including the network, userspace, and database layers.\n\
+  bpf_sk_select_reuseport selects which socket to send the request to. Assume this cannot fail and will always return 0, which\
+  \ uses the program's selection. Your task is to surface a hypothesis and a list of questions you currently cannot answer\
+  \ with your information that will confirm or deny the hypothesis. You should also ask questions about anything you're unsure\
+  \ about in the summary and hypothesis. These questions will be fed into a RAG retrieval system and then the answers returned\
+  \ back to you. You must consider carefully and explore creative, yet grounded ideas.\n\nMethod & guardrails\n- Be precise\
+  \ but efficient and quick. Do not take too long running or waste tokens.\n- Look carefully at the provided codebase summary\
+  \ and performance metrics and program. The first thing you should do is summarize each log for yourself to make sure you\
+  \ understand what is happening. For example, some questions to ask are: \u201CAre the requests well balanced on server workers?\
+  \ What do I see in the logs as the latencies increase across runs?\u201D Include in your output a json field called log_summaries\
+  \ that includes a summary for each provided log file.\n- The questions should be directly related to the codebase and not\
+  \ abstract. Do not ask about the eBPF programs or logs that you already have access to. Questions should pertain to the\
+  \ rest of the codebase, as outlined in the codebase summary. Direct questions that can immediately invalidate or validate\
+  \ the hypothesis are preferred (e.g. If the theory is that not all workers have their socket accessible in the socket map,\
+  \ a good question would be \u201CIn the server implementation, does every worker thread add its socket to the socket map?\u201D\
+  ). The more specific and concrete the question, the better. Another good question might be \u201CIn the workload client,\
+  \ how many client threads are there sending traffic?\u201D Some bad questions (too abstract, focused on logs, not code)\
+  \ are: \u201CIn the new eBPF implementation, how does the selection of the slot directly impact the load distribution amongst\
+  \ worker sockets as the rate increases?\u201D, \u201CWhat is the average queue length of requests at the socket level as\
+  \ logged in the server logs, particularly during peak load how does this compare to the previous implementation?\u201D.\
+  \ These are bad since they focus on logs, are not concrete, and are not about the server code, instead asking questions\
+  \ about the \u201Cprevious implementation\u201D that the RAG system knows nothing about. You may not ask questions you have\
+  \ already asked. You may not ask two different questions that still get at the exact same idea. Be precise in the hypothesis.\
+  \ An example of a bad hypothesis is \u201Cthis is due to suboptimal distribution algorithms in the new eBPF code\u201D.\
+  \ Instead, be precise of exactly what the suboptimal distribution algorithm is. If a hypothesis has been invalidated, you\
+  \ may not re-supply that hypothesis or another invalid hypothesis.\n- Evidence only. No leaps. If a claim is not supported\
+  \ by the artifacts, mark it uncertain and state exactly what\u2019s missing. Be explicit about assumptions you cannot verify.\
+  \ And use the places to ask informative questions.\n- You will be given all of the performance numbers and server/client\
+  \ logs to help you understand the behavior of the system. You should use these as well as the codebase itself to confirm\
+  \ your hypothesis.\n- Attribution. Tie each observed effect to a plausible component (e.g. BPF routing, socket queues, userspace,\
+  \ DB) with specific evidence.\n- Do not forget to account for the possibility of randomness or jitter across runs. Not all\
+  \ observations of differing performance are explained by different programs.\n- Unless something explicitly is in the log,\
+  \ assume there are no errors or misconfigurations (for example, assume all sockets are configured and setup correctly).\
+  \ You must know that all reuseport slots are correctly mapped to functioning sockets and that the active worker count matches\
+  \ the number of sockets in the map and there are no stale entries. Do not include any explanations that contradict this.\n\
+  \nOutput format (JSON):\n- Summary: succinctly describe the behavior you see in the logs and performance metrics. Be precise\
+  \ about exactly what you see in the logs to bring you to that conclusion.\n- hypothesis: { \"text\": \"<best explanation>\"\
+  , \"score\": <0-10> } \u2014 keep the text concise and avoid technical log details; lower the score if uncertain.\n- questions:\
+  \ list of specific and precise codebase questions to feed into RAG (<=5, avoid repeats, concrete and code-focused).\n- log_summaries:\
+  \ optional quick bullet summaries of any logs/metrics you saw.\n\nRun context:\nBest program metrics: policy=agent, rates=[80000,\
+  \ 100000, 140000, 160000], load_p99_curve=[(80000.0, 2.04), (100000.0, 2.406), (140000.0, 21.259), (160000.0, 1073.506)],\
+  \ load_p99_stddev_curve=[(80000.0, 0.0), (100000.0, 0.0), (140000.0, 0.0), (160000.0, 0.0)], compile=1.0, load=1.0, combined_score=-1146.5410000000002,\
+  \ run_success=1.0\n\nCodebase summary:\n{\n  \"overview\": {\n    \"scope\": \"Synthetic UDP storage emulator with eBPF-aware\
+  \ load balancing (pebble-server) \u2014 only internal/, cmd/, scripts/, workload/, run.sh, run_exp.py included.\",\n   \
+  \ \"languages\": [\n      \"Go 1.22 (internal/*, cmd/*)\",\n      \"Bash (run.sh, scripts/*, workload/run_client.sh)\",\n\
+  \      \"Python 3 (run_exp.py, scripts/dispatch_docker_experiments.py)\"\n    ],\n    \"artifact_conventions\": {\n    \
+  \  \"logs\": \"logs/<role> (server|client)\",\n      \"results\": \"results/run-* (per run.sh invocation) containing experiment.json\
+  \ + workload_summary.json\",\n      \"eBPF_pin_paths\": \"/sys/fs/bpf/pebble/<RUN_ID> (set by run.sh before launching the\
+  \ Go server)\"\n    }\n  },\n  \"execution_flow\": [\n    {\n      \"order\": 1,\n      \"name\": \"Experiment orchestration\"\
+  ,\n      \"artefact\": \"run_exp.py\",\n      \"description\": \"Thin experiment wrapper: either shells into run.sh for\
+  \ fresh sweeps or parses dispatch manifests to summarise existing runs, then emits summary.json and optional matplotlib\
+  \ plots.\",\n      \"key_steps\": [\n        \"parse_args (run_exp.py:29-95) exposes policies/rates/threads plus manifest\
+  \ + plotting toggles.\",\n        \"invoke_run_sh/load_manifest_runs gather `run-*` directories, extract metrics from workload_summary.json,\
+  \ and pass records into write_experiment_summary/generate_plots.\"\n      ]\n    },\n    {\n      \"order\": 2,\n      \"\
+  name\": \"Per-run workflow\",\n      \"artefact\": \"run.sh\",\n      \"description\": \"Convenience script that (a) slices\
+  \ NUMA CPUs between server/client, (b) rebuilds eBPF assets, (c) restarts the Go server for each workload iteration, (d)\
+  \ runs cmd/workload_client under taskset, and (e) aggregates iteration outputs into workload_summary.json.\",\n      \"\
+  key_steps\": [\n        \"resolve_cpu_pool/join_by (run.sh:27-118) derive SERVER_CPUSET + CLIENT_CPUSET from CPUSET_POOL\
+  \ or NUMA node 0.\",\n        \"Calls scripts/build_ebpf.sh + scripts/cleanup_ebpf_maps.sh, then orchestrates server via\
+  \ scripts/launch_server.sh and client via run_client wrapper.\",\n        \"Embedded Python (run.sh:415-452) regex-parses\
+  \ client logs into workload_summary.json; final line prints the run directory for downstream tooling.\"\n      ]\n    },\n\
+  \    {\n      \"order\": 3,\n      \"name\": \"Runtime services\",\n      \"artefacts\": [\n        \"cmd/pebble_server/main.go:21-91\
+  \ -> internal/server/*\",\n        \"cmd/workload_client/main.go:67-450\"\n      ],\n      \"description\": \"Go binaries\
+  \ that run.sh controls. The server exposes UDP reuseport workers with synthetic latency and optional eBPF selection, while\
+  \ the workload client generates GET/SCAN traffic with latency tracking.\",\n      \"key_steps\": [\n        \"cmd/pebble_server\
+  \ wires CLI flags, creates log/results dirs, enables pprof/profiling, builds server.Config and runs server.New/Run under\
+  \ signal-aware context.\",\n        \"internal/server.Server.New/Run (server.go:104-181) validate config, load eBPF policy,\
+  \ clear pinned maps, then open reuseport sockets, attach eBPF, and spawn workers; handleRequest (server.go:268-325) executes\
+  \ busy-wait delays and records stats.\",\n        \"cmd/workload_client main loop (main.go:67-347) builds UDP payloads,\
+  \ enforces rate limit via golang.org/x/time/rate, tags each request with reqID (makeReqID/parseReqID, main.go:308-337) so\
+  \ receive goroutines can compute latency and feed the aggregator (latencyAggregator, main.go:40-66).\",\n        \"Server\
+  \ stats logger (server.go:328-395) emits per-worker and aggregate lines that scripts/monitoring can scrape.\"\n      ],\n\
+  \      \"downstream\": [\n        \"Server relies on internal/server/ebpf.go + generated internal/ebpfutil bindings.\",\n\
+  \        \"Client output is parsed by run.sh\u2019s Python aggregator; logs feed human debugging.\"\n      ]\n    },\n \
+  \   {\n      \"order\": 4,\n      \"name\": \"Support scripts\",\n      \"artefacts\": [\n        \"scripts/build_ebpf.sh:1-34\"\
+  ,\n        \"scripts/cleanup_ebpf_maps.sh:1-25\",\n        \"scripts/launch_server.sh:1-96\",\n        \"scripts/dispatch_docker_experiments.py:1-654\"\
+  ,\n        \"workload/run_client.sh:1-62\"\n      ],\n      \"description\": \"Reusable helpers for building eBPF assets,\
+  \ cleaning pinned maps, launching the server standalone, dispatching dockerized experiments, and invoking the workload client\
+  \ without run.sh.\",\n      \"key_steps\": [\n        \"build_ebpf.sh enforces clang availability, sets BPF_CLANG/BPF_CFLAGS,\
+  \ adds arch include paths, then runs `go generate ./internal/ebpfutil`.\",\n        \"cleanup_ebpf_maps.sh deletes global\
+  \ pinned maps unless run-specific BPF_PIN_PATH is set, preventing fd leaks between runs.\",\n        \"launch_server.sh\
+  \ builds cmd/pebble_server (unless disabled), enforces single instance via PID file, applies taskset when SERVER_CPUSET\
+  \ is exported, and records PID for run.sh.\",\n        \"dispatch_docker_experiments.py reads NUMA topology (read_numa_cpu_map,\
+  \ line 106), assigns per-container CPU slices, constructs docker run commands (build_jobs, line 149), streams logs asynchronously\
+  \ (run_job, line 221), and optionally post-processes with run_exp.py.\",\n        \"workload/run_client.sh is a thin CLI\
+  \ around `go run ./cmd/workload_client` for ad-hoc manual traffic.\"\n      ]\n    }\n  ],\n  \"modules\": {\n    \"run_exp.py\"\
+  : {\n      \"high_level_role\": \"Top-level wrapper to sweep policies/rates and collect workload_summary.json files into\
+  \ one experiment summary.\",\n      \"key_points\": [\n        \"parse_args exposes knobs for policies/rates, send-workers,\
+  \ duration, server/client cores, plotting, and manifest reuse.\",\n        \"invoke_run_sh executes run.sh and captures\
+  \ the run directory; load_manifest_runs + link_run_directories reuse docker-dispatched runs.\",\n        \"generate_overall_plot\
+  \ / generate_get_scan_plot optionally render PNGs (skip with --skip-plot).\"\n      ]\n    },\n    \"run.sh\": {\n     \
+  \ \"high_level_role\": \"Automation glue that sets up CPU pinning, rebuilds eBPF assets, runs cmd/pebble_server + cmd/workload_client\
+  \ for N iterations, and emits workload_summary.json.\",\n      \"key_points\": [\n        \"resolve_cpu_pool + join_by compute\
+  \ SERVER_CPUSET/CLIENT_CPUSET and export them for both taskset prefixes.\",\n        \"start_server/stop_server wrap scripts/launch_server.sh\
+  \ and enforce clean PID files; run_client pins workload_client under CLIENT_CPUSET.\",\n        \"Embedded Python generates\
+  \ workload_summary.json from logs/workload_iteration_*.txt, which run_exp.py later ingests.\"\n      ]\n    },\n    \"cmd/pebble_server\"\
+  : {\n      \"high_level_role\": \"Go binary that instantiates internal/server.Server based on CLI flags and keeps it running\
+  \ with profiling enabled.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Flag wiring & filesystem setup\"\
+  ,\n          \"lines\": \"cmd/pebble_server/main.go:21-52\",\n          \"details\": [\n            \"Defines flags for\
+  \ listen addr, workers, policy, max scan, log/results dirs, timeouts, and synthetic delays; ensures directories exist before\
+  \ logging.\",\n            \"Creates/opens <log-dir>/server.log (append mode) and builds a microsecond-resolution logger.\"\
+  \n          ]\n        },\n        {\n          \"name\": \"Profiling + server lifecycle\",\n          \"lines\": \"cmd/pebble_server/main.go:52-92\"\
+  ,\n          \"details\": [\n            \"Enables block/mutex profiling (runtime.SetBlockProfileRate/SetMutexProfileFraction)\
+  \ and hosts net/http/pprof on 127.0.0.1:6060.\",\n            \"Builds server.Config, calls server.New (fails fast on invalid\
+  \ config or eBPF load issues), installs SIGINT/SIGTERM handler, logs startup configuration, and blocks on srv.Run(ctx).\"\
+  \n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"Uses internal/server (Config, Server, eBPF\
+  \ loader).\",\n        \"scripts/launch_server.sh expects -log-dir and -results-dir to exist for log collation.\"\n    \
+  \  ]\n    },\n    \"cmd/workload_client\": {\n      \"high_level_role\": \"Open-loop UDP workload generator with reqID-based\
+  \ latency measurement and throughput reporting.\",\n      \"key_sections\": [\n        {\n          \"name\": \"Latency\
+  \ data structures\",\n          \"lines\": \"cmd/workload_client/main.go:32-66\",\n          \"details\": [\n          \
+  \  \"latencyRecord and latencyAggregator store per-request latencies, split into overall/GET/SCAN slices; aggregator.totalRecv\
+  \ reports sample counts.\"\n          ]\n        },\n        {\n          \"name\": \"Main workload loop\",\n          \"\
+  lines\": \"cmd/workload_client/main.go:67-307\",\n          \"details\": [\n            \"Parses flags (server, duration,\
+  \ rate, get-frac, scan-limit, key prefix/space, log path, send workers), validates arguments, seeds RNGs per worker.\",\n\
+  \            \"Creates a shared rate limiter (golang.org/x/time/rate), spawns send goroutines that build payloads (buildPayload,\
+  \ line 363) and assign reqIDs (makeReqID, line 308).\",\n            \"Spawns recv goroutines with deadlines that parse\
+  \ responses, extract reqIDs (parseReqID, line 320), compute latency, and push records into latencyCh.\",\n            \"\
+  Aggregator + monitor goroutines track outstanding requests and total received counts.\"\n          ]\n        },\n     \
+  \   {\n          \"name\": \"Statistics reporting\",\n          \"lines\": \"cmd/workload_client/main.go:308-451\",\n  \
+  \        \"details\": [\n            \"Helper functions (makeReqID/parseReqID/writeHex/parseHex) ensure both sides share\
+  \ the encoding.\",\n            \"percentile/average/reportLatencyStats (lines 376-451) sort copies of the latency slices,\
+  \ compute p50/p90/p99/avg, and print textual summaries that run.sh\u2019s regex parser expects.\"\n          ]\n       \
+  \ }\n      ],\n      \"cross_dependencies\": [\n        \"run.sh\u2019s run_client wrapper invokes this with -log pointing\
+  \ at logs/client.log; workload/run_client.sh uses go run for convenience.\",\n        \"Server assumes GET payload format\
+  \ 'GET key [reqID]' and SCAN 'SCAN start limit [reqID]' as implemented here.\"\n      ]\n    },\n    \"internal/server\"\
+  : {\n      \"high_level_role\": \"Core server runtime, including configuration validation, UDP worker pool, request parser,\
+  \ stats logging, and eBPF policy integration.\",\n      \"key_files\": [\n        {\n          \"path\": \"internal/server/config.go\"\
+  ,\n          \"summary\": \"Config struct + Validate clamp runtime knobs to sane defaults so CLI/script errors don\u2019\
+  t crash the server.\",\n          \"key_functions\": [\n            {\n              \"name\": \"Config.Validate\",\n  \
+  \            \"lines\": \"internal/server/config.go:19-43\",\n              \"details\": [\n                \"Sets ListenAddr\
+  \ default (127.0.0.1:9000), ensures at least one worker, caps MaxScanKeys >= 1 (default 100k), enforces non-zero timeouts/delays.\"\
+  ,\n                \"Called by server.New before any socket/eBPF work, giving run.sh freedom to pass zero/negative placeholder\
+  \ values.\"\n              ]\n            }\n          ]\n        },\n        {\n          \"path\": \"internal/server/server.go\"\
+  ,\n          \"summary\": \"Implements the Server struct, worker lifecycle, UDP handler, and stats reporter.\",\n      \
+  \    \"key_functions\": [\n            {\n              \"name\": \"Server.New\",\n              \"lines\": \"internal/server/server.go:104-131\"\
+  ,\n              \"details\": [\n                \"Validates config, builds default logger when nil, loads eBPF policy via\
+  \ loadEBPF, clears pinned target map when a program is present, and preallocates workerStats.\"\n              ]\n     \
+  \       },\n            {\n              \"name\": \"Server.Run\",\n              \"lines\": \"internal/server/server.go:144-182\"\
+  ,\n              \"details\": [\n                \"Resets stats, spawns stats logger, iterates workers to open UDP sockets\
+  \ (openWorker, lines 184-230), optionally attaches the eBPF program to worker 0, records socket fds into the pinned map,\
+  \ launches spawnWorker goroutines, and blocks until ctx cancellation.\"\n              ]\n            },\n            {\n\
+  \              \"name\": \"openWorker + spawnWorker\",\n              \"lines\": \"internal/server/server.go:184-266\",\n\
+  \              \"details\": [\n                \"openWorker sets SO_REUSEADDR/SO_REUSEPORT via net.ListenConfig.Control\
+  \ and attaches the eBPF program once; returns both UDPConn and fd for map updates.\",\n                \"spawnWorker loops\
+  \ on ReadFromUDP, handles ctx cancellation/ErrClosed gracefully, and logs transient read/write errors.\"\n             \
+  \ ]\n            },\n            {\n              \"name\": \"handleRequest\",\n              \"lines\": \"internal/server/server.go:268-325\"\
+  ,\n              \"details\": [\n                \"Parses payloads via parseRequest, extracts optional reqID tokens, enforces\
+  \ SCAN limit <= MaxScanKeys, executes accurate busy-wait delays for GET/SCAN, records latencies per worker, and formats\
+  \ responses (formatResponse, lines 397-407).\"\n              ]\n            },\n            {\n              \"name\":\
+  \ \"startStatsLogger\",\n              \"lines\": \"internal/server/server.go:328-395\",\n              \"details\": [\n\
+  \                \"Every second, snapshots worker metrics, logs per-worker averages when there was traffic, accumulates\
+  \ totals, and emits aggregate '[perf] interval=1s ...' lines consumed by observability tooling.\"\n              ]\n   \
+  \         }\n          ]\n        },\n        {\n          \"path\": \"internal/server/handler.go\",\n          \"summary\"\
+  : \"Robust ASCII parser for GET/SCAN requests.\",\n          \"key_functions\": [\n            {\n              \"name\"\
+  : \"parseRequest\",\n              \"lines\": \"internal/server/handler.go:14-45\",\n              \"details\": [\n    \
+  \            \"Trims whitespace, splits fields, enforces argument counts for GET/SCAN, and lowercases manually via equalFoldASCII\
+  \ (lines 48-66) to avoid allocations in hot paths.\"\n              ]\n            }\n          ]\n        },\n        {\n\
+  \          \"path\": \"internal/server/ebpf.go\",\n          \"summary\": \"Loads eBPF selector programs, manages pin directories,\
+  \ and updates reuseport target maps.\",\n          \"key_functions\": [\n            {\n              \"name\": \"loadEBPF\
+  \ + load* variants\",\n              \"lines\": \"internal/server/ebpf.go:50-218\",\n              \"details\": [\n    \
+  \            \"Switches on policy names, ensures memlock rlimit is raised, creates pin directories, loads generated ebpfutil\
+  \ objects, seeds state maps (e.g., PebbleRrState.Active = workers), and returns ebpfPolicy handles with Close hooks.\",\n\
+  \                \"Validates non-negative worker counts for agent/scan_split/hash policies.\"\n              ]\n       \
+  \     },\n            {\n              \"name\": \"attach/updateTargetsMap/clearTargets\",\n              \"lines\": \"\
+  internal/server/ebpf.go:220-268\",\n              \"details\": [\n                \"attach(fd) wraps SO_ATTACH_REUSEPORT_EBPF,\
+  \ updateTargetsMap writes worker fd values into the pinned pebble_udp_targets map so eBPF programs can redirect flows, clearTargets\
+  \ removes stale slots at startup (skips when map not present).\"\n              ]\n            }\n          ]\n        }\n\
+  \      ],\n      \"cross_dependencies\": [\n        \"Relies on generated internal/ebpfutil bindings (bpf2go outputs).\"\
+  ,\n        \"Server expects run.sh or scripts/launch_server.sh to set BPF_PIN_BASE/PATH correctly.\"\n      ]\n    },\n\
+  \    \"internal/ebpfutil\": {\n      \"high_level_role\": \"Generated Go bindings/objects for each eBPF selector program;\
+  \ rebuild with `go generate ./internal/ebpfutil`.\",\n      \"key_files\": [\n        {\n          \"path\": \"internal/ebpfutil/bpf_assets.go\"\
+  ,\n          \"summary\": \"Contains go:generate directives pointing at ../../ebpf/*.c programs with bpf2go, ensuring clang\
+  \ builds BPF object files.\",\n          \"key_points\": [\n            \"Generated *_bpf.go files (e.g., agentselector_bpf.go)\
+  \ expose typed structs (AgentSelectorObjects, Maps, Programs) and embed corresponding *.o bytecode, which internal/server/ebpf.go\
+  \ loads with pinned map support.\"\n          ]\n        }\n      ],\n      \"cross_dependencies\": [\n        \"scripts/build_ebpf.sh\
+  \ must run before any policy other than 'default' is used, otherwise loadEBPF will fail due to missing object files.\"\n\
+  \      ]\n    },\n    \"scripts\": {\n      \"build_ebpf.sh\": {\n        \"role\": \"Rebuild internal/ebpfutil assets (`go\
+  \ generate ./internal/ebpfutil`) with clang, unless SKIP_EBPF_BUILD=true.\"\n      },\n      \"cleanup_ebpf_maps.sh\": {\n\
+  \        \"role\": \"Remove pinned reuseport maps under $BPF_PIN_BASE to avoid stale file descriptor slots; skipped when\
+  \ BPF_PIN_PATH is set.\"\n      },\n      \"launch_server.sh\": {\n        \"role\": \"Build/run cmd/pebble_server with\
+  \ provided flags, enforce single instance via PID files, and optionally wrap in taskset.\"\n      },\n      \"dispatch_docker_experiments.py\"\
+  : {\n        \"role\": \"NUMA-aware docker dispatcher: builds `docker run` commands per (policy, rate), streams logs, writes\
+  \ dispatch manifests, and can trigger run_exp.py on completion.\"\n      }\n    },\n    \"workload\": {\n      \"run_client.sh\"\
+  : {\n        \"role\": \"Simplified wrapper to run cmd/workload_client without building binaries.\",\n        \"lines\"\
+  : \"workload/run_client.sh:1-62\",\n        \"notes\": [\n          \"Accepts basic knobs (-s server, -t duration, -r rate,\
+  \ -g GET fraction, -m scan limit, -k prefix, -N key space, -w workers, -l log file).\",\n          \"Ensures client log\
+  \ directory exists, runs from repo root so go modules resolve, and writes logs to logs/client.log by default.\"\n      \
+  \  ]\n      }\n    }\n  }\n}\n\n\nRun artifacts (runs):\n[\n  {\n    \"name\": \"agent-80000\",\n    \"server_log\": \"\
+  2025/12/02 13:18:27.671624 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms\
+  \ pprof=127.0.0.1:6060\\n2025/12/02 13:18:29.674113 server stopped\\n2025/12/02 13:18:29.823928 server starting addr=127.0.0.1:9000\
+  \ workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\n2025/12/02 13:18:32.824299 [perf] worker=0\
+  \ gets=15752 get_errors=0 avg_get=10.147\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:32.824337 [perf] worker=1\
+  \ gets=15747 get_errors=0 avg_get=10.185\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:32.824343 [perf] worker=2\
+  \ gets=15748 get_errors=0 avg_get=10.153\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:32.824348 [perf] worker=3\
+  \ gets=15752 get_errors=0 avg_get=10.279\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:32.824353 [perf] worker=4\
+  \ gets=0 get_errors=0 avg_get=0s scans=141 scan_errors=0 avg_scan=2.000427ms\\n2025/12/02 13:18:32.824358 [perf] worker=5\
+  \ gets=0 get_errors=0 avg_get=0s scans=140 scan_errors=0 avg_scan=2.000101ms\\n2025/12/02 13:18:32.824363 [perf] interval=1s\
+  \ gets=62999 get_errors=0 avg_get=10.191\\u00b5s scans=281 scan_errors=0 avg_scan=2.000265ms\\n2025/12/02 13:18:33.824382\
+  \ [perf] worker=0 gets=19865 get_errors=0 avg_get=10.496\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:33.824425\
+  \ [perf] worker=1 gets=19858 get_errors=0 avg_get=10.313\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:33.824431\
+  \ [perf] worker=2 gets=19850 get_errors=0 avg_get=10.323\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:33.824436\
+  \ [perf] worker=3 gets=19860 get_errors=0 avg_get=10.274\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:33.824440\
+  \ [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=207 scan_errors=0 avg_scan=2.00015ms\\n2025/12/02 13:18:33.824445\
+  \ [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=207 scan_errors=0 avg_scan=2.0001ms\\n2025/12/02 13:18:33.824450\
+  \ [perf] interval=1s gets=79433 get_errors=0 avg_get=10.351\\u00b5s scans=414 scan_errors=0 avg_scan=2.000125ms\\n2025/12/02\
+  \ 13:18:34.824317 [perf] worker=0 gets=19855 get_errors=0 avg_get=10.141\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:34.824346 [perf] worker=1 gets=19844 get_errors=0 avg_get=10.152\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:34.824353 [perf] worker=2 gets=19847 get_errors=0 avg_get=10.161\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:34.824358 [perf] worker=3 gets=19853 get_errors=0 avg_get=10.164\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:34.824362 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=197 scan_errors=0 avg_scan=2.000323ms\\n2025/12/02\
+  \ 13:18:34.824367 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=197 scan_errors=0 avg_scan=2.000102ms\\n2025/12/02\
+  \ 13:18:34.824372 [perf] interval=1s gets=79399 get_errors=0 avg_get=10.155\\u00b5s scans=394 scan_errors=0 avg_scan=2.000213ms\\\
+  n2025/12/02 13:18:35.824286 [perf] worker=0 gets=19712 get_errors=0 avg_get=10.17\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:35.824331 [perf] worker=1 gets=19731 get_errors=0 avg_get=10.175\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:35.824337 [perf] worker=2 gets=19721 get_errors=0 avg_get=10.181\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:35.824342 [perf] worker=3 gets=19715 get_errors=0 avg_get=10.275\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:35.824347 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=197 scan_errors=0 avg_scan=2.008405ms\\\
+  n2025/12/02 13:18:35.824352 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=197 scan_errors=0 avg_scan=2.01506ms\\\
+  n2025/12/02 13:18:35.824357 [perf] interval=1s gets=78879 get_errors=0 avg_get=10.2\\u00b5s scans=394 scan_errors=0 avg_scan=2.011732ms\\\
+  n2025/12/02 13:18:36.824312 [perf] worker=0 gets=19781 get_errors=0 avg_get=10.164\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:36.824342 [perf] worker=1 gets=19780 get_errors=0 avg_get=10.147\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:36.824348 [perf] worker=2 gets=19765 get_errors=0 avg_get=10.17\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:36.824353 [perf] worker=3 gets=19752 get_errors=0 avg_get=10.164\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:36.824382 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=200 scan_errors=0 avg_scan=2.016021ms\\\
+  n2025/12/02 13:18:36.824389 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=200 scan_errors=0 avg_scan=2.000317ms\\\
+  n2025/12/02 13:18:36.824393 [perf] interval=1s gets=79078 get_errors=0 avg_get=10.162\\u00b5s scans=400 scan_errors=0 avg_scan=2.008169ms\\\
+  n2025/12/02 13:18:37.824298 [perf] worker=0 gets=19891 get_errors=0 avg_get=10.148\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:37.824331 [perf] worker=1 gets=19883 get_errors=0 avg_get=10.158\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:37.824338 [perf] worker=2 gets=19873 get_errors=0 avg_get=10.15\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:37.824343 [perf] worker=3 gets=19878 get_errors=0 avg_get=10.151\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:37.824347 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=198 scan_errors=0 avg_scan=2.0001ms\\n2025/12/02\
+  \ 13:18:37.824352 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=198 scan_errors=0 avg_scan=2.002329ms\\n2025/12/02\
+  \ 13:18:37.824357 [perf] interval=1s gets=79525 get_errors=0 avg_get=10.152\\u00b5s scans=396 scan_errors=0 avg_scan=2.001215ms\\\
+  n2025/12/02 13:18:38.824324 [perf] worker=0 gets=19904 get_errors=0 avg_get=10.187\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:38.824355 [perf] worker=1 gets=19908 get_errors=0 avg_get=10.174\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:38.824361 [perf] worker=2 gets=19886 get_errors=0 avg_get=10.139\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:38.824366 [perf] worker=3 gets=19905 get_errors=0 avg_get=10.149\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:38.824371 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=201 scan_errors=0 avg_scan=2.000701ms\\\
+  n2025/12/02 13:18:38.824375 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=202 scan_errors=0 avg_scan=2.000099ms\\\
+  n2025/12/02 13:18:38.824380 [perf] interval=1s gets=79603 get_errors=0 avg_get=10.163\\u00b5s scans=403 scan_errors=0 avg_scan=2.000399ms\\\
+  n2025/12/02 13:18:39.824404 [perf] worker=0 gets=4136 get_errors=0 avg_get=10.149\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:39.824461 [perf] worker=1 gets=4120 get_errors=0 avg_get=10.187\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:39.824475 [perf] worker=2 gets=4123 get_errors=0 avg_get=10.147\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:39.824487 [perf] worker=3 gets=4132 get_errors=0 avg_get=10.12\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:39.824499 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=46 scan_errors=0 avg_scan=2.0001ms\\n2025/12/02\
+  \ 13:18:39.824510 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=45 scan_errors=0 avg_scan=2.000096ms\\n2025/12/02\
+  \ 13:18:39.824522 [perf] interval=1s gets=16511 get_errors=0 avg_get=10.151\\u00b5s scans=91 scan_errors=0 avg_scan=2.000098ms\\\
+  n2025/12/02 13:18:42.176664 server stopped\\n\",\n    \"client_log\": \"[client] 2025/12/02 13:18:32.031620 starting workload\
+  \ server=127.0.0.1:9000 duration=7s rate=80000.00 get_frac=0.99\\n[client] 2025/12/02 13:18:33.032115 outstanding=5 sent=79903\
+  \ recv=79898\\n[client] 2025/12/02 13:18:34.032078 outstanding=6 sent=159659 recv=159653\\n[client] 2025/12/02 13:18:35.032090\
+  \ outstanding=5 sent=239313 recv=239308\\n[client] 2025/12/02 13:18:36.032104 outstanding=9 sent=318821 recv=318812\\n[client]\
+  \ 2025/12/02 13:18:37.032080 outstanding=7 sent=398297 recv=398290\\n[client] 2025/12/02 13:18:38.032088 outstanding=8 sent=478215\
+  \ recv=478207\\n[client] 2025/12/02 13:18:39.032993 outstanding=1 sent=558200 recv=558199\\n[client] 2025/12/02 13:18:42.033427\
+  \ sent=558200 recv=558200\\n\"\n  },\n  {\n    \"name\": \"agent-100000\",\n    \"server_log\": \"2025/12/02 13:18:42.432753\
+  \ server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\\
+  n2025/12/02 13:18:44.436130 server stopped\\n2025/12/02 13:18:44.583684 server starting addr=127.0.0.1:9000 workers=6 policy=agent\
+  \ get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\n2025/12/02 13:18:47.584200 [perf] worker=0 gets=19704 get_errors=0\
+  \ avg_get=10.162\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:47.584240 [perf] worker=1 gets=19711 get_errors=0\
+  \ avg_get=10.143\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:47.584246 [perf] worker=2 gets=19727 get_errors=0\
+  \ avg_get=10.203\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:47.584251 [perf] worker=3 gets=19726 get_errors=0\
+  \ avg_get=10.166\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:47.584256 [perf] worker=4 gets=0 get_errors=0\
+  \ avg_get=0s scans=205 scan_errors=0 avg_scan=2.000102ms\\n2025/12/02 13:18:47.584261 [perf] worker=5 gets=0 get_errors=0\
+  \ avg_get=0s scans=205 scan_errors=0 avg_scan=2.003325ms\\n2025/12/02 13:18:47.584266 [perf] interval=1s gets=78868 get_errors=0\
+  \ avg_get=10.168\\u00b5s scans=410 scan_errors=0 avg_scan=2.001714ms\\n2025/12/02 13:18:48.584368 [perf] worker=0 gets=24850\
+  \ get_errors=0 avg_get=10.15\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:48.584397 [perf] worker=1 gets=24827\
+  \ get_errors=0 avg_get=10.157\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:48.584403 [perf] worker=2 gets=24839\
+  \ get_errors=0 avg_get=10.143\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:48.584408 [perf] worker=3 gets=24847\
+  \ get_errors=0 avg_get=10.14\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:48.584413 [perf] worker=4 gets=0\
+  \ get_errors=0 avg_get=0s scans=250 scan_errors=0 avg_scan=2.00437ms\\n2025/12/02 13:18:48.584418 [perf] worker=5 gets=0\
+  \ get_errors=0 avg_get=0s scans=249 scan_errors=0 avg_scan=2.001527ms\\n2025/12/02 13:18:48.584423 [perf] interval=1s gets=99363\
+  \ get_errors=0 avg_get=10.148\\u00b5s scans=499 scan_errors=0 avg_scan=2.002951ms\\n2025/12/02 13:18:49.583979 [perf] worker=0\
+  \ gets=24794 get_errors=0 avg_get=10.145\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:49.584007 [perf] worker=1\
+  \ gets=24784 get_errors=0 avg_get=10.165\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:49.584014 [perf] worker=2\
+  \ gets=24777 get_errors=0 avg_get=10.147\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:49.584018 [perf] worker=3\
+  \ gets=24782 get_errors=0 avg_get=10.166\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:49.584023 [perf] worker=4\
+  \ gets=0 get_errors=0 avg_get=0s scans=247 scan_errors=0 avg_scan=2.000175ms\\n2025/12/02 13:18:49.584028 [perf] worker=5\
+  \ gets=0 get_errors=0 avg_get=0s scans=248 scan_errors=0 avg_scan=2.000448ms\\n2025/12/02 13:18:49.584033 [perf] interval=1s\
+  \ gets=99137 get_errors=0 avg_get=10.155\\u00b5s scans=495 scan_errors=0 avg_scan=2.000312ms\\n2025/12/02 13:18:50.584078\
+  \ [perf] worker=0 gets=24636 get_errors=0 avg_get=10.159\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:50.584117\
+  \ [perf] worker=1 gets=24631 get_errors=0 avg_get=10.181\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:50.584124\
+  \ [perf] worker=2 gets=24651 get_errors=0 avg_get=10.138\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:50.584128\
+  \ [perf] worker=3 gets=24620 get_errors=0 avg_get=10.149\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:18:50.584133\
+  \ [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=251 scan_errors=0 avg_scan=2.00789ms\\n2025/12/02 13:18:50.584138\
+  \ [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=251 scan_errors=0 avg_scan=2.000496ms\\n2025/12/02 13:18:50.584143\
+  \ [perf] interval=1s gets=98538 get_errors=0 avg_get=10.157\\u00b5s scans=502 scan_errors=0 avg_scan=2.004193ms\\n2025/12/02\
+  \ 13:18:51.584126 [perf] worker=0 gets=24631 get_errors=0 avg_get=10.156\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:51.584157 [perf] worker=1 gets=24674 get_errors=0 avg_get=10.195\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:51.584164 [perf] worker=2 gets=24628 get_errors=0 avg_get=10.137\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:51.584168 [perf] worker=3 gets=24638 get_errors=0 avg_get=10.156\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:18:51.584206 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=256 scan_errors=0 avg_scan=2.000098ms\\n2025/12/02\
+  \ 13:18:51.584212 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=256 scan_errors=0 avg_scan=2.000607ms\\n2025/12/02\
+  \ 13:18:51.584217 [perf] interval=1s gets=98571 get_errors=0 avg_get=10.161\\u00b5s scans=512 scan_errors=0 avg_scan=2.000353ms\\\
+  n2025/12/02 13:18:52.583996 [perf] worker=0 gets=24786 get_errors=0 avg_get=10.141\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:52.584028 [perf] worker=1 gets=24786 get_errors=0 avg_get=10.149\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:52.584034 [perf] worker=2 gets=24796 get_errors=0 avg_get=10.169\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:52.584039 [perf] worker=3 gets=24785 get_errors=0 avg_get=10.239\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:52.584043 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=253 scan_errors=0 avg_scan=2.012385ms\\\
+  n2025/12/02 13:18:52.584048 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=252 scan_errors=0 avg_scan=2.000653ms\\\
+  n2025/12/02 13:18:52.584053 [perf] interval=1s gets=99153 get_errors=0 avg_get=10.174\\u00b5s scans=505 scan_errors=0 avg_scan=2.006531ms\\\
+  n2025/12/02 13:18:53.584016 [perf] worker=0 gets=24466 get_errors=0 avg_get=10.308\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:53.584062 [perf] worker=1 gets=24475 get_errors=0 avg_get=10.391\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:53.584068 [perf] worker=2 gets=24463 get_errors=0 avg_get=10.18\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:53.584074 [perf] worker=3 gets=24464 get_errors=0 avg_get=10.166\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:53.584079 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=252 scan_errors=0 avg_scan=2.003442ms\\\
+  n2025/12/02 13:18:53.584084 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=253 scan_errors=0 avg_scan=2.000708ms\\\
+  n2025/12/02 13:18:53.584089 [perf] interval=1s gets=97868 get_errors=0 avg_get=10.261\\u00b5s scans=505 scan_errors=0 avg_scan=2.002072ms\\\
+  n2025/12/02 13:18:54.584769 [perf] worker=0 gets=5076 get_errors=0 avg_get=10.125\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:54.584827 [perf] worker=1 gets=5081 get_errors=0 avg_get=10.138\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:54.584841 [perf] worker=2 gets=5079 get_errors=0 avg_get=10.152\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:54.584853 [perf] worker=3 gets=5073 get_errors=0 avg_get=10.17\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:18:54.584864 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=43 scan_errors=0 avg_scan=2.000097ms\\\
+  n2025/12/02 13:18:54.584876 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=43 scan_errors=0 avg_scan=2.000098ms\\\
+  n2025/12/02 13:18:54.584888 [perf] interval=1s gets=20309 get_errors=0 avg_get=10.146\\u00b5s scans=86 scan_errors=0 avg_scan=2.000097ms\\\
+  n2025/12/02 13:18:56.965384 server stopped\\n\",\n    \"client_log\": \"[client] 2025/12/02 13:18:46.788172 starting workload\
+  \ server=127.0.0.1:9000 duration=7s rate=100000.00 get_frac=0.99\\n[client] 2025/12/02 13:18:47.788638 outstanding=8 sent=99708\
+  \ recv=99700\\n[client] 2025/12/02 13:18:48.788630 outstanding=8 sent=199484 recv=199476\\n[client] 2025/12/02 13:18:49.788635\
+  \ outstanding=4 sent=298691 recv=298687\\n[client] 2025/12/02 13:18:50.788628 outstanding=11 sent=398276 recv=398265\\n[client]\
+  \ 2025/12/02 13:18:51.788638 outstanding=27 sent=497275 recv=497248\\n[client] 2025/12/02 13:18:52.788631 outstanding=8\
+  \ sent=595894 recv=595886\\n[client] 2025/12/02 13:18:56.789359 sent=695321 recv=695321\\n\"\n  },\n  {\n    \"name\": \"\
+  agent-140000\",\n    \"server_log\": \"2025/12/02 13:18:57.226624 server starting addr=127.0.0.1:9000 workers=6 policy=agent\
+  \ get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\n2025/12/02 13:18:59.229166 server stopped\\n2025/12/02 13:18:59.376916\
+  \ server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\\
+  n2025/12/02 13:19:02.383499 [perf] worker=0 gets=27507 get_errors=0 avg_get=10.432\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:02.383541 [perf] worker=1 gets=27676 get_errors=0 avg_get=10.514\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:02.383548 [perf] worker=2 gets=27658 get_errors=0 avg_get=10.452\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:02.383552 [perf] worker=3 gets=27544 get_errors=0 avg_get=10.302\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:02.383557 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=277 scan_errors=0 avg_scan=2.015095ms\\\
+  n2025/12/02 13:19:02.383562 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=275 scan_errors=0 avg_scan=2.044514ms\\\
+  n2025/12/02 13:19:02.383567 [perf] interval=1s gets=110385 get_errors=0 avg_get=10.425\\u00b5s scans=552 scan_errors=0 avg_scan=2.029751ms\\\
+  n2025/12/02 13:19:03.377267 [perf] worker=0 gets=34178 get_errors=0 avg_get=10.681\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:03.377310 [perf] worker=1 gets=34029 get_errors=0 avg_get=10.536\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:03.377317 [perf] worker=2 gets=33772 get_errors=0 avg_get=10.577\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:03.377322 [perf] worker=3 gets=34059 get_errors=0 avg_get=10.387\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:03.377326 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=349 scan_errors=0 avg_scan=2.038874ms\\\
+  n2025/12/02 13:19:03.377331 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=350 scan_errors=0 avg_scan=2.03558ms\\\
+  n2025/12/02 13:19:03.377336 [perf] interval=1s gets=136038 get_errors=0 avg_get=10.545\\u00b5s scans=699 scan_errors=0 avg_scan=2.037225ms\\\
+  n2025/12/02 13:19:04.377260 [perf] worker=0 gets=34238 get_errors=0 avg_get=10.716\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:04.377302 [perf] worker=1 gets=33755 get_errors=0 avg_get=10.803\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:04.377309 [perf] worker=2 gets=34313 get_errors=0 avg_get=10.742\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:04.377313 [perf] worker=3 gets=34311 get_errors=0 avg_get=10.625\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:04.377318 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=354 scan_errors=0 avg_scan=2.044306ms\\\
+  n2025/12/02 13:19:04.377323 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=355 scan_errors=0 avg_scan=2.054327ms\\\
+  n2025/12/02 13:19:04.377328 [perf] interval=1s gets=136617 get_errors=0 avg_get=10.721\\u00b5s scans=709 scan_errors=0 avg_scan=2.049324ms\\\
+  n2025/12/02 13:19:05.377271 [perf] worker=0 gets=34074 get_errors=0 avg_get=10.828\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:05.377316 [perf] worker=1 gets=34499 get_errors=0 avg_get=10.827\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:05.377322 [perf] worker=2 gets=34052 get_errors=0 avg_get=10.726\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:05.377327 [perf] worker=3 gets=34071 get_errors=0 avg_get=10.475\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:05.377332 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=337 scan_errors=0 avg_scan=2.028757ms\\\
+  n2025/12/02 13:19:05.377337 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=336 scan_errors=0 avg_scan=2.062602ms\\\
+  n2025/12/02 13:19:05.377342 [perf] interval=1s gets=136696 get_errors=0 avg_get=10.714\\u00b5s scans=673 scan_errors=0 avg_scan=2.045654ms\\\
+  n2025/12/02 13:19:06.385014 [perf] worker=0 gets=34319 get_errors=0 avg_get=11.129\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:06.385055 [perf] worker=1 gets=34413 get_errors=0 avg_get=10.605\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:06.385061 [perf] worker=2 gets=33958 get_errors=0 avg_get=10.63\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:06.385066 [perf] worker=3 gets=34116 get_errors=0 avg_get=10.604\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:06.385106 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=361 scan_errors=0 avg_scan=2.045772ms\\\
+  n2025/12/02 13:19:06.385118 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=361 scan_errors=0 avg_scan=2.0395ms\\n2025/12/02\
+  \ 13:19:06.385123 [perf] interval=1s gets=136806 get_errors=0 avg_get=10.743\\u00b5s scans=722 scan_errors=0 avg_scan=2.042636ms\\\
+  n2025/12/02 13:19:07.377285 [perf] worker=0 gets=34296 get_errors=0 avg_get=10.283\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:07.377333 [perf] worker=1 gets=34271 get_errors=0 avg_get=10.295\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:07.377340 [perf] worker=2 gets=34828 get_errors=0 avg_get=10.46\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:07.377345 [perf] worker=3 gets=34550 get_errors=0 avg_get=10.398\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:07.377350 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=340 scan_errors=0 avg_scan=2.027178ms\\\
+  n2025/12/02 13:19:07.377355 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=340 scan_errors=0 avg_scan=2.041505ms\\\
+  n2025/12/02 13:19:07.377360 [perf] interval=1s gets=137945 get_errors=0 avg_get=10.36\\u00b5s scans=680 scan_errors=0 avg_scan=2.034342ms\\\
+  n2025/12/02 13:19:08.377257 [perf] worker=0 gets=33796 get_errors=0 avg_get=10.593\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:08.377303 [perf] worker=1 gets=33968 get_errors=0 avg_get=10.328\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:08.377309 [perf] worker=2 gets=33850 get_errors=0 avg_get=10.488\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:08.377314 [perf] worker=3 gets=33875 get_errors=0 avg_get=10.552\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:08.377319 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=369 scan_errors=0 avg_scan=2.016983ms\\\
+  n2025/12/02 13:19:08.377324 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=370 scan_errors=0 avg_scan=2.02138ms\\\
+  n2025/12/02 13:19:08.377330 [perf] interval=1s gets=135489 get_errors=0 avg_get=10.49\\u00b5s scans=739 scan_errors=0 avg_scan=2.019184ms\\\
+  n2025/12/02 13:19:09.377704 [perf] worker=0 gets=7099 get_errors=0 avg_get=10.124\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:09.377750 [perf] worker=1 gets=6948 get_errors=0 avg_get=10.157\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:09.377756 [perf] worker=2 gets=7033 get_errors=0 avg_get=10.165\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:09.377761 [perf] worker=3 gets=7000 get_errors=0 avg_get=10.169\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:09.377766 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=65 scan_errors=0 avg_scan=2.000098ms\\\
+  n2025/12/02 13:19:09.377770 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=65 scan_errors=0 avg_scan=2.019348ms\\\
+  n2025/12/02 13:19:09.377775 [perf] interval=1s gets=28080 get_errors=0 avg_get=10.154\\u00b5s scans=130 scan_errors=0 avg_scan=2.009723ms\\\
+  n2025/12/02 13:19:11.828805 server stopped\\n\",\n    \"client_log\": \"[client] 2025/12/02 13:19:01.581222 starting workload\
+  \ server=127.0.0.1:9000 duration=7s rate=140000.00 get_frac=0.99\\n[client] 2025/12/02 13:19:02.581650 outstanding=803 sent=138903\
+  \ recv=138100\\n[client] 2025/12/02 13:19:03.581661 outstanding=1551 sent=275892 recv=274341\\n[client] 2025/12/02 13:19:04.581652\
+  \ outstanding=480 sent=413859 recv=413379\\n[client] 2025/12/02 13:19:05.581661 outstanding=813 sent=551091 recv=550278\\\
+  n[client] 2025/12/02 13:19:06.581665 outstanding=618 sent=688165 recv=687547\\n[client] 2025/12/02 13:19:07.584334 outstanding=287\
+  \ sent=827578 recv=827291\\n[client] 2025/12/02 13:19:08.581650 outstanding=57 sent=962960 recv=962903\\n[client] 2025/12/02\
+  \ 13:19:11.582492 sent=962960 recv=962960\\n\"\n  },\n  {\n    \"name\": \"agent-160000\",\n    \"server_log\": \"2025/12/02\
+  \ 13:19:12.082009 server starting addr=127.0.0.1:9000 workers=6 policy=agent get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\\
+  n2025/12/02 13:19:14.085073 server stopped\\n2025/12/02 13:19:14.232143 server starting addr=127.0.0.1:9000 workers=6 policy=agent\
+  \ get_delay=10\\u00b5s scan_delay=2ms pprof=127.0.0.1:6060\\n2025/12/02 13:19:17.241034 [perf] worker=0 gets=28239 get_errors=0\
+  \ avg_get=10.555\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:17.241076 [perf] worker=1 gets=28284 get_errors=0\
+  \ avg_get=10.263\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:17.241083 [perf] worker=2 gets=28677 get_errors=0\
+  \ avg_get=10.391\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:17.241088 [perf] worker=3 gets=27571 get_errors=0\
+  \ avg_get=10.877\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:17.241103 [perf] worker=4 gets=0 get_errors=0\
+  \ avg_get=0s scans=310 scan_errors=0 avg_scan=2.090198ms\\n2025/12/02 13:19:17.241113 [perf] worker=5 gets=0 get_errors=0\
+  \ avg_get=0s scans=305 scan_errors=0 avg_scan=2.136576ms\\n2025/12/02 13:19:17.241118 [perf] interval=1s gets=112771 get_errors=0\
+  \ avg_get=10.519\\u00b5s scans=615 scan_errors=0 avg_scan=2.113198ms\\n2025/12/02 13:19:18.234112 [perf] worker=0 gets=35071\
+  \ get_errors=0 avg_get=10.389\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:18.234163 [perf] worker=1 gets=33182\
+  \ get_errors=0 avg_get=11.292\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:18.234169 [perf] worker=2 gets=34060\
+  \ get_errors=0 avg_get=10.56\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:18.234174 [perf] worker=3 gets=32997\
+  \ get_errors=0 avg_get=10.991\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:18.234190 [perf] worker=4 gets=0\
+  \ get_errors=0 avg_get=0s scans=407 scan_errors=0 avg_scan=2.105553ms\\n2025/12/02 13:19:18.234206 [perf] worker=5 gets=0\
+  \ get_errors=0 avg_get=0s scans=411 scan_errors=0 avg_scan=2.093073ms\\n2025/12/02 13:19:18.234211 [perf] interval=1s gets=135310\
+  \ get_errors=0 avg_get=10.8\\u00b5s scans=818 scan_errors=0 avg_scan=2.099283ms\\n2025/12/02 13:19:19.236919 [perf] worker=0\
+  \ gets=35063 get_errors=0 avg_get=10.25\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:19.237167 [perf] worker=1\
+  \ gets=34608 get_errors=0 avg_get=10.527\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:19.237192 [perf] worker=2\
+  \ gets=34912 get_errors=0 avg_get=10.461\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:19.237199 [perf] worker=3\
+  \ gets=34344 get_errors=0 avg_get=10.735\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:19.237204 [perf] worker=4\
+  \ gets=0 get_errors=0 avg_get=0s scans=395 scan_errors=0 avg_scan=2.095546ms\\n2025/12/02 13:19:19.237209 [perf] worker=5\
+  \ gets=0 get_errors=0 avg_get=0s scans=397 scan_errors=0 avg_scan=2.058004ms\\n2025/12/02 13:19:19.237220 [perf] interval=1s\
+  \ gets=138927 get_errors=0 avg_get=10.492\\u00b5s scans=792 scan_errors=0 avg_scan=2.076727ms\\n2025/12/02 13:19:20.233141\
+  \ [perf] worker=0 gets=34788 get_errors=0 avg_get=10.493\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:20.233186\
+  \ [perf] worker=1 gets=34430 get_errors=0 avg_get=10.506\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:20.233192\
+  \ [perf] worker=2 gets=33326 get_errors=0 avg_get=10.834\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:20.233203\
+  \ [perf] worker=3 gets=33998 get_errors=0 avg_get=10.611\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02 13:19:20.233208\
+  \ [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=366 scan_errors=0 avg_scan=2.037697ms\\n2025/12/02 13:19:20.233233\
+  \ [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=369 scan_errors=0 avg_scan=2.141904ms\\n2025/12/02 13:19:20.233251\
+  \ [perf] interval=1s gets=136542 get_errors=0 avg_get=10.609\\u00b5s scans=735 scan_errors=0 avg_scan=2.090013ms\\n2025/12/02\
+  \ 13:19:21.232376 [perf] worker=0 gets=34519 get_errors=0 avg_get=10.416\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:19:21.232595 [perf] worker=1 gets=34180 get_errors=0 avg_get=10.606\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:19:21.232602 [perf] worker=2 gets=33813 get_errors=0 avg_get=10.814\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:19:21.232607 [perf] worker=3 gets=33054 get_errors=0 avg_get=11.258\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\n2025/12/02\
+  \ 13:19:21.232637 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=396 scan_errors=0 avg_scan=2.081748ms\\n2025/12/02\
+  \ 13:19:21.232643 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=393 scan_errors=0 avg_scan=2.088744ms\\n2025/12/02\
+  \ 13:19:21.232648 [perf] interval=1s gets=135566 get_errors=0 avg_get=10.769\\u00b5s scans=789 scan_errors=0 avg_scan=2.085233ms\\\
+  n2025/12/02 13:19:22.243122 [perf] worker=0 gets=33429 get_errors=0 avg_get=10.779\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:22.243177 [perf] worker=1 gets=34517 get_errors=0 avg_get=10.653\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:22.243183 [perf] worker=2 gets=32735 get_errors=0 avg_get=11.223\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:22.243189 [perf] worker=3 gets=34341 get_errors=0 avg_get=10.818\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:22.243193 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=411 scan_errors=0 avg_scan=2.085179ms\\\
+  n2025/12/02 13:19:22.243198 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=409 scan_errors=0 avg_scan=2.082395ms\\\
+  n2025/12/02 13:19:22.243203 [perf] interval=1s gets=135022 get_errors=0 avg_get=10.864\\u00b5s scans=820 scan_errors=0 avg_scan=2.083791ms\\\
+  n2025/12/02 13:19:23.233119 [perf] worker=0 gets=33501 get_errors=0 avg_get=10.747\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:23.233167 [perf] worker=1 gets=34084 get_errors=0 avg_get=10.386\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:23.233174 [perf] worker=2 gets=33214 get_errors=0 avg_get=10.628\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:23.233179 [perf] worker=3 gets=33181 get_errors=0 avg_get=10.927\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:23.233212 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=388 scan_errors=0 avg_scan=2.030905ms\\\
+  n2025/12/02 13:19:23.233219 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=388 scan_errors=0 avg_scan=2.127573ms\\\
+  n2025/12/02 13:19:23.233224 [perf] interval=1s gets=133980 get_errors=0 avg_get=10.67\\u00b5s scans=776 scan_errors=0 avg_scan=2.079239ms\\\
+  n2025/12/02 13:19:24.232364 [perf] worker=0 gets=33583 get_errors=0 avg_get=10.329\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:24.232407 [perf] worker=1 gets=33584 get_errors=0 avg_get=10.357\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:24.232414 [perf] worker=2 gets=33597 get_errors=0 avg_get=10.292\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:24.232419 [perf] worker=3 gets=33797 get_errors=0 avg_get=10.199\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:24.232424 [perf] worker=4 gets=0 get_errors=0 avg_get=0s scans=81 scan_errors=0 avg_scan=2.042308ms\\\
+  n2025/12/02 13:19:24.232429 [perf] worker=5 gets=0 get_errors=0 avg_get=0s scans=81 scan_errors=0 avg_scan=2.109622ms\\\
+  n2025/12/02 13:19:24.232433 [perf] interval=1s gets=134561 get_errors=0 avg_get=10.294\\u00b5s scans=162 scan_errors=0 avg_scan=2.075965ms\\\
+  n2025/12/02 13:19:25.233349 [perf] worker=0 gets=5775 get_errors=0 avg_get=10.102\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:25.233864 [perf] worker=1 gets=7102 get_errors=0 avg_get=10.126\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:25.234079 [perf] worker=2 gets=9603 get_errors=0 avg_get=10.122\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:25.234085 [perf] worker=3 gets=10606 get_errors=0 avg_get=10.133\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:25.234090 [perf] interval=1s gets=33086 get_errors=0 avg_get=10.123\\u00b5s scans=0 scan_errors=0 avg_scan=0s\\\
+  n2025/12/02 13:19:26.667526 server stopped\\n\",\n    \"client_log\": \"[client] 2025/12/02 13:19:16.437010 starting workload\
+  \ server=127.0.0.1:9000 duration=7s rate=160000.00 get_frac=0.99\\n[client] 2025/12/02 13:19:17.437491 outstanding=18058\
+  \ sent=158316 recv=140258\\n[client] 2025/12/02 13:19:18.437492 outstanding=38378 sent=315532 recv=277154\\n[client] 2025/12/02\
+  \ 13:19:19.437507 outstanding=56503 sent=473317 recv=416814\\n[client] 2025/12/02 13:19:20.437493 outstanding=77910 sent=631705\
+  \ recv=553795\\n[client] 2025/12/02 13:19:21.437503 outstanding=97349 sent=788899 recv=691550\\n[client] 2025/12/02 13:19:22.437495\
+  \ outstanding=120735 sent=945102 recv=824367\\n[client] 2025/12/02 13:19:23.437525 outstanding=141232 sent=1101272 recv=960040\\\
+  n[client] 2025/12/02 13:19:24.437506 outstanding=6356 sent=1101272 recv=1094916\\n[client] 2025/12/02 13:19:26.438301 sent=1101272\
+  \ recv=1101272\\n\"\n  }\n]\n\nBest program code:\n```.c\n//go:build ignore\n\n#include <linux/bpf.h>\n#include <bpf/bpf_helpers.h>\n\
+  \nstruct {\n    __uint(type, BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);\n    __uint(max_entries, 128);\n    __type(key, __u32);\n\
+  \    __type(value, __u32);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n} pebble_udp_targets SEC(\".maps\");\n\n// EVOLVE-BLOCK-START\n\
+  /*\n * Agent UDP selector\n *\n * Approach\n * --------\n * 1) Use a shared agent_state with:\n *      - active: number\
+  \ of SO_REUSEPORT workers (set by Go, kept as\u2011is).\n *      - get_rr: round\u2011robin counter for GET (and generic)\
+  \ traffic.\n *      - scan_rr: round\u2011robin counter for SCAN traffic.\n *\n *    Go only initializes `Active`; the extra\
+  \ fields are zero\u2011initialized\n *    automatically on map update. This respects the existing control\n *    surface\
+  \ while giving us cheap per\u2011packet state.\n *\n * 2) Drive all workers:\n *      - For small pools (active <= 3), we\
+  \ just round\u2011robin across the\n *        full [0..active-1] range using get_rr. This avoids wasting a\n *        worker\
+  \ on a split that would not meaningfully help.\n *\n *      - For larger pools (active >= 4), we reserve a small tail subset\n\
+  \ *        of workers for SCAN requests and use the head subset for GETs:\n *\n *            if (active >= 5)  scan_slots\
+  \ = 2;\n *            else              scan_slots = 1;   // active == 4\n *            get_slots = active - scan_slots;\
+  \    // >= 1\n *\n *        GETs  : worker indices [0 .. get_slots-1]\n *        SCANs : worker indices [get_slots .. active-1]\n\
+  \ *\n *        With the common configuration active == 6, this yields:\n *          - 4 GET workers  (0\u20133)\n *    \
+  \      - 2 SCAN workers (4\u20135)\n *\n *        All workers are driven via simple round\u2011robin counters, so we\n *\
+  \        avoid the hash\u2011bias that left some workers idle in the baseline.\n *\n * 3) Isolate long SCAN requests:\n\
+  \ *      - Client payloads begin with the ASCII verb \"GET \" or \"SCAN \".\n *      - In sk_reuseport_md, reuse->data may\
+  \ point at different layers\n *        depending on kernel version (IPv4 header, UDP header, or UDP\n *        payload).\
+  \ Previous iterations assumed a single layout and\n *        misclassified all SCANs as GETs.\n *\n *      - Here we use\
+  \ a cheap, verifier\u2011friendly classifier that tries\n *        three interpretations of reuse->data, all under tight\
+  \ bounds:\n *\n *          a) IPv4 header -> UDP header -> payload\n *          b) UDP header  -> payload\n *          c)\
+  \ Payload directly\n *\n *        If any interpretation finds a payload starting with \"SCAN\", the\n *        packet is\
+  \ treated as SCAN; otherwise it is treated as GET.\n *\n * 4) Verifier\u2011friendly and cheap:\n *      - One array map\
+  \ lookup (pebble_agent_state).\n *      - No loops, only straight\u2011line code.\n *      - Minimal stack usage, no dynamic\
+  \ allocation.\n *      - Exactly one bpf_sk_select_reuseport() call per packet.\n *      - Deterministic logic; the only\
+  \ shared state is the two 32\u2011bit\n *        round\u2011robin counters in the map.\n */\n\n#include <linux/ip.h>\n#include\
+  \ <linux/udp.h>\n#include <linux/in.h>\n\nstruct agent_state {\n    __u32 active;   /* number of configured workers (0..active-1)\
+  \ */\n    __u32 get_rr;   /* round-robin counter for GET (and generic) */\n    __u32 scan_rr;  /* round-robin counter for\
+  \ SCAN workers */\n    __u32 pad;      /* reserved for future use / alignment */\n};\n\nstruct {\n    __uint(type, BPF_MAP_TYPE_ARRAY);\n\
+  \    __uint(max_entries, 1);\n    __type(key, __u32);\n    __type(value, struct agent_state);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n\
+  } pebble_agent_state SEC(\".maps\");\n\n/* Check whether p (within [data, data_end)) starts with \"SCAN\". */\nstatic __always_inline\
+  \ int has_scan_prefix(char *p, void *data_end)\n{\n    if (p + 4 > (char *)data_end)\n        return 0;\n\n    if (p[0]\
+  \ == 'S' && p[1] == 'C' && p[2] == 'A' && p[3] == 'N')\n        return 1;\n\n    return 0;\n}\n\n/*\n * Classify packet\
+  \ as SCAN (return 1) or not (return 0) by decoding enough\n * of the layout around reuse->data to find the UDP payload start.\n\
+  \ *\n * We support three possible layouts for reuse->data:\n *   1) IPv4 header       -> UDP header -> payload\n *   2)\
+  \ UDP header        -> payload\n *   3) Payload directly\n *\n * All paths are fully bounds-checked and loop-free.\n */\n\
+  static __always_inline int classify_scan(struct sk_reuseport_md *reuse)\n{\n    void *data = (void *)(long)reuse->data;\n\
+  \    void *data_end = (void *)(long)reuse->data_end;\n    char *cursor = (char *)data;\n\n    /* Path 1: assume data points\
+  \ at an IPv4 header. */\n    if (cursor + sizeof(struct iphdr) <= (char *)data_end) {\n        struct iphdr *iph = (struct\
+  \ iphdr *)cursor;\n\n        if (iph->version == 4 && iph->protocol == IPPROTO_UDP) {\n            __u32 ihl = iph->ihl;\n\
+  \            if (ihl >= 5) {\n                __u32 ip_hdr_len = ihl * 4;\n\n                if (cursor + ip_hdr_len + sizeof(struct\
+  \ udphdr) <=\n                    (char *)data_end) {\n                    char *p = cursor + ip_hdr_len + sizeof(struct\
+  \ udphdr);\n                    if (has_scan_prefix(p, data_end))\n                        return 1;\n                }\n\
+  \            }\n        }\n    }\n\n    /* Path 2: assume data points at a UDP header. */\n    cursor = (char *)data;\n\
+  \    if (cursor + sizeof(struct udphdr) <= (char *)data_end) {\n        char *p = cursor + sizeof(struct udphdr);\n    \
+  \    if (has_scan_prefix(p, data_end))\n            return 1;\n    }\n\n    /* Path 3: assume data already points at the\
+  \ payload. */\n    cursor = (char *)data;\n    if (has_scan_prefix(cursor, data_end))\n        return 1;\n\n    return 0;\n\
+  }\n\nSEC(\"sk_reuseport/selector\")\nenum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)\n{\n    __u32 key\
+  \ = 0;\n    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);\n    if (!state)\n        return\
+  \ SK_PASS;\n\n    __u32 active = state->active;\n    if (active == 0)\n        return SK_PASS;\n\n    __u32 slot = 0;\n\n\
+  \    if (active <= 3) {\n        /* Small pools: just round-robin across all workers. */\n        __u32 rr = state->get_rr++;\n\
+  \        if (active > 1)\n            slot = rr % active;\n        else\n            slot = 0;\n    } else {\n        /*\n\
+  \         * Larger pools: reserve a small tail subset of workers for SCANs\n         * and use the head subset for GETs.\n\
+  \         *\n         *   - For Active == 4: 3 GET, 1 SCAN\n         *   - For Active >= 5: Active-2 GET, 2 SCAN\n     \
+  \    */\n        __u32 scan_slots;\n\n        if (active >= 5)\n            scan_slots = 2;\n        else\n            scan_slots\
+  \ = 1;\n\n        if (scan_slots >= active)\n            scan_slots = active - 1;\n\n        __u32 get_slots = active -\
+  \ scan_slots; /* >= 1 */\n\n        int is_scan = classify_scan(reuse);\n\n        if (is_scan) {\n            __u32 rr\
+  \ = state->scan_rr++;\n            if (scan_slots > 1)\n                slot = get_slots + (rr % scan_slots);\n        \
+  \    else\n                slot = get_slots; /* single dedicated SCAN worker */\n        } else {\n            __u32 rr\
+  \ = state->get_rr++;\n            if (get_slots > 1)\n                slot = rr % get_slots;\n            else\n       \
+  \         slot = 0; /* only worker 0 for GETs */\n        }\n    }\n\n    if (slot >= active) {\n        /* Safety clamp;\
+  \ should not normally trigger. */\n        if (active > 0)\n            slot %= active;\n        else\n            slot\
+  \ = 0;\n    }\n\n    /* Exactly one selection attempt; kernel ignores any additional calls. */\n    (void)bpf_sk_select_reuseport(reuse,\
+  \ &pebble_udp_targets, &slot, 0);\n\n    return SK_PASS;\n}\n// EVOLVE-BLOCK-END\n\nchar _license[] SEC(\"license\") = \"\
+  GPL\";\n```"
+run_context:
+  best_metrics:
+    policy: |-
+      agent
+    rates:
+    - 80000
+    - 100000
+    - 140000
+    - 160000
+    load_p99_curve:
+    - - 80000.0
+      - 2.04
+    - - 100000.0
+      - 2.406
+    - - 140000.0
+      - 21.259
+    - - 160000.0
+      - 1073.506
+    load_p99_stddev_curve:
+    - - 80000.0
+      - 0.0
+    - - 100000.0
+      - 0.0
+    - - 140000.0
+      - 0.0
+    - - 160000.0
+      - 0.0
+    compile: 1.0
+    load: 1.0
+    combined_score: -1146.5410000000002
+    run_success: 1.0
+  best_reasoning: null
+  eval_summary: null
+  eval_hypothesis: null
+  eval_score: null
+best_program_code: "//go:build ignore\n\n#include <linux/bpf.h>\n#include <bpf/bpf_helpers.h>\n\nstruct {\n    __uint(type,\
+  \ BPF_MAP_TYPE_REUSEPORT_SOCKARRAY);\n    __uint(max_entries, 128);\n    __type(key, __u32);\n    __type(value, __u32);\n\
+  \    __uint(pinning, LIBBPF_PIN_BY_NAME);\n} pebble_udp_targets SEC(\".maps\");\n\n// EVOLVE-BLOCK-START\n/*\n * Agent UDP\
+  \ selector\n *\n * Approach\n * --------\n * 1) Use a shared agent_state with:\n *      - active: number of SO_REUSEPORT\
+  \ workers (set by Go, kept as\u2011is).\n *      - get_rr: round\u2011robin counter for GET (and generic) traffic.\n * \
+  \     - scan_rr: round\u2011robin counter for SCAN traffic.\n *\n *    Go only initializes `Active`; the extra fields are\
+  \ zero\u2011initialized\n *    automatically on map update. This respects the existing control\n *    surface while giving\
+  \ us cheap per\u2011packet state.\n *\n * 2) Drive all workers:\n *      - For small pools (active <= 3), we just round\u2011\
+  robin across the\n *        full [0..active-1] range using get_rr. This avoids wasting a\n *        worker on a split that\
+  \ would not meaningfully help.\n *\n *      - For larger pools (active >= 4), we reserve a small tail subset\n *       \
+  \ of workers for SCAN requests and use the head subset for GETs:\n *\n *            if (active >= 5)  scan_slots = 2;\n\
+  \ *            else              scan_slots = 1;   // active == 4\n *            get_slots = active - scan_slots;    //\
+  \ >= 1\n *\n *        GETs  : worker indices [0 .. get_slots-1]\n *        SCANs : worker indices [get_slots .. active-1]\n\
+  \ *\n *        With the common configuration active == 6, this yields:\n *          - 4 GET workers  (0\u20133)\n *    \
+  \      - 2 SCAN workers (4\u20135)\n *\n *        All workers are driven via simple round\u2011robin counters, so we\n *\
+  \        avoid the hash\u2011bias that left some workers idle in the baseline.\n *\n * 3) Isolate long SCAN requests:\n\
+  \ *      - Client payloads begin with the ASCII verb \"GET \" or \"SCAN \".\n *      - In sk_reuseport_md, reuse->data may\
+  \ point at different layers\n *        depending on kernel version (IPv4 header, UDP header, or UDP\n *        payload).\
+  \ Previous iterations assumed a single layout and\n *        misclassified all SCANs as GETs.\n *\n *      - Here we use\
+  \ a cheap, verifier\u2011friendly classifier that tries\n *        three interpretations of reuse->data, all under tight\
+  \ bounds:\n *\n *          a) IPv4 header -> UDP header -> payload\n *          b) UDP header  -> payload\n *          c)\
+  \ Payload directly\n *\n *        If any interpretation finds a payload starting with \"SCAN\", the\n *        packet is\
+  \ treated as SCAN; otherwise it is treated as GET.\n *\n * 4) Verifier\u2011friendly and cheap:\n *      - One array map\
+  \ lookup (pebble_agent_state).\n *      - No loops, only straight\u2011line code.\n *      - Minimal stack usage, no dynamic\
+  \ allocation.\n *      - Exactly one bpf_sk_select_reuseport() call per packet.\n *      - Deterministic logic; the only\
+  \ shared state is the two 32\u2011bit\n *        round\u2011robin counters in the map.\n */\n\n#include <linux/ip.h>\n#include\
+  \ <linux/udp.h>\n#include <linux/in.h>\n\nstruct agent_state {\n    __u32 active;   /* number of configured workers (0..active-1)\
+  \ */\n    __u32 get_rr;   /* round-robin counter for GET (and generic) */\n    __u32 scan_rr;  /* round-robin counter for\
+  \ SCAN workers */\n    __u32 pad;      /* reserved for future use / alignment */\n};\n\nstruct {\n    __uint(type, BPF_MAP_TYPE_ARRAY);\n\
+  \    __uint(max_entries, 1);\n    __type(key, __u32);\n    __type(value, struct agent_state);\n    __uint(pinning, LIBBPF_PIN_BY_NAME);\n\
+  } pebble_agent_state SEC(\".maps\");\n\n/* Check whether p (within [data, data_end)) starts with \"SCAN\". */\nstatic __always_inline\
+  \ int has_scan_prefix(char *p, void *data_end)\n{\n    if (p + 4 > (char *)data_end)\n        return 0;\n\n    if (p[0]\
+  \ == 'S' && p[1] == 'C' && p[2] == 'A' && p[3] == 'N')\n        return 1;\n\n    return 0;\n}\n\n/*\n * Classify packet\
+  \ as SCAN (return 1) or not (return 0) by decoding enough\n * of the layout around reuse->data to find the UDP payload start.\n\
+  \ *\n * We support three possible layouts for reuse->data:\n *   1) IPv4 header       -> UDP header -> payload\n *   2)\
+  \ UDP header        -> payload\n *   3) Payload directly\n *\n * All paths are fully bounds-checked and loop-free.\n */\n\
+  static __always_inline int classify_scan(struct sk_reuseport_md *reuse)\n{\n    void *data = (void *)(long)reuse->data;\n\
+  \    void *data_end = (void *)(long)reuse->data_end;\n    char *cursor = (char *)data;\n\n    /* Path 1: assume data points\
+  \ at an IPv4 header. */\n    if (cursor + sizeof(struct iphdr) <= (char *)data_end) {\n        struct iphdr *iph = (struct\
+  \ iphdr *)cursor;\n\n        if (iph->version == 4 && iph->protocol == IPPROTO_UDP) {\n            __u32 ihl = iph->ihl;\n\
+  \            if (ihl >= 5) {\n                __u32 ip_hdr_len = ihl * 4;\n\n                if (cursor + ip_hdr_len + sizeof(struct\
+  \ udphdr) <=\n                    (char *)data_end) {\n                    char *p = cursor + ip_hdr_len + sizeof(struct\
+  \ udphdr);\n                    if (has_scan_prefix(p, data_end))\n                        return 1;\n                }\n\
+  \            }\n        }\n    }\n\n    /* Path 2: assume data points at a UDP header. */\n    cursor = (char *)data;\n\
+  \    if (cursor + sizeof(struct udphdr) <= (char *)data_end) {\n        char *p = cursor + sizeof(struct udphdr);\n    \
+  \    if (has_scan_prefix(p, data_end))\n            return 1;\n    }\n\n    /* Path 3: assume data already points at the\
+  \ payload. */\n    cursor = (char *)data;\n    if (has_scan_prefix(cursor, data_end))\n        return 1;\n\n    return 0;\n\
+  }\n\nSEC(\"sk_reuseport/selector\")\nenum sk_action agent_udp_selector(struct sk_reuseport_md *reuse)\n{\n    __u32 key\
+  \ = 0;\n    struct agent_state *state = bpf_map_lookup_elem(&pebble_agent_state, &key);\n    if (!state)\n        return\
+  \ SK_PASS;\n\n    __u32 active = state->active;\n    if (active == 0)\n        return SK_PASS;\n\n    __u32 slot = 0;\n\n\
+  \    if (active <= 3) {\n        /* Small pools: just round-robin across all workers. */\n        __u32 rr = state->get_rr++;\n\
+  \        if (active > 1)\n            slot = rr % active;\n        else\n            slot = 0;\n    } else {\n        /*\n\
+  \         * Larger pools: reserve a small tail subset of workers for SCANs\n         * and use the head subset for GETs.\n\
+  \         *\n         *   - For Active == 4: 3 GET, 1 SCAN\n         *   - For Active >= 5: Active-2 GET, 2 SCAN\n     \
+  \    */\n        __u32 scan_slots;\n\n        if (active >= 5)\n            scan_slots = 2;\n        else\n            scan_slots\
+  \ = 1;\n\n        if (scan_slots >= active)\n            scan_slots = active - 1;\n\n        __u32 get_slots = active -\
+  \ scan_slots; /* >= 1 */\n\n        int is_scan = classify_scan(reuse);\n\n        if (is_scan) {\n            __u32 rr\
+  \ = state->scan_rr++;\n            if (scan_slots > 1)\n                slot = get_slots + (rr % scan_slots);\n        \
+  \    else\n                slot = get_slots; /* single dedicated SCAN worker */\n        } else {\n            __u32 rr\
+  \ = state->get_rr++;\n            if (get_slots > 1)\n                slot = rr % get_slots;\n            else\n       \
+  \         slot = 0; /* only worker 0 for GETs */\n        }\n    }\n\n    if (slot >= active) {\n        /* Safety clamp;\
+  \ should not normally trigger. */\n        if (active > 0)\n            slot %= active;\n        else\n            slot\
+  \ = 0;\n    }\n\n    /* Exactly one selection attempt; kernel ignores any additional calls. */\n    (void)bpf_sk_select_reuseport(reuse,\
+  \ &pebble_udp_targets, &slot, 0);\n\n    return SK_PASS;\n}\n// EVOLVE-BLOCK-END\n\nchar _license[] SEC(\"license\") = \"\
+  GPL\";"

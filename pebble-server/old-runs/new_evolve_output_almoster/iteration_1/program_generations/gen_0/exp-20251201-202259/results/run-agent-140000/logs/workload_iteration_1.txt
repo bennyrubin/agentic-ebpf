@@ -1,0 +1,15 @@
+Total sent: 964021 (GET=959192 SCAN=4829)
+Total received: 964021 (GET=959192 SCAN=4829)
+Throughput: 137717.29 req/s
+Overall latency p50: 2.151 ms
+Overall latency p90: 7.774 ms
+Overall latency p99: 16.360 ms
+Overall latency avg: 3.253 ms
+GET latency p50: 2.139 ms
+GET latency p90: 7.762 ms
+GET latency p99: 16.349 ms
+GET latency avg: 3.243 ms
+SCAN latency p50: 4.124 ms
+SCAN latency p90: 9.671 ms
+SCAN latency p99: 18.723 ms
+SCAN latency avg: 5.241 ms

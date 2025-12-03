@@ -1,0 +1,16 @@
+{
+  "threads": "6",
+  "policy": "agent",
+  "duration_sec": "7",
+  "rate_rps": "140000",
+  "get_fraction": ".995",
+  "scan_limit": "1500",
+  "listen": "127.0.0.1:9000",
+  "get_delay": "10us",
+  "scan_delay": "2ms",
+  "iterations": "1",
+  "server_cores": "6",
+  "client_cores": "7",
+  "server_cpuset": "0,2,4,6,8,10",
+  "client_cpuset": "12,14,16,18,20,22,24"
+}
